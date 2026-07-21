@@ -1,0 +1,2205 @@
+/* Yajna Pharma Solutions — pharmacy audit console backend
+ * Node + Express + SQLite (better-sqlite3). Single-tenant, role-based.
+ * Roles: admin (everything) · user (the daily entry screen for their hospitals, nothing else).
+ */
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const express = require('express');
+const Database = require('better-sqlite3');
+const bcrypt = require('bcryptjs');
+const cookieParser = require('cookie-parser');
+const multer = require('multer');
+const XLSX = require('xlsx');
+const Anthropic = require('@anthropic-ai/sdk');
+
+try { require('dotenv').config({ path: path.join(__dirname, '.env') }); } catch (e) {}
+
+const PORT = process.env.PORT || 3060;
+const MARGIN_TOL = parseFloat(process.env.MARGIN_TOLERANCE_PP || '2'); // percentage points
+const SESSION_DAYS = 30;
+const COOKIE = 'yps_session';
+
+fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
+const db = new Database(path.join(__dirname, 'data', 'yajna.db'));
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS users(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL CHECK(role IN ('admin','user')),
+  role_label TEXT NOT NULL, hospital_id TEXT, pw_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(
+  token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS hospitals(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, doctor TEXT DEFAULT '', location TEXT DEFAULT '',
+  phone TEXT DEFAULT '', start_date TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, base INTEGER NOT NULL DEFAULT 50000);
+CREATE TABLE IF NOT EXISTS vendors(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL, name TEXT NOT NULL,
+  credit_days INTEGER NOT NULL DEFAULT 30, opening_bal REAL NOT NULL DEFAULT 0,
+  phone TEXT DEFAULT '', added_on TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_vendors_h ON vendors(hospital_id);
+CREATE TABLE IF NOT EXISTS payments(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL, vendor_id TEXT NOT NULL, vendor_name TEXT NOT NULL,
+  amount REAL NOT NULL, date TEXT NOT NULL, note TEXT DEFAULT '', created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_pay_h ON payments(hospital_id);
+CREATE TABLE IF NOT EXISTS entries(
+  hospital_id TEXT NOT NULL, date TEXT NOT NULL, data TEXT NOT NULL, saved_at INTEGER NOT NULL,
+  PRIMARY KEY(hospital_id, date));
+CREATE TABLE IF NOT EXISTS notifications(
+  id TEXT PRIMARY KEY, type TEXT NOT NULL, hospital_id TEXT NOT NULL, date TEXT NOT NULL,
+  msg TEXT NOT NULL, ts INTEGER NOT NULL, read INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_notif_ts ON notifications(ts);
+CREATE TABLE IF NOT EXISTS report_prefs(
+  hospital_id TEXT NOT NULL, type TEXT NOT NULL, prefs TEXT NOT NULL, PRIMARY KEY(hospital_id, type));
+CREATE TABLE IF NOT EXISTS hv_tracked(hospital_id TEXT PRIMARY KEY, drugs TEXT NOT NULL DEFAULT '[]');
+/* users.hospital_ids: JSON array of hospital ids the user may open; ["*"] = every hospital (incl. future).
+   users.active: 0 revokes portal access without deleting the account. */
+CREATE TABLE IF NOT EXISTS items(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL, name TEXT NOT NULL, name_key TEXT NOT NULL,
+  pack TEXT DEFAULT '', nr REAL NOT NULL DEFAULT 0, mrp REAL NOT NULL DEFAULT 0,
+  source TEXT DEFAULT 'manual', updated_at INTEGER NOT NULL,
+  UNIQUE(hospital_id, name_key));
+CREATE INDEX IF NOT EXISTS idx_items_h ON items(hospital_id);
+CREATE TABLE IF NOT EXISTS period_data(
+  hospital_id TEXT NOT NULL, ptype TEXT NOT NULL, pkey TEXT NOT NULL,
+  data TEXT NOT NULL, updated_at INTEGER NOT NULL,
+  PRIMARY KEY(hospital_id, ptype, pkey));
+/* Stock corrections are recorded as signed movements, never as an overwrite of the
+   balance — so the ledger still explains how today's stock was arrived at, and a
+   write-off can never be quietly buried inside the computed figure. */
+CREATE TABLE IF NOT EXISTS stock_adjustments(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL,
+  item_key TEXT NOT NULL, item_name TEXT NOT NULL,
+  date TEXT NOT NULL, qty REAL NOT NULL,
+  reason TEXT NOT NULL, note TEXT DEFAULT '',
+  user_name TEXT DEFAULT '', created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_adj_h ON stock_adjustments(hospital_id);
+/* Receivables. amount_received / amount_due are NEVER stored — they are recomputed
+   from the append-only action log, so a correction is always a counter-entry and the
+   ledger stays auditable. status_override is flattened onto the row (ov_*). */
+CREATE TABLE IF NOT EXISTS receivables(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL,
+  bill_no TEXT NOT NULL, bill_date TEXT NOT NULL,
+  party TEXT NOT NULL, party_type TEXT NOT NULL,
+  amount REAL NOT NULL,
+  next_follow_up_date TEXT, assigned_to TEXT,
+  priority TEXT NOT NULL DEFAULT 'normal',
+  ov_value TEXT, ov_reason TEXT, ov_by TEXT, ov_at INTEGER, ov_expires TEXT,
+  created_by TEXT DEFAULT '', created_at INTEGER NOT NULL,
+  UNIQUE(hospital_id, bill_no));
+CREATE INDEX IF NOT EXISTS idx_recv_h ON receivables(hospital_id);
+CREATE TABLE IF NOT EXISTS receivable_actions(
+  id TEXT PRIMARY KEY, receivable_id TEXT NOT NULL, hospital_id TEXT NOT NULL,
+  type TEXT NOT NULL, amount REAL, mode TEXT, reason TEXT DEFAULT '',
+  approver_id TEXT, approver_name TEXT,
+  action_date TEXT NOT NULL, entered_by TEXT DEFAULT '', entered_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_ract_r ON receivable_actions(receivable_id);
+CREATE INDEX IF NOT EXISTS idx_ract_h ON receivable_actions(hospital_id);
+/* Batch-wise stock with expiry, exported from the pharmacy software and uploaded
+   here. Kept as its OWN dataset rather than stamped onto our purchase lines:
+   their batches and our lots are two different records of the same shelf, and
+   forcing one onto the other would have to guess the mapping and would bury the
+   disagreement — which is exactly what an audit wants to see. */
+CREATE TABLE IF NOT EXISTS expiry_snapshots(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL, as_of TEXT NOT NULL,
+  file_name TEXT DEFAULT '', rows TEXT NOT NULL,
+  uploaded_by TEXT NOT NULL, uploaded_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_snap_h ON expiry_snapshots(hospital_id);
+/* Margin offers. A vendor rep proposes a better rate; someone here negotiates it;
+   it is chased, then accepted or declined, and only then does it touch the Item
+   Master. The point is the FOLLOW-UP — an offer nobody chases is a discount lost,
+   so who offered it, who is negotiating, and when it expires all live here. */
+CREATE TABLE IF NOT EXISTS margin_offers(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL,
+  item_id TEXT, item_name TEXT NOT NULL, molecule TEXT DEFAULT '', pack TEXT DEFAULT '',
+  vendor TEXT DEFAULT '', offered_by TEXT DEFAULT '', offered_by_phone TEXT DEFAULT '',
+  negotiated_by TEXT NOT NULL, offer_date TEXT NOT NULL,
+  old_nr REAL DEFAULT 0, old_mrp REAL DEFAULT 0, new_nr REAL DEFAULT 0, new_mrp REAL DEFAULT 0,
+  qty_commit REAL DEFAULT 0, valid_till TEXT, next_follow_up TEXT,
+  status TEXT NOT NULL DEFAULT 'proposed', notes TEXT DEFAULT '',
+  applied_at INTEGER, created_by TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_off_h ON margin_offers(hospital_id);
+/* Append-only, exactly like the receivable log: a correction is a new entry. */
+CREATE TABLE IF NOT EXISTS margin_offer_actions(
+  id TEXT PRIMARY KEY, offer_id TEXT NOT NULL, hospital_id TEXT NOT NULL,
+  type TEXT NOT NULL, note TEXT DEFAULT '', action_date TEXT NOT NULL,
+  by_name TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_offact_o ON margin_offer_actions(offer_id);
+CREATE INDEX IF NOT EXISTS idx_offact_h ON margin_offer_actions(hospital_id);
+CREATE TABLE IF NOT EXISTS price_log(
+  id TEXT PRIMARY KEY, item_id TEXT NOT NULL, hospital_id TEXT NOT NULL,
+  old_nr REAL, old_mrp REAL, new_nr REAL, new_mrp REAL,
+  note TEXT DEFAULT '', user_name TEXT DEFAULT '', ts INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_plog_item ON price_log(item_id);
+`);
+
+/* migrate: single hospital_id -> hospital_ids list + portal on/off flag */
+{
+  const cols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  if (!cols.includes('hospital_ids')) {
+    db.exec("ALTER TABLE users ADD COLUMN hospital_ids TEXT NOT NULL DEFAULT '[]'");
+    const upd = db.prepare('UPDATE users SET hospital_ids=? WHERE id=?');
+    for (const u of db.prepare('SELECT id, hospital_id FROM users').all()) {
+      upd.run(JSON.stringify(u.hospital_id ? [u.hospital_id] : ['*']), u.id);
+    }
+  }
+  if (!cols.includes('active')) db.exec('ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1');
+  /* Two roles, not three (Arjun, Jul 17): admin — everything; user — the daily
+     entry screen and nothing else. 'manager' had the same reach as admin bar
+     user/hospital management, so it folds into admin; 'staff' becomes 'user'.
+
+     SQLite CANNOT alter a CHECK constraint, so widening the CREATE TABLE above
+     only ever helps a fresh database — an existing table keeps the old three-role
+     check and rejects the UPDATE. The table has to be rebuilt. */
+  if (/CHECK\(role IN \('admin','manager','staff'\)\)/.test(
+        db.prepare("SELECT sql FROM sqlite_master WHERE name='users'").get().sql || '')) {
+    db.exec(`
+      CREATE TABLE users_new(
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+        role TEXT NOT NULL CHECK(role IN ('admin','user')),
+        role_label TEXT NOT NULL, hospital_id TEXT, pw_hash TEXT NOT NULL, created_at INTEGER NOT NULL,
+        hospital_ids TEXT NOT NULL DEFAULT '[]', active INTEGER NOT NULL DEFAULT 1);
+      INSERT INTO users_new(id,name,email,role,role_label,hospital_id,pw_hash,created_at,hospital_ids,active)
+        SELECT id, name, email,
+          CASE role WHEN 'manager' THEN 'admin' WHEN 'staff' THEN 'user' ELSE role END,
+          CASE role WHEN 'manager' THEN 'Yajna Admin' WHEN 'staff' THEN 'Data entry' ELSE role_label END,
+          hospital_id, pw_hash, created_at, hospital_ids, active
+        FROM users;
+      DROP TABLE users;
+      ALTER TABLE users_new RENAME TO users;`);
+    console.log('Migrated users to two roles (admin / user).');
+  }
+}
+
+/* inventory: per-item opening quantity + the date that count was taken.
+   Live stock = opening_qty + invoice qty in - sale qty out - RTV qty, for movements on/after stock_date. */
+{
+  const icols = db.prepare('PRAGMA table_info(items)').all().map(c => c.name);
+  if (!icols.includes('opening_qty')) db.exec('ALTER TABLE items ADD COLUMN opening_qty REAL NOT NULL DEFAULT 0');
+  /* Molecule is what makes two brands comparable across hospitals — "Tab.
+     Rifaximin 550" at one and "Rifagut 550" at another are the same purchase
+     decision. Optional: an item without one still works everywhere else. */
+  if (!icols.includes('molecule')) db.exec("ALTER TABLE items ADD COLUMN molecule TEXT NOT NULL DEFAULT ''");
+  const hcols = db.prepare('PRAGMA table_info(hospitals)').all().map(c => c.name);
+  if (!hcols.includes('stock_date')) db.exec('ALTER TABLE hospitals ADD COLUMN stock_date TEXT');
+  // pharmacies dispense by expiry, not receipt order — FEFO is the shipped default
+  if (!hcols.includes('issue_method')) db.exec("ALTER TABLE hospitals ADD COLUMN issue_method TEXT NOT NULL DEFAULT 'fefo'");
+}
+
+/* ---------- helpers ---------- */
+const todayISO = () => {
+  const d = new Date();
+  // IST — pharmacy operating timezone
+  const ist = new Date(d.getTime() + (330 + d.getTimezoneOffset()) * 60000);
+  return ist.getFullYear() + '-' + String(ist.getMonth() + 1).padStart(2, '0') + '-' + String(ist.getDate()).padStart(2, '0');
+};
+const uid = (p) => p + '-' + crypto.randomBytes(6).toString('hex');
+const msToISO = (ms) => { const d = new Date(ms); const ist = new Date(d.getTime() + (330 + d.getTimezoneOffset()) * 60000); return ist.toISOString().slice(0, 10); };
+const addDaysISO = (iso, n) => { const d = new Date(iso + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+const N = (v) => { const n = parseFloat(v); return isFinite(n) ? n : 0; };
+const fmtRs = (n) => 'Rs. ' + Math.round(Math.abs(n)).toLocaleString('en-IN');
+const S = (v, l = 300) => String(v == null ? '' : v).slice(0, l);
+const prim = (v, l = 300) => (typeof v === 'number' && isFinite(v)) ? v : S(v, l);
+
+const nameKey = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+// YYYY-MM, and the month must be a real month — /^\d{4}-\d{2}$/ alone accepts 2027-13
+const validExpiry = (v) => { const x = S(v, 7); return /^\d{4}-(0[1-9]|1[0-2])$/.test(x) ? x : ''; };
+const marginPct = (nr, mrp) => (N(mrp) > 0 ? (N(mrp) - N(nr)) / N(mrp) * 100 : 0);
+
+/* Purchase-line maths. Vendor discount and GST are ALWAYS percentages.
+   Free (offer) stock is not paid for but does enter stock, so it dilutes cost
+   across Total Qty — Net Rate, not Rate, is the real cost basis to negotiate on.
+     Total Qty  = Purchase Qty + Offer Qty
+     Disc Rate  = Rate x (1 - Disc%/100)
+     Rate+Tax   = Disc Rate x (1 + GST%/100)
+     Purchase Amount = Purchase Qty x Rate+Tax      (you only pay for billed qty)
+     Net Rate   = Purchase Amount / Total Qty
+     Margin %   = (MRP - Net Rate) / MRP x 100
+     Margin Rs  = (MRP - Net Rate) x Total Qty                                   */
+function calcLine(l) {
+  const pqty = Math.max(0, N(l.pqty));
+  const oqty = Math.max(0, N(l.oqty));
+  const rate = Math.max(0, N(l.rate));
+  const disc = Math.min(100, Math.max(0, N(l.disc)));
+  const gst = Math.max(0, N(l.gst));
+  const mrp = Math.max(0, N(l.mrp));
+  const tqty = pqty + oqty;
+  const drate = rate * (1 - disc / 100);
+  const prit = drate * (1 + gst / 100);
+  const pamt = pqty * prit;
+  const nr = tqty > 0 ? pamt / tqty : 0;                 // guard divide-by-zero
+  return {
+    pqty, oqty, rate, disc, gst, mrp, tqty, drate, prit, pamt, nr,
+    marginPct: marginPct(nr, mrp),                        // guards mrp === 0
+    marginRs: mrp > 0 ? (mrp - nr) * tqty : 0
+  };
+}
+
+function cleanEntry(x) {
+  if (!x || typeof x !== 'object') throw new Error('Invalid entry payload');
+  const arr = (v, cap) => (Array.isArray(v) ? v.slice(0, cap) : []);
+  const sales = x.sales || {}, audit = x.audit || {}, cash = x.cash || {};
+  return {
+    // invId links a purchase-summary row to the invoice it was derived from
+    purchases: arr(x.purchases, 100).map(p => ({ vendor: S(p.vendor, 120), items: prim(p.items), value: prim(p.value), invId: S(p.invId, 40) })),
+    rtv: arr(x.rtv, 100).map(r => ({ drug: S(r.drug, 120), vendor: S(r.vendor, 120), qty: prim(r.qty), value: prim(r.value), reason: S(r.reason, 40), status: S(r.status, 40) })),
+    sales: { mrp: prim(sales.mrp), cogs: prim(sales.cogs), cash: prim(sales.cash), credit: prim(sales.credit), cancels: prim(sales.cancels) },
+    /* Cash drawer. cash_sales is NOT stored here — it IS sales.cash. A second
+       field beside a derivable one guarantees two conflicting numbers. */
+    cash: {
+      opening: prim(cash.opening), receipts: prim(cash.receipts), payments: prim(cash.payments),
+      actual: prim(cash.actual), reason: S(cash.reason, 300)
+    },
+    audit: {
+      opening: prim(audit.opening), actual: prim(audit.actual), unbilled: !!audit.unbilled,
+      /* est_value_lost is derived (qty × mrp), never stored. Legacy rows
+         (drug/qty/doctor/action) map in without inventing a reason. */
+      bounces: arr(audit.bounces, 200).map(b => ({
+        brand: S(b.brand !== undefined ? b.brand : b.drug, 150),
+        molecule: S(b.molecule, 150),
+        qty: prim(b.qty),
+        mrp: prim(b.mrp),
+        reason: BOUNCE_REASONS.some(r => r.v === b.reason) ? b.reason : 'out_of_stock',
+        prescriber: S(b.prescriber !== undefined ? b.prescriber : b.doctor, 120),
+        department: S(b.department, 120),
+        action: BOUNCE_ACTIONS.some(a => a.v === b.action) ? b.action : 'lost_sale',
+        remarks: S(b.remarks, 300)
+      }))
+    },
+    hv: arr(x.hv, 60).map(h => ({ drug: S(h.drug, 120), opening: prim(h.opening), received: prim(h.received), dispensed: prim(h.dispensed), closing: prim(h.closing) })),
+    /* nr/mrp/pack ride along when the sales template supplied them — that is what
+       lets the day's margin be checked per item rather than only in total. */
+    itemSales: arr(x.itemSales, 1000).map(r => ({ item: S(r.item, 150), qty: prim(r.qty), amount: prim(r.amount),
+      pack: S(r.pack, 30), nr: prim(r.nr), mrp: prim(r.mrp), cost: prim(r.cost) })),
+    invoices: arr(x.invoices, 20).map(inv => ({
+      id: S(inv.id, 40), vendor: S(inv.vendor, 120), invoiceNo: S(inv.invoiceNo, 60), date: S(inv.date, 12), fileName: S(inv.fileName, 200),
+      /* Derived values are recomputed here, never trusted from the client.
+         Legacy lines (qty/nr/mrp only) map in as pqty=qty, rate=nr, disc=gst=0,
+         which reproduces their old numbers exactly. */
+      lines: arr(inv.lines, 200).map(l => {
+        const legacy = l.pqty === undefined && l.rate === undefined;
+        const d = calcLine(legacy
+          ? { pqty: l.qty, oqty: 0, rate: l.nr, disc: 0, gst: 0, mrp: l.mrp }
+          : l);
+        return {
+          item: S(l.item, 150),
+          // batch identity: valuation is per batch, because the same brand arrives
+          // repeatedly at different net rates and carries a different printed MRP
+          // each time. expiry is per batch by law.
+          batch: S(l.batch, 40).trim(), exp: validExpiry(l.exp),
+          pqty: d.pqty, oqty: d.oqty, rate: d.rate, disc: d.disc, gst: d.gst, mrp: d.mrp,
+          qty: d.tqty,          // Total Qty — what actually enters stock (incl. free goods)
+          nr: d.nr,             // Net Rate — the cost basis used by the margin tally
+          value: d.pamt         // Purchase Amount — what feeds the purchase total
+        };
+      })
+    }))
+  };
+}
+
+/* The drawer chain. Mirrored in index.html — this copy is the source of truth.
+   cash_sales is sales.cash. Cash handed to the doctor is a cash payment out like
+   any other: the drawer is the only place the day's cash is reconciled. */
+function calcCash(e) {
+  const c = e.cash || {};
+  const opening = N(c.opening), receipts = N(c.receipts), payments = N(c.payments);
+  const cashSales = N(e.sales.cash);
+  const expected = opening + cashSales + receipts - payments;
+  const hasActual = c.actual !== '' && c.actual != null;
+  const actual = N(c.actual);
+  const variance = hasActual ? actual - expected : 0;
+  return { opening, cashSales, receipts, payments, expected, hasActual, actual, variance,
+    breach: hasActual && Math.abs(variance) > CASH_VAR_THRESHOLD, reason: S(c.reason, 300) };
+}
+
+function entryAlerts(e) {
+  const alerts = [];
+  const purchTotal = e.purchases.reduce((a, p) => a + N(p.value), 0);
+  const hasActual = e.audit.actual !== '' && e.audit.actual != null;
+  if (hasActual) {
+    const variance = N(e.audit.actual) - (N(e.audit.opening) + purchTotal - N(e.sales.cogs));
+    if (Math.round(variance) !== 0) alerts.push({ type: 'variance', msg: `Stock variance of ${fmtRs(variance)} on day close` });
+  }
+  if (e.audit.unbilled) alerts.push({ type: 'unbilled', msg: 'Unbilled dispensing flagged during audit' });
+  const mm = e.hv.filter(r => r.drug && (N(r.opening) + N(r.received) - N(r.dispensed)) !== N(r.closing)).length;
+  if (mm > 0) alerts.push({ type: 'hv', msg: `${mm} high-value drug mismatch${mm > 1 ? 'es' : ''} in register` });
+  const cc = calcCash(e);
+  if (cc.breach) alerts.push({
+    type: 'cashdrawer',
+    msg: `Cash drawer ${cc.variance < 0 ? 'short' : 'over'} by ${fmtRs(Math.abs(cc.variance))} — counted ${fmtRs(cc.actual)} against an expected ${fmtRs(cc.expected)}${cc.reason ? ` (${cc.reason})` : ''}`
+  });
+  return alerts;
+}
+
+function userHospitals(u) {
+  try { const v = JSON.parse(u.hospital_ids || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+}
+/* null => every hospital; otherwise the explicit list of ids this user may open */
+function allowedHids(u) {
+  const list = userHospitals(u);
+  return list.includes('*') ? null : list;
+}
+const rowUser = (u) => u && ({
+  uid: u.id, name: u.name, email: u.email, role: u.role, roleLabel: u.role_label,
+  hospitals: userHospitals(u), allHospitals: userHospitals(u).includes('*'), active: !!u.active
+});
+/* admin — full access. user — the daily entry screen only. */
+const ROLES = ['admin', 'user'];
+const ROLE_LABEL = { admin: 'Yajna Admin', user: 'Data entry' };
+const ISSUE_METHODS = ['fefo', 'fifo'];
+const rowHosp = (h) => ({ id: h.id, name: h.name, doctor: h.doctor, location: h.location, phone: h.phone, startDate: h.start_date, stockDate: h.stock_date || null, issueMethod: h.issue_method || 'fefo', active: !!h.active, base: h.base });
+const rowVendor = (v) => ({ id: v.id, name: v.name, creditDays: v.credit_days, openingBal: v.opening_bal, phone: v.phone, addedOn: v.added_on });
+const rowPay = (p) => ({ id: p.id, vendorId: p.vendor_id, vendorName: p.vendor_name, amount: p.amount, date: p.date, note: p.note });
+const rowNotif = (n) => ({ id: n.id, type: n.type, hid: n.hospital_id, date: n.date, msg: n.msg, ts: n.ts, read: !!n.read });
+const rowItem = (i) => ({ molecule: i.molecule || '', id: i.id, name: i.name, key: i.name_key, pack: i.pack, nr: i.nr, mrp: i.mrp, openingQty: i.opening_qty || 0, source: i.source, updatedAt: i.updated_at });
+const rowAdj = (a) => ({ id: a.id, key: a.item_key, item: a.item_name, date: a.date, qty: a.qty, reason: a.reason, note: a.note, user: a.user_name, ts: a.created_at });
+
+/* why stock was corrected — required, because an unexplained adjustment is the
+   easiest place for leakage to hide */
+const ADJ_REASONS = ['Physical count correction', 'Expiry write-off', 'Damage / breakage', 'Theft / loss', 'Free sample issued', 'Return from ward', 'Data correction', 'Other'];
+
+/* ---------- bounce register ----------
+   A bounce is a LOST SALE from unavailability — never an RTV (stock returned to
+   a vendor). Separate registers, separate models, separate screens.
+   reason splits the two failures the report must never merge into one number:
+     not_stocked / not_in_formulary → a formulary DECISION
+     out_of_stock on a stocked brand → an OPERATIONS failure (reorder level) */
+const BOUNCE_REASONS = [
+  { v: 'out_of_stock', l: 'Stocked but out of stock', kind: 'ops' },
+  { v: 'not_stocked', l: 'Not stocked at all', kind: 'formulary' },
+  { v: 'not_in_formulary', l: 'Not in formulary', kind: 'formulary' },
+  { v: 'expired_pulled', l: 'Expired / pulled from shelf', kind: 'ops' },
+  { v: 'other', l: 'Other', kind: 'other' }
+];
+const BOUNCE_ACTIONS = [
+  { v: 'lost_sale', l: 'Lost sale' }, { v: 'substituted', l: 'Substituted' },
+  { v: 'outside_purchase', l: 'Bought outside' }, { v: 'customer_waiting', l: 'Customer waiting' }
+];
+const bounceKind = (r) => (BOUNCE_REASONS.find(x => x.v === r) || { kind: 'other' }).kind;
+
+/* Cash drawer variance needing a written reason. */
+const CASH_VAR_THRESHOLD = parseFloat(process.env.CASH_VAR_THRESHOLD || '100');
+
+/* ---------- receivables model ----------
+   Each party type carries its own expected credit period; status is measured
+   against THAT party's period, so a 40-day insurance claim is normal while a
+   40-day patient due is critical. */
+const PARTY_TYPES = [
+  { v: 'Insurance / TPA', days: 45 },
+  { v: 'Government scheme', days: 60 },
+  { v: 'Corporate', days: 30 },
+  { v: 'Ward / department', days: 15 },
+  { v: 'Patient', days: 7 }
+];
+const partyDays = (t) => (PARTY_TYPES.find(p => p.v === t) || { days: 30 }).days;
+const RECEIPT_MODES = ['Cash', 'UPI', 'Cheque', 'NEFT'];
+/* Overrides explain WHY a bill is old — they can never make it look current.
+   None of these are derived values, so an override can't reset the clock. */
+const OVERRIDE_VALUES = ['disputed', 'payment_promised', 'legal', 'write_off_pending', 'claim_resubmitted'];
+const OVERRIDE_DEFAULT_DAYS = 15, OVERRIDE_MAX_DAYS = 45;
+const ADJ_THRESHOLD = parseFloat(process.env.RECV_ADJ_THRESHOLD || '5000');
+
+const daysBetween = (from, to) => Math.floor((new Date(to + 'T12:00:00Z') - new Date(from + 'T12:00:00Z')) / 864e5);
+function derivedStatus(daysOut, partyType) {
+  const p = partyDays(partyType);
+  if (daysOut > 2 * p) return 'critical';
+  if (daysOut > p) return 'overdue';
+  if (daysOut >= p * 0.8) return 'due_soon';
+  return 'current';
+}
+const overrideActive = (r, today) => !!(r.ov_value && r.ov_expires && r.ov_expires >= today);
+
+/* amount_due is derived, never stored: bill − receipts + signed adjustments */
+function recvTotals(r, actions) {
+  let received = 0, adj = 0;
+  for (const a of actions) {
+    if (a.type === 'receipt') received += N(a.amount);
+    else if (a.type === 'adjustment') adj += N(a.amount);
+  }
+  return { received, adj, due: N(r.amount) - received + adj };
+}
+function rowRecv(r, actions, today) {
+  const t = recvTotals(r, actions);
+  const daysOut = daysBetween(r.bill_date, today);
+  const derived = derivedStatus(daysOut, r.party_type);
+  const ovOn = overrideActive(r, today);
+  return {
+    id: r.id, billNo: r.bill_no, billDate: r.bill_date, party: r.party, partyType: r.party_type,
+    amount: N(r.amount), received: t.received, adjustments: t.adj, due: t.due,
+    daysOutstanding: daysOut, creditDays: partyDays(r.party_type),
+    status: derived,
+    override: ovOn ? { value: r.ov_value, reason: r.ov_reason, setBy: r.ov_by, setAt: r.ov_at, setOn: msToISO(r.ov_at), expiresAt: r.ov_expires } : null,
+    effectiveStatus: ovOn ? r.ov_value : derived,
+    nextFollowUp: r.next_follow_up_date || null, assignedTo: r.assigned_to || null,
+    priority: r.priority || 'normal', createdBy: r.created_by, createdAt: r.created_at
+  };
+}
+const rowAction = (a) => ({
+  id: a.id, receivableId: a.receivable_id, type: a.type, amount: a.amount, mode: a.mode || null,
+  reason: a.reason || '', approver: a.approver_name || null, date: a.action_date,
+  by: a.entered_by, ts: a.entered_at
+});
+
+/* ---------- seed (first run only) ---------- */
+function seed() {
+  if (db.prepare('SELECT COUNT(*) c FROM users').get().c > 0) return;
+  const t = todayISO(), now = Date.now();
+  const insH = db.prepare('INSERT INTO hospitals(id,name,doctor,location,phone,start_date,active,base) VALUES(?,?,?,?,?,?,1,?)');
+  insH.run('viraj', 'Viraj Gastro', 'Dr. Guna Ranjan', 'Juvvalapalem Rd, Bhimavaram', '+91 98480 11223', t, 42000);
+  insH.run('siri', 'Siri Emergency Hospital', 'Dr. Siddartha Kannaji', 'PP Road, Bhimavaram', '+91 98661 44556', t, 58000);
+  insH.run('mithra', 'Mithra Medicare', 'Dr. Vikranth Chunduri', 'Gunupudi, Bhimavaram', '+91 99590 77889', t, 71000);
+  /* Seed passwords come from the environment, never from this file — a password
+     committed to source is a published password. Anything not supplied is
+     generated at random and printed ONCE, here, at seed time; there is no
+     default to guess and nothing to leak by reading the repository. */
+  const generated = [];
+  const seedPw = (envKey) => {
+    if (process.env[envKey]) return process.env[envKey];
+    const pw = 'Yajna-' + crypto.randomBytes(9).toString('base64url');
+    generated.push(`${envKey}=${pw}`);
+    return pw;
+  };
+  const insU = db.prepare('INSERT INTO users(id,name,email,role,role_label,hospital_id,hospital_ids,active,pw_hash,created_at) VALUES(?,?,?,?,?,NULL,?,1,?,?)');
+  insU.run('u-admin', 'Bhagavan', 'bhagavan@yajnapharma.in', 'admin', 'Yajna Admin', '["*"]', bcrypt.hashSync(seedPw('SEED_ADMIN_PW'), 10), now);
+  insU.run('u-manager', 'Ravi Teja', 'manager@yajnapharma.in', 'admin', 'Yajna Admin', '["*"]', bcrypt.hashSync(seedPw('SEED_MANAGER_PW'), 10), now);
+  insU.run('u-staff-mithra', 'Lakshmi D', 'staff.mithra@yajnapharma.in', 'user', 'Data entry', '["mithra"]', bcrypt.hashSync(seedPw('SEED_USER_PW'), 10), now);
+  console.log('Seeded 3 hospitals + 3 users (clean database).');
+  if (generated.length) {
+    console.log('\n  First-run logins — WRITE THESE DOWN, they are not stored anywhere in readable form:');
+    generated.forEach(l => console.log('    ' + l));
+    console.log('  Change them from Settings once you are in.\n');
+  }
+}
+seed();
+
+/* ---------- app ---------- */
+const app = express();
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '400kb' }));
+app.use(cookieParser());
+
+/* login rate limit: 10 attempts / 15 min per IP */
+const attempts = new Map();
+function rateLimited(ip) {
+  const now = Date.now();
+  const a = attempts.get(ip) || [];
+  const recent = a.filter(ts => now - ts < 15 * 60 * 1000);
+  attempts.set(ip, recent);
+  return recent.length >= 10;
+}
+
+function setSession(res, req, userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const now = Date.now();
+  db.prepare('INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)')
+    .run(token, userId, now, now + SESSION_DAYS * 864e5);
+  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
+  res.cookie(COOKIE, token, {
+    httpOnly: true, sameSite: 'lax', maxAge: SESSION_DAYS * 864e5,
+    secure: req.secure || req.headers['x-forwarded-proto'] === 'https'
+  });
+}
+
+function auth(req, res, next) {
+  const token = req.cookies[COOKIE];
+  if (!token) return res.status(401).json({ error: 'Not signed in' });
+  const s = db.prepare('SELECT * FROM sessions WHERE token=?').get(token);
+  if (!s || s.expires_at < Date.now()) return res.status(401).json({ error: 'Session expired — sign in again' });
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(s.user_id);
+  if (!u) return res.status(401).json({ error: 'Account not found' });
+  if (!u.active) { db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id); return res.status(401).json({ error: 'Your portal access has been turned off — contact the Yajna admin' }); }
+  req.user = u;
+  next();
+}
+const requireRole = (...roles) => (req, res, next) =>
+  roles.includes(req.user.role) ? next() : res.status(403).json({ error: 'Not permitted for your role' });
+
+function scopeCheck(req, hid) {
+  const allowed = allowedHids(req.user);
+  if (allowed && !allowed.includes(hid)) {
+    const e = new Error('You do not have access to this hospital'); e.status = 403; throw e;
+  }
+  const h = db.prepare('SELECT * FROM hospitals WHERE id=?').get(hid);
+  if (!h) { const e = new Error('Unknown hospital'); e.status = 404; throw e; }
+  return h;
+}
+
+/* ---------- auth routes ---------- */
+app.post('/api/login', (req, res) => {
+  const ip = req.ip || '?';
+  if (rateLimited(ip)) return res.status(429).json({ error: 'Too many attempts — wait 15 minutes' });
+  const { email, password } = req.body || {};
+  const u = db.prepare('SELECT * FROM users WHERE email=?').get(S(email, 200).trim().toLowerCase());
+  if (!u || !bcrypt.compareSync(S(password, 200), u.pw_hash)) {
+    attempts.get(ip).push(Date.now());
+    return res.status(401).json({ error: 'Incorrect email or password' });
+  }
+  if (!u.active) return res.status(403).json({ error: 'Your portal access has been turned off — contact the Yajna admin' });
+  setSession(res, req, u.id);
+  res.json({ user: rowUser(u) });
+});
+
+app.post('/api/logout', (req, res) => {
+  const token = req.cookies[COOKIE];
+  if (token) db.prepare('DELETE FROM sessions WHERE token=?').run(token);
+  res.clearCookie(COOKIE);
+  res.json({ ok: true });
+});
+
+app.post('/api/password', auth, (req, res) => {
+  const { current, next } = req.body || {};
+  if (!bcrypt.compareSync(S(current, 200), req.user.pw_hash)) return res.status(400).json({ error: 'Current password is incorrect' });
+  if (S(next).length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
+  db.prepare('UPDATE users SET pw_hash=? WHERE id=?').run(bcrypt.hashSync(S(next, 200), 10), req.user.id);
+  res.json({ ok: true });
+});
+
+/* ---------- bootstrap ---------- */
+app.get('/api/bootstrap', auth, (req, res) => {
+  const allowed = allowedHids(req.user);
+  const hs = allowed
+    ? (allowed.length ? db.prepare(`SELECT * FROM hospitals WHERE id IN (${allowed.map(() => '?').join(',')})`).all(...allowed) : [])
+    : db.prepare('SELECT * FROM hospitals').all();
+  const hids = hs.map(h => h.id);
+  const out = { user: rowUser(req.user), hospitals: {}, vendors: {}, payments: {}, dailyData: {}, hvTracked: {}, reportPrefs: {}, notifications: [], items: {}, adjustments: {}, offers: {}, offerActions: {}, receivables: {}, recvActions: {}, snapshots: {}, periodData: {}, offerStates: OFFER_STATES, offerActionTypes: OFFER_ACTIONS, adjReasons: ADJ_REASONS, issueMethods: ISSUE_METHODS, bounceReasons: BOUNCE_REASONS, bounceActions: BOUNCE_ACTIONS, cashVarThreshold: CASH_VAR_THRESHOLD, partyTypes: PARTY_TYPES, receiptModes: RECEIPT_MODES, overrideValues: OVERRIDE_VALUES, adjThreshold: ADJ_THRESHOLD, overrideMaxDays: OVERRIDE_MAX_DAYS, overrideDefaultDays: OVERRIDE_DEFAULT_DAYS, aiEnabled: !!process.env.ANTHROPIC_API_KEY };
+  for (const h of hs) {
+    out.hospitals[h.id] = rowHosp(h);
+    out.vendors[h.id] = db.prepare('SELECT * FROM vendors WHERE hospital_id=? ORDER BY name').all(h.id).map(rowVendor);
+    out.payments[h.id] = db.prepare('SELECT * FROM payments WHERE hospital_id=? ORDER BY date DESC, created_at DESC').all(h.id).map(rowPay);
+    out.dailyData[h.id] = {};
+    for (const r of db.prepare("SELECT date,data,saved_at FROM entries WHERE hospital_id=? AND date >= date('now','-400 days')").all(h.id)) {
+      const e = JSON.parse(r.data); e.savedAt = r.saved_at;
+      out.dailyData[h.id][r.date] = e;
+    }
+    const hv = db.prepare('SELECT drugs FROM hv_tracked WHERE hospital_id=?').get(h.id);
+    out.hvTracked[h.id] = hv ? JSON.parse(hv.drugs) : [];
+    out.items[h.id] = db.prepare('SELECT * FROM items WHERE hospital_id=? ORDER BY name').all(h.id).map(rowItem);
+    out.adjustments[h.id] = db.prepare('SELECT * FROM stock_adjustments WHERE hospital_id=? ORDER BY date DESC, created_at DESC').all(h.id).map(rowAdj);
+    out.offers[h.id] = db.prepare('SELECT * FROM margin_offers WHERE hospital_id=? ORDER BY offer_date DESC, created_at DESC').all(h.id).map(o => rowOffer(o, todayISO()));
+    out.offerActions[h.id] = db.prepare('SELECT * FROM margin_offer_actions WHERE hospital_id=? ORDER BY action_date, at').all(h.id).map(rowOfferAction);
+    {
+      const acts = db.prepare('SELECT * FROM receivable_actions WHERE hospital_id=? ORDER BY action_date, entered_at').all(h.id);
+      const byR = {};
+      for (const a of acts) (byR[a.receivable_id] = byR[a.receivable_id] || []).push(a);
+      out.receivables[h.id] = db.prepare('SELECT * FROM receivables WHERE hospital_id=?').all(h.id)
+        .map(r => rowRecv(r, byR[r.id] || [], todayISO()));
+      out.recvActions[h.id] = acts.map(rowAction);
+      out.snapshots[h.id] = db.prepare('SELECT * FROM expiry_snapshots WHERE hospital_id=? ORDER BY as_of DESC').all(h.id).map(rowSnap);
+    }
+    out.periodData[h.id] = { weekly: {}, monthly: {} };
+    for (const r of db.prepare('SELECT ptype,pkey,data FROM period_data WHERE hospital_id=?').all(h.id)) {
+      if (out.periodData[h.id][r.ptype]) out.periodData[h.id][r.ptype][r.pkey] = JSON.parse(r.data);
+    }
+    out.reportPrefs[h.id] = {};
+    for (const r of db.prepare('SELECT type,prefs FROM report_prefs WHERE hospital_id=?').all(h.id)) {
+      out.reportPrefs[h.id][r.type] = JSON.parse(r.prefs);
+    }
+  }
+  out.notifications = (allowed
+    ? (allowed.length ? db.prepare(`SELECT * FROM notifications WHERE hospital_id IN (${allowed.map(() => '?').join(',')}) ORDER BY ts DESC LIMIT 200`).all(...allowed) : [])
+    : db.prepare('SELECT * FROM notifications ORDER BY ts DESC LIMIT 200').all()
+  ).map(rowNotif);
+  if (req.user.role === 'admin') {
+    out.userList = db.prepare('SELECT * FROM users ORDER BY created_at').all().map(rowUser);
+  }
+  res.json(out);
+});
+
+/* ---------- daily entries ---------- */
+app.put('/api/entries/:hid/:date', auth, (req, res) => {
+  const { hid, date } = req.params;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Bad date' });
+  scopeCheck(req, hid);
+  const today = todayISO();
+  if (date > today) return res.status(400).json({ error: 'Cannot enter data for a future date' });
+  const existing = db.prepare('SELECT saved_at FROM entries WHERE hospital_id=? AND date=?').get(hid, date);
+  if (req.user.role !== 'admin' && existing && date !== today) {
+    return res.status(403).json({ error: 'Saved entries for past dates are locked — ask the admin to edit' });
+  }
+  const entry = cleanEntry((req.body || {}).entry);
+  // a drawer variance past the threshold is not a saveable day without a reason
+  const cc = calcCash(entry);
+  if (cc.breach && !cc.reason)
+    return res.status(400).json({ error: `Cash variance of ${fmtRs(cc.variance)} needs a reason — anything over ${fmtRs(CASH_VAR_THRESHOLD)} must be explained` });
+  const savedAt = Date.now();
+
+  const tx = db.transaction(() => {
+    db.prepare('INSERT INTO entries(hospital_id,date,data,saved_at) VALUES(?,?,?,?) ON CONFLICT(hospital_id,date) DO UPDATE SET data=excluded.data, saved_at=excluded.saved_at')
+      .run(hid, date, JSON.stringify(entry), savedAt);
+
+    // auto-register unknown vendors from purchase rows
+    const known = db.prepare('SELECT name FROM vendors WHERE hospital_id=?').all(hid).map(v => v.name.toLowerCase());
+    const vendorsAdded = [];
+    for (const p of entry.purchases) {
+      const name = (p.vendor || '').trim();
+      if (name && !known.includes(name.toLowerCase())) {
+        const v = { id: uid(hid + '-v'), name, credit_days: 30, opening_bal: 0, phone: '', added_on: today };
+        db.prepare('INSERT INTO vendors(id,hospital_id,name,credit_days,opening_bal,phone,added_on) VALUES(?,?,?,?,?,?,?)')
+          .run(v.id, hid, v.name, v.credit_days, v.opening_bal, v.phone, v.added_on);
+        known.push(name.toLowerCase());
+        vendorsAdded.push(rowVendor(v));
+      }
+    }
+
+    // keep the tracked HV drug list in sync with this entry
+    const drugs = [...new Set(entry.hv.map(r => r.drug.trim()).filter(Boolean))];
+    db.prepare('INSERT INTO hv_tracked(hospital_id,drugs) VALUES(?,?) ON CONFLICT(hospital_id) DO UPDATE SET drugs=excluded.drugs')
+      .run(hid, JSON.stringify(drugs));
+
+    // item master: auto-register unknown invoice items; margin-tally known ones
+    const itemsAdded = [];
+    const marginAlerts = [];
+    const findItem = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
+    for (const inv of entry.invoices) {
+      for (const l of inv.lines) {
+        const name = (l.item || '').trim();
+        if (!name) continue;
+        const key = nameKey(name);
+        const existing = findItem.get(hid, key);
+        if (!existing) {
+          if (N(l.nr) > 0 && N(l.mrp) > 0) {
+            const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack: '', nr: N(l.nr), mrp: N(l.mrp), source: 'invoice', updated_at: savedAt };
+            db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
+              .run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.source, it.updated_at);
+            itemsAdded.push(rowItem(it));
+          }
+        } else if (N(l.nr) > 0 && N(l.mrp) > 0) {
+          const lineM = marginPct(l.nr, l.mrp);
+          const masterM = marginPct(existing.nr, existing.mrp);
+          if (Math.abs(lineM - masterM) > MARGIN_TOL) {
+            marginAlerts.push(`"${existing.name}" margin ${lineM.toFixed(1)}% vs master ${masterM.toFixed(1)}% on ${inv.vendor || 'invoice'}${inv.invoiceNo ? ' #' + inv.invoiceNo : ''}`);
+          }
+        }
+      }
+    }
+
+    // regenerate audit alerts for this day
+    db.prepare("DELETE FROM notifications WHERE hospital_id=? AND date=? AND type IN ('variance','unbilled','hv','margin','cashdrawer')").run(hid, date);
+    const alerts = entryAlerts(entry);
+    marginAlerts.slice(0, 20).forEach(msg => alerts.push({ type: 'margin', msg }));
+    const notifications = alerts.map(a => {
+      const n = { id: uid('n'), type: a.type, hospital_id: hid, date, msg: a.msg, ts: savedAt, read: 0 };
+      db.prepare('INSERT INTO notifications(id,type,hospital_id,date,msg,ts,read) VALUES(?,?,?,?,?,?,0)')
+        .run(n.id, n.type, n.hospital_id, n.date, n.msg, n.ts);
+      return rowNotif(n);
+    });
+    return { vendorsAdded, itemsAdded, notifications, hvTracked: drugs };
+  });
+
+  const r = tx();
+  res.json({ savedAt, ...r });
+});
+
+/* ---------- payments ---------- */
+app.post('/api/payments', auth, requireRole('admin'), (req, res) => {
+  const { hid, vendorId, amount, date, note } = req.body || {};
+  scopeCheck(req, S(hid, 60));
+  const v = db.prepare('SELECT * FROM vendors WHERE id=? AND hospital_id=?').get(S(vendorId, 80), hid);
+  if (!v) return res.status(404).json({ error: 'Vendor not found for this hospital' });
+  const amt = N(amount);
+  if (amt <= 0) return res.status(400).json({ error: 'Payment amount must be positive' });
+  const d = /^\d{4}-\d{2}-\d{2}$/.test(S(date)) ? date : todayISO();
+  const p = { id: uid('p'), hospital_id: hid, vendor_id: v.id, vendor_name: v.name, amount: amt, date: d, note: S(note, 200), created_at: Date.now() };
+  db.prepare('INSERT INTO payments(id,hospital_id,vendor_id,vendor_name,amount,date,note,created_at) VALUES(?,?,?,?,?,?,?,?)')
+    .run(p.id, p.hospital_id, p.vendor_id, p.vendor_name, p.amount, p.date, p.note, p.created_at);
+  res.json({ payment: rowPay(p) });
+});
+
+/* ---------- vendors bulk import ---------- */
+app.post('/api/vendors/bulk', auth, requireRole('admin'), (req, res) => {
+  const { hid, vendors } = req.body || {};
+  scopeCheck(req, S(hid, 60));
+  if (!Array.isArray(vendors)) return res.status(400).json({ error: 'vendors must be an array' });
+  const today = todayISO();
+  const known = db.prepare('SELECT name FROM vendors WHERE hospital_id=?').all(hid).map(v => v.name.toLowerCase());
+  const created = [];
+  const tx = db.transaction(() => {
+    for (const raw of vendors.slice(0, 500)) {
+      const name = S(raw.name, 120).trim();
+      if (!name || known.includes(name.toLowerCase())) continue;
+      const v = { id: uid(hid + '-v'), name, credit_days: Math.max(0, Math.round(N(raw.credit)) || 30), opening_bal: N(raw.bal), phone: S(raw.phone, 40), added_on: today };
+      db.prepare('INSERT INTO vendors(id,hospital_id,name,credit_days,opening_bal,phone,added_on) VALUES(?,?,?,?,?,?,?)')
+        .run(v.id, hid, v.name, v.credit_days, v.opening_bal, v.phone, v.added_on);
+      known.push(name.toLowerCase());
+      created.push(rowVendor(v));
+    }
+  });
+  tx();
+  res.json({ created });
+});
+
+/* ---------- hospitals (admin) ---------- */
+app.post('/api/hospitals', auth, requireRole('admin'), (req, res) => {
+  const b = req.body || {};
+  const name = S(b.name, 150).trim();
+  if (!name) return res.status(400).json({ error: 'Hospital name is required' });
+  const h = {
+    id: uid('h'), name, doctor: S(b.doctor, 150), location: S(b.location, 200), phone: S(b.phone, 40),
+    start_date: /^\d{4}-\d{2}-\d{2}$/.test(S(b.startDate)) ? b.startDate : todayISO(), active: 1, base: 50000
+  };
+  db.prepare('INSERT INTO hospitals(id,name,doctor,location,phone,start_date,active,base) VALUES(?,?,?,?,?,?,1,?)')
+    .run(h.id, h.name, h.doctor, h.location, h.phone, h.start_date, h.base);
+  res.json({ hospital: rowHosp(h) });
+});
+
+app.patch('/api/hospitals/:id', auth, requireRole('admin'), (req, res) => {
+  const h = db.prepare('SELECT * FROM hospitals WHERE id=?').get(req.params.id);
+  if (!h) return res.status(404).json({ error: 'Unknown hospital' });
+  const b = req.body || {};
+  const upd = {
+    name: b.name !== undefined ? S(b.name, 150).trim() || h.name : h.name,
+    doctor: b.doctor !== undefined ? S(b.doctor, 150) : h.doctor,
+    location: b.location !== undefined ? S(b.location, 200) : h.location,
+    phone: b.phone !== undefined ? S(b.phone, 40) : h.phone,
+    start_date: (b.startDate !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(S(b.startDate))) ? b.startDate : h.start_date,
+    issue_method: (b.issueMethod !== undefined && ISSUE_METHODS.includes(b.issueMethod)) ? b.issueMethod : (h.issue_method || 'fefo'),
+    active: b.active !== undefined ? (b.active ? 1 : 0) : h.active
+  };
+  db.prepare('UPDATE hospitals SET name=?,doctor=?,location=?,phone=?,start_date=?,issue_method=?,active=? WHERE id=?')
+    .run(upd.name, upd.doctor, upd.location, upd.phone, upd.start_date, upd.issue_method, upd.active, h.id);
+  res.json({ hospital: rowHosp({ id: h.id, base: h.base, ...upd }) });
+});
+
+/* ---------- clearing data ----------
+   One target per dataset, never a single "clear everything" — the datasets are
+   independent (the item master outlives any day's entry; a payment is not a
+   purchase), so lumping them together would make a slip unrecoverable and would
+   hide what was actually removed.
+
+   Irreversible and bulk, so it is gated hard: admin only, and the caller must
+   type the hospital's name back. */
+const CLEAR_TARGETS = {
+  entries:     { t: 'Daily entries', ranged: true,  tables: ['entries', 'notifications'] },
+  /* Opening stock is inventory's anchor, and it is NOT the item master: you can
+     re-do a bad opening count without throwing away every negotiated price. It
+     lives on the items rows, so it is zeroed rather than deleted. */
+  opening:     { t: 'Opening stock', ranged: false, tables: [], count: (hid) =>
+                 db.prepare('SELECT COUNT(*) c FROM items WHERE hospital_id=? AND opening_qty!=0').get(hid).c },
+  payments:    { t: 'Vendor payments', ranged: true, tables: ['payments'] },
+  adjustments: { t: 'Stock adjustments', ranged: true, tables: ['stock_adjustments'] },
+  snapshots:   { t: 'Imported stock reports', ranged: true, tables: ['expiry_snapshots'] },
+  receivables: { t: 'Receivables', ranged: true, tables: ['receivables', 'receivable_actions'] },
+  items:       { t: 'Item Master', ranged: false, tables: ['items', 'price_log'] },
+  vendors:     { t: 'Vendors', ranged: false, tables: ['vendors'] },
+  periods:     { t: 'Weekly / monthly entered sections', ranged: false, tables: ['period_data'] }
+};
+/* which column dates each table, where it is ranged at all */
+const CLEAR_DATE_COL = { entries: 'date', notifications: 'date', payments: 'date',
+  stock_adjustments: 'date', expiry_snapshots: 'as_of', receivables: 'bill_date' };
+
+app.get('/api/clear/preview', auth, requireRole('admin'), (req, res) => {
+  const hid = S(req.query.hid, 60);
+  scopeCheck(req, hid);
+  const out = {};
+  for (const [key, t] of Object.entries(CLEAR_TARGETS)) {
+    const from = S(req.query.from, 12), to = S(req.query.to, 12);
+    const ranged = t.ranged && /^\d{4}-\d{2}-\d{2}$/.test(from) && /^\d{4}-\d{2}-\d{2}$/.test(to);
+    if (t.count) { out[key] = t.count(hid); continue; }
+    const tbl = t.tables[0];
+    const col = CLEAR_DATE_COL[tbl];
+    out[key] = ranged && col
+      ? db.prepare(`SELECT COUNT(*) c FROM ${tbl} WHERE hospital_id=? AND ${col} BETWEEN ? AND ?`).get(hid, from, to).c
+      : db.prepare(`SELECT COUNT(*) c FROM ${tbl} WHERE hospital_id=?`).get(hid).c;
+  }
+  res.json({ counts: out });
+});
+
+app.post('/api/clear', auth, requireRole('admin'), (req, res) => {
+  const b = req.body || {};
+  const hid = S(b.hid, 60);
+  scopeCheck(req, hid);
+  const key = S(b.target, 40);
+  const T = CLEAR_TARGETS[key];
+  if (!T) return res.status(400).json({ error: 'Unknown thing to clear' });
+  const h = db.prepare('SELECT name FROM hospitals WHERE id=?').get(hid);
+  if (!h) return res.status(404).json({ error: 'Unknown hospital' });
+  // typing the name back is the last thing between a slip and lost work
+  if (S(b.confirm, 150).trim() !== h.name)
+    return res.status(400).json({ error: `Type the hospital name exactly — ${h.name} — to confirm` });
+
+  const from = S(b.from, 12), to = S(b.to, 12);
+  const ranged = T.ranged && /^\d{4}-\d{2}-\d{2}$/.test(from) && /^\d{4}-\d{2}-\d{2}$/.test(to);
+  if (T.ranged && !ranged) return res.status(400).json({ error: 'Pick a valid date range' });
+  if (ranged && from > to) return res.status(400).json({ error: 'The range starts after it ends' });
+
+  let deleted = 0;
+  const tx = db.transaction(() => {
+    // opening stock is a column on the items, not a table — zero it and drop the
+    // anchor date, but leave the items and their prices standing
+    if (key === 'opening') {
+      deleted = db.prepare('SELECT COUNT(*) c FROM items WHERE hospital_id=? AND opening_qty!=0').get(hid).c;
+      db.prepare('UPDATE items SET opening_qty=0 WHERE hospital_id=?').run(hid);
+      db.prepare('UPDATE hospitals SET stock_date=NULL WHERE id=?').run(hid);
+      return;
+    }
+    // receivable_actions are keyed to their bill, not to a date of their own —
+    // clearing a bill must take its whole action log with it
+    if (key === 'receivables') {
+      const ids = ranged
+        ? db.prepare('SELECT id FROM receivables WHERE hospital_id=? AND bill_date BETWEEN ? AND ?').all(hid, from, to).map(r => r.id)
+        : db.prepare('SELECT id FROM receivables WHERE hospital_id=?').all(hid).map(r => r.id);
+      for (const id of ids) db.prepare('DELETE FROM receivable_actions WHERE receivable_id=?').run(id);
+      deleted = ids.length;
+      if (ranged) db.prepare('DELETE FROM receivables WHERE hospital_id=? AND bill_date BETWEEN ? AND ?').run(hid, from, to);
+      else db.prepare('DELETE FROM receivables WHERE hospital_id=?').run(hid);
+      return;
+    }
+    for (const tbl of T.tables) {
+      const col = CLEAR_DATE_COL[tbl];
+      const r = (ranged && col)
+        ? db.prepare(`DELETE FROM ${tbl} WHERE hospital_id=? AND ${col} BETWEEN ? AND ?`).run(hid, from, to)
+        : db.prepare(`DELETE FROM ${tbl} WHERE hospital_id=?`).run(hid);
+      if (tbl === T.tables[0]) deleted = r.changes;
+    }
+    // the item master carries the opening count — clearing it clears the anchor
+    if (key === 'items') db.prepare('UPDATE hospitals SET stock_date=NULL WHERE id=?').run(hid);
+  });
+  tx();
+  console.log(`[clear] ${req.user.name} cleared ${deleted} ${key} for ${hid}${ranged ? ` (${from}..${to})` : ' (everything)'}`);
+  res.json({ deleted, target: key, from: ranged ? from : null, to: ranged ? to : null });
+});
+
+/* Every table a hospital owns. Deleting the hospital takes all of it — this is
+   the single most destructive thing in the app, so the list is explicit rather
+   than inferred, and the impact is countable before anything happens. */
+const HOSPITAL_TABLES = ['entries', 'notifications', 'vendors', 'payments', 'items', 'price_log',
+  'stock_adjustments', 'receivables', 'receivable_actions', 'expiry_snapshots', 'period_data',
+  'hv_tracked', 'report_prefs'];
+
+/* What would go, and who would be left without a hospital — answered BEFORE the
+   delete, so the confirmation can show it rather than surprise anyone. */
+app.get('/api/hospitals/:id/impact', auth, requireRole('admin'), (req, res) => {
+  const h = db.prepare('SELECT * FROM hospitals WHERE id=?').get(req.params.id);
+  if (!h) return res.status(404).json({ error: 'Unknown hospital' });
+  const rows = {};
+  let total = 0;
+  for (const t of HOSPITAL_TABLES) {
+    const c = db.prepare(`SELECT COUNT(*) c FROM ${t} WHERE hospital_id=?`).get(h.id).c;
+    if (c) { rows[t] = c; total += c; }
+  }
+  // a user scoped only to this hospital would be left able to sign in and see nothing
+  const stranded = db.prepare('SELECT id,name,email,hospital_ids FROM users').all()
+    .map(u => ({ ...u, ids: JSON.parse(u.hospital_ids || '[]') }))
+    .filter(u => !u.ids.includes('*') && u.ids.includes(h.id) && u.ids.filter(x => x !== h.id).length === 0)
+    .map(u => ({ name: u.name, email: u.email }));
+  res.json({ hospital: rowHosp(h), rows, total, stranded, remaining: db.prepare('SELECT COUNT(*) c FROM hospitals').get().c - 1 });
+});
+
+app.delete('/api/hospitals/:id', auth, requireRole('admin'), (req, res) => {
+  const h = db.prepare('SELECT * FROM hospitals WHERE id=?').get(req.params.id);
+  if (!h) return res.status(404).json({ error: 'Unknown hospital' });
+  if (db.prepare('SELECT COUNT(*) c FROM hospitals').get().c <= 1)
+    return res.status(400).json({ error: 'This is the only hospital — the console would have nothing to show' });
+  const b = req.body || {};
+  if (S(b.confirm, 150).trim() !== h.name)
+    return res.status(400).json({ error: `Type the hospital name exactly — ${h.name} — to confirm` });
+
+  let deleted = 0;
+  const stranded = [];
+  const tx = db.transaction(() => {
+    for (const t of HOSPITAL_TABLES) deleted += db.prepare(`DELETE FROM ${t} WHERE hospital_id=?`).run(h.id).changes;
+    // a user's scope must never point at a hospital that no longer exists
+    for (const u of db.prepare('SELECT id,name,hospital_ids FROM users').all()) {
+      const ids = JSON.parse(u.hospital_ids || '[]');
+      if (ids.includes('*') || !ids.includes(h.id)) continue;
+      const left = ids.filter(x => x !== h.id);
+      db.prepare('UPDATE users SET hospital_ids=? WHERE id=?').run(JSON.stringify(left), u.id);
+      if (!left.length) stranded.push(u.name);
+      db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);   // their scope changed under them
+    }
+    db.prepare('DELETE FROM hospitals WHERE id=?').run(h.id);
+  });
+  tx();
+  console.log(`[hospital] ${req.user.name} DELETED ${h.id} (${h.name}) — ${deleted} rows${stranded.length ? `; stranded: ${stranded.join(', ')}` : ''}`);
+  res.json({ deleted, id: h.id, name: h.name, stranded });
+});
+
+/* ---------- margin offers ----------
+   Status is DERIVED where it can be: `expired` is not a state anyone sets, it is
+   what `valid_till` means once the date passes. Only the decisions people
+   actually make — accepted, declined, applied — are stored. */
+const OFFER_STATES = ['proposed', 'accepted', 'declined', 'applied'];
+const OFFER_ACTIONS = ['follow_up', 'note', 'revised', 'accepted', 'declined', 'applied', 'reopened'];
+const offerMargin = (nr, mrp) => (N(mrp) > 0 ? (N(mrp) - N(nr)) / N(mrp) * 100 : 0);
+
+function rowOffer(o, today) {
+  const oldM = offerMargin(o.old_nr, o.old_mrp), newM = offerMargin(o.new_nr, o.new_mrp);
+  // an offer past its date is expired whatever the stored state says — unless it
+  // was already applied, which is history and cannot expire
+  const expired = !!o.valid_till && o.valid_till < today && o.status !== 'applied' && o.status !== 'declined';
+  return {
+    id: o.id, hid: o.hospital_id, itemId: o.item_id || null, item: o.item_name,
+    molecule: o.molecule || '', pack: o.pack || '',
+    vendor: o.vendor || '', offeredBy: o.offered_by || '', offeredByPhone: o.offered_by_phone || '',
+    negotiatedBy: o.negotiated_by, offerDate: o.offer_date,
+    oldNr: N(o.old_nr), oldMrp: N(o.old_mrp), newNr: N(o.new_nr), newMrp: N(o.new_mrp),
+    oldMargin: oldM, newMargin: newM, gainPts: newM - oldM,
+    // what the better rate is worth over the quantity committed
+    qtyCommit: N(o.qty_commit), savingRs: (N(o.old_nr) - N(o.new_nr)) * N(o.qty_commit),
+    validTill: o.valid_till || null, nextFollowUp: o.next_follow_up || null,
+    status: o.status, expired, effectiveStatus: expired ? 'expired' : o.status,
+    notes: o.notes || '', appliedAt: o.applied_at || null,
+    createdBy: o.created_by, createdAt: o.created_at
+  };
+}
+const rowOfferAction = (a) => ({ id: a.id, offerId: a.offer_id, type: a.type, note: a.note || '',
+  date: a.action_date, by: a.by_name, at: a.at });
+const offerActions = (oid) => db.prepare('SELECT * FROM margin_offer_actions WHERE offer_id=? ORDER BY action_date, at').all(oid);
+
+function pushOfferAction(o, type, note, date, user) {
+  const a = { id: uid('oa'), offer_id: o.id, hospital_id: o.hospital_id, type,
+    note: S(note, 400), action_date: date || todayISO(), by_name: user, at: Date.now() };
+  db.prepare('INSERT INTO margin_offer_actions(id,offer_id,hospital_id,type,note,action_date,by_name,at) VALUES(?,?,?,?,?,?,?,?)')
+    .run(a.id, a.offer_id, a.hospital_id, a.type, a.note, a.action_date, a.by_name, a.at);
+  return a;
+}
+
+app.post('/api/offers', auth, requireRole('admin'), (req, res) => {
+  const b = req.body || {};
+  scopeCheck(req, S(b.hid, 60));
+  const item = S(b.item, 150).trim();
+  if (!item) return res.status(400).json({ error: 'Which item is the offer for?' });
+  const negotiatedBy = S(b.negotiatedBy, 120).trim();
+  if (!negotiatedBy) return res.status(400).json({ error: 'Who is negotiating this? An offer nobody owns is an offer nobody chases.' });
+  const offerDate = /^\d{4}-\d{2}-\d{2}$/.test(S(b.offerDate)) ? b.offerDate : todayISO();
+  if (offerDate > todayISO()) return res.status(400).json({ error: 'The offer date cannot be in the future' });
+  const newNr = N(b.newNr), newMrp = N(b.newMrp);
+  if (newNr <= 0) return res.status(400).json({ error: 'What is the offered rate?' });
+  if (newMrp > 0 && newNr > newMrp) return res.status(400).json({ error: 'The offered rate is above the MRP — that would sell at a loss' });
+  const validTill = /^\d{4}-\d{2}-\d{2}$/.test(S(b.validTill)) ? b.validTill : null;
+  if (validTill && validTill < offerDate) return res.status(400).json({ error: 'The offer cannot expire before it was made' });
+
+  // the CURRENT price comes from the master, not from the caller — an offer is
+  // measured against what we actually pay today
+  const existing = b.itemId ? db.prepare('SELECT * FROM items WHERE id=? AND hospital_id=?').get(S(b.itemId, 60), b.hid)
+    : db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?').get(b.hid, nameKey(item));
+  const o = {
+    id: uid('off'), hospital_id: b.hid, item_id: existing ? existing.id : null, item_name: existing ? existing.name : item,
+    molecule: S(b.molecule, 150).trim() || (existing ? existing.molecule : ''), pack: S(b.pack, 60) || (existing ? existing.pack : ''),
+    vendor: S(b.vendor, 120), offered_by: S(b.offeredBy, 120), offered_by_phone: S(b.offeredByPhone, 40),
+    negotiated_by: negotiatedBy, offer_date: offerDate,
+    old_nr: existing ? N(existing.nr) : N(b.oldNr), old_mrp: existing ? N(existing.mrp) : N(b.oldMrp),
+    new_nr: newNr, new_mrp: newMrp || (existing ? N(existing.mrp) : 0),
+    qty_commit: N(b.qtyCommit), valid_till: validTill,
+    next_follow_up: /^\d{4}-\d{2}-\d{2}$/.test(S(b.nextFollowUp)) ? b.nextFollowUp : null,
+    status: 'proposed', notes: S(b.notes, 400), applied_at: null,
+    created_by: req.user.name, created_at: Date.now()
+  };
+  db.prepare(`INSERT INTO margin_offers(id,hospital_id,item_id,item_name,molecule,pack,vendor,offered_by,offered_by_phone,
+    negotiated_by,offer_date,old_nr,old_mrp,new_nr,new_mrp,qty_commit,valid_till,next_follow_up,status,notes,applied_at,created_by,created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(o.id, o.hospital_id, o.item_id, o.item_name, o.molecule, o.pack, o.vendor, o.offered_by, o.offered_by_phone,
+      o.negotiated_by, o.offer_date, o.old_nr, o.old_mrp, o.new_nr, o.new_mrp, o.qty_commit, o.valid_till,
+      o.next_follow_up, o.status, o.notes, o.applied_at, o.created_by, o.created_at);
+  res.json({ offer: rowOffer(o, todayISO()), actions: [] });
+});
+
+/* Every move is an action on the log — including the decision itself, so the
+   history reads as what happened rather than as a field that changed. */
+app.post('/api/offers/:id/actions', auth, requireRole('admin'), (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const o = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(req.params.id);
+    if (!o) return res.status(404).json({ error: 'Offer not found' });
+    scopeCheck(req, o.hospital_id);
+    const type = S(b.type, 30);
+    if (!OFFER_ACTIONS.includes(type)) return res.status(400).json({ error: 'Unknown action' });
+    const today = todayISO();
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(S(b.date)) ? b.date : today;
+    if (date > today) return res.status(400).json({ error: 'That date is in the future' });
+    if (date < o.offer_date) return res.status(400).json({ error: `Before the offer was made (${o.offer_date})` });
+
+    const upd = {};
+    if (type === 'follow_up') {
+      const nf = S(b.nextFollowUp, 12);
+      if (nf && !/^\d{4}-\d{2}-\d{2}$/.test(nf)) return res.status(400).json({ error: 'Bad follow-up date' });
+      upd.next_follow_up = nf || null;
+    } else if (type === 'revised') {
+      // the rep came back with a different number — the offer moves, the old one
+      // stays on the log
+      const nr = N(b.newNr);
+      if (nr <= 0) return res.status(400).json({ error: 'What is the revised rate?' });
+      const mrp = N(b.newMrp) || N(o.new_mrp);
+      if (mrp > 0 && nr > mrp) return res.status(400).json({ error: 'The revised rate is above the MRP' });
+      upd.new_nr = nr; upd.new_mrp = mrp;
+      if (!S(b.note, 400).trim()) return res.status(400).json({ error: 'Say what changed' });
+    } else if (type === 'accepted' || type === 'declined') {
+      if (o.status === 'applied') return res.status(400).json({ error: 'This offer is already applied to the Item Master' });
+      upd.status = type;
+      if (type === 'declined' && !S(b.note, 400).trim()) return res.status(400).json({ error: 'Why was it declined? That is the part worth keeping.' });
+    } else if (type === 'reopened') {
+      upd.status = 'proposed';
+      if (o.status === 'applied') return res.status(400).json({ error: 'An applied offer is history — raise a new one instead' });
+    } else if (type === 'applied') {
+      return res.status(400).json({ error: 'Use Apply to the Item Master — it moves the price and logs itself' });
+    }
+
+    const tx = db.transaction(() => {
+      const keys = Object.keys(upd);
+      if (keys.length) db.prepare(`UPDATE margin_offers SET ${keys.map(k => k + '=?').join(', ')} WHERE id=?`)
+        .run(...keys.map(k => upd[k]), o.id);
+      pushOfferAction(o, type, b.note, date, req.user.name);
+    });
+    tx();
+    const fresh = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(o.id);
+    res.json({ offer: rowOffer(fresh, today), actions: offerActions(o.id).map(rowOfferAction) });
+  } catch (err) { next(err); }
+});
+
+/* Applying is the ONLY thing that moves the Item Master, and it writes the
+   ordinary price_log entry too — so the item's own history still tells the whole
+   story without anyone needing to know the offer tracker exists. */
+app.post('/api/offers/:id/apply', auth, requireRole('admin'), (req, res) => {
+  const o = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Offer not found' });
+  scopeCheck(req, o.hospital_id);
+  if (o.status === 'applied') return res.status(400).json({ error: 'Already applied' });
+  if (o.status === 'declined') return res.status(400).json({ error: 'This offer was declined — reopen it first' });
+  const today = todayISO();
+  if (o.valid_till && o.valid_till < today) return res.status(400).json({ error: `The offer expired on ${o.valid_till} — reopen it with a new validity if the vendor still honours it` });
+
+  let it = o.item_id ? db.prepare('SELECT * FROM items WHERE id=?').get(o.item_id) : null;
+  if (!it) it = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?').get(o.hospital_id, nameKey(o.item_name));
+  const now = Date.now();
+  const newNr = N(o.new_nr), newMrp = N(o.new_mrp) || (it ? N(it.mrp) : 0);
+  if (newMrp <= 0) return res.status(400).json({ error: 'No MRP to price against — set one on the Item Master first' });
+  if (newNr > newMrp) return res.status(400).json({ error: 'The offered rate is above the MRP' });
+
+  const tx = db.transaction(() => {
+    if (it) {
+      db.prepare('INSERT INTO price_log(id,item_id,hospital_id,old_nr,old_mrp,new_nr,new_mrp,note,user_name,ts) VALUES(?,?,?,?,?,?,?,?,?,?)')
+        .run(uid('pl'), it.id, it.hospital_id, it.nr, it.mrp, newNr, newMrp,
+          `Offer from ${o.vendor || 'vendor'}${o.offered_by ? ' (' + o.offered_by + ')' : ''}, negotiated by ${o.negotiated_by}`, req.user.name, now);
+      db.prepare('UPDATE items SET nr=?, mrp=?, updated_at=? WHERE id=?').run(newNr, newMrp, now, it.id);
+    } else {
+      // the offer names an item the master has never seen — create it, or the
+      // negotiated price would have nowhere to land
+      const nit = { id: uid('it'), hospital_id: o.hospital_id, name: o.item_name, name_key: nameKey(o.item_name),
+        pack: o.pack || '', nr: newNr, mrp: newMrp, source: 'offer', updated_at: now };
+      db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,source,updated_at,molecule) VALUES(?,?,?,?,?,?,?,?,?,?)')
+        .run(nit.id, nit.hospital_id, nit.name, nit.name_key, nit.pack, nit.nr, nit.mrp, nit.source, nit.updated_at, o.molecule || '');
+      it = nit;
+      db.prepare('UPDATE margin_offers SET item_id=? WHERE id=?').run(nit.id, o.id);
+    }
+    db.prepare("UPDATE margin_offers SET status='applied', applied_at=? WHERE id=?").run(now, o.id);
+    pushOfferAction(o, 'applied', `Item Master moved to ${newNr} / ${newMrp}`, today, req.user.name);
+  });
+  tx();
+  const fresh = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(o.id);
+  res.json({ offer: rowOffer(fresh, today), actions: offerActions(o.id).map(rowOfferAction), item: rowItem(db.prepare('SELECT * FROM items WHERE id=?').get(fresh.item_id)) });
+});
+
+app.delete('/api/offers/:id', auth, requireRole('admin'), (req, res) => {
+  const o = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Offer not found' });
+  scopeCheck(req, o.hospital_id);
+  if (o.status === 'applied') return res.status(400).json({ error: 'An applied offer is part of the price history — it cannot be deleted' });
+  db.prepare('DELETE FROM margin_offer_actions WHERE offer_id=?').run(o.id);
+  db.prepare('DELETE FROM margin_offers WHERE id=?').run(o.id);
+  res.json({ ok: true, id: o.id });
+});
+
+/* ---------- the group item master ----------
+   Every hospital's master in one place, grouped by MOLECULE so the same purchase
+   decision made twice can be compared. The whole point is the spread: if one
+   hospital buys a molecule 12 points better than another, that gap is money. */
+app.get('/api/master', auth, requireRole('admin'), (req, res) => {
+  const hids = allowedHids(req.user);
+  const hosps = (hids === null ? db.prepare('SELECT * FROM hospitals').all()
+    : db.prepare(`SELECT * FROM hospitals WHERE id IN (${hids.map(() => '?').join(',') || "''"})`).all(...hids));
+  const groups = {};
+  for (const h of hosps) {
+    for (const it of db.prepare('SELECT * FROM items WHERE hospital_id=?').all(h.id)) {
+      /* Group by molecule when it is recorded, else by the item name — grouping
+         everything unlabelled together would invent comparisons that do not exist. */
+      const key = it.molecule ? 'm:' + nameKey(it.molecule) : 'n:' + it.name_key;
+      const g = groups[key] = groups[key] || { key, molecule: it.molecule || '', label: it.molecule || it.name, byMolecule: !!it.molecule, rows: [] };
+      if (it.molecule && !g.molecule) { g.molecule = it.molecule; g.label = it.molecule; g.byMolecule = true; }
+      g.rows.push({ hid: h.id, hospital: h.name, itemId: it.id, name: it.name, pack: it.pack || '',
+        nr: N(it.nr), mrp: N(it.mrp), margin: offerMargin(it.nr, it.mrp), openingQty: N(it.opening_qty), updatedAt: it.updated_at });
+    }
+  }
+  const out = Object.values(groups).map(g => {
+    const ms = g.rows.map(r => r.margin);
+    const best = Math.max(...ms), worst = Math.min(...ms);
+    const bestRow = g.rows.find(r => r.margin === best);
+    return { ...g, hospitals: g.rows.length, bestMargin: best, worstMargin: worst,
+      spreadPts: g.rows.length > 1 ? best - worst : 0,
+      bestAt: bestRow ? bestRow.hospital : '', bestNr: bestRow ? bestRow.nr : 0 };
+  }).sort((a, z) => z.spreadPts - a.spreadPts || a.label.localeCompare(z.label));
+  res.json({ groups: out, hospitals: hosps.map(h => ({ id: h.id, name: h.name })) });
+});
+
+/* ---------- notifications ---------- */
+app.patch('/api/notifications/read', auth, (req, res) => {
+  const { all, ids, hid } = req.body || {};
+  const allowed = allowedHids(req.user);
+  // scope every write to the hospitals this user may open
+  let scope = allowed;                       // null => all hospitals
+  if (hid) { scopeCheck(req, S(hid, 60)); scope = [hid]; }
+  const inClause = scope ? ` AND hospital_id IN (${scope.map(() => '?').join(',')})` : '';
+  const scopeArgs = scope || [];
+  if (scope && !scope.length) return res.json({ ok: true });
+  if (all) {
+    db.prepare('UPDATE notifications SET read=1 WHERE 1=1' + inClause).run(...scopeArgs);
+  } else if (Array.isArray(ids)) {
+    const st = db.prepare('UPDATE notifications SET read=1 WHERE id=?' + inClause);
+    for (const id of ids.slice(0, 200)) st.run(S(id, 60), ...scopeArgs);
+  }
+  res.json({ ok: true });
+});
+
+/* ---------- report prefs ---------- */
+app.put('/api/report-prefs/:hid/:type', auth, (req, res) => {
+  const { hid, type } = req.params;
+  if (!['daily', 'weekly', 'monthly'].includes(type)) return res.status(400).json({ error: 'Bad report type' });
+  scopeCheck(req, hid);
+  const prefs = (req.body || {}).prefs;
+  if (!prefs || typeof prefs !== 'object') return res.status(400).json({ error: 'Bad prefs' });
+  const clean = {};
+  for (const [k, v] of Object.entries(prefs).slice(0, 40)) clean[k] = !!v;
+  db.prepare('INSERT INTO report_prefs(hospital_id,type,prefs) VALUES(?,?,?) ON CONFLICT(hospital_id,type) DO UPDATE SET prefs=excluded.prefs')
+    .run(hid, type, JSON.stringify(clean));
+  res.json({ ok: true });
+});
+
+/* ---------- user management (admin) ---------- */
+app.get('/api/users', auth, requireRole('admin'), (req, res) => {
+  res.json({ users: db.prepare('SELECT * FROM users ORDER BY created_at').all().map(rowUser) });
+});
+
+/* accepts ["*"] (every hospital) or an explicit list of existing hospital ids */
+function cleanHospitalList(v) {
+  if (!Array.isArray(v) || !v.length) return null;
+  if (v.includes('*')) return ['*'];
+  const ids = [...new Set(v.map(x => S(x, 60)))].filter(Boolean);
+  if (!ids.length) return null;
+  const found = db.prepare(`SELECT id FROM hospitals WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids).map(h => h.id);
+  return found.length === ids.length ? ids : null;
+}
+const adminCount = () => db.prepare("SELECT COUNT(*) c FROM users WHERE role='admin' AND active=1").get().c;
+
+app.post('/api/users', auth, requireRole('admin'), (req, res) => {
+  const b = req.body || {};
+  const email = S(b.email, 200).trim().toLowerCase();
+  const name = S(b.name, 120).trim();
+  const role = ROLES.includes(b.role) ? b.role : null;
+  if (!name || !email.includes('@') || !role) return res.status(400).json({ error: 'Name, valid email and role are required' });
+  if (S(b.password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  const hospitals = cleanHospitalList(b.hospitals);
+  if (!hospitals) return res.status(400).json({ error: 'Pick at least one hospital this user can access' });
+  if (db.prepare('SELECT 1 FROM users WHERE email=?').get(email)) return res.status(409).json({ error: 'That email already has an account' });
+  const u = {
+    id: uid('u'), name, email, role, role_label: ROLE_LABEL[role],
+    hospital_ids: JSON.stringify(hospitals), active: b.active === false ? 0 : 1,
+    pw_hash: bcrypt.hashSync(S(b.password, 200), 10), created_at: Date.now()
+  };
+  db.prepare('INSERT INTO users(id,name,email,role,role_label,hospital_id,hospital_ids,active,pw_hash,created_at) VALUES(?,?,?,?,?,NULL,?,?,?,?)')
+    .run(u.id, u.name, u.email, u.role, u.role_label, u.hospital_ids, u.active, u.pw_hash, u.created_at);
+  res.json({ user: rowUser(u) });
+});
+
+app.patch('/api/users/:id', auth, requireRole('admin'), (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  const b = req.body || {};
+  const isSelf = u.id === req.user.id;
+
+  const name = b.name !== undefined ? S(b.name, 120).trim() || u.name : u.name;
+  let role = u.role;
+  if (b.role !== undefined) {
+    if (!ROLES.includes(b.role)) return res.status(400).json({ error: 'Invalid role' });
+    // don't let the last admin (or yourself) drop admin rights and lock everyone out
+    if (u.role === 'admin' && b.role !== 'admin') {
+      if (isSelf) return res.status(400).json({ error: "You can't change your own role — ask another admin" });
+      if (adminCount() <= 1) return res.status(400).json({ error: 'This is the last admin — promote someone else first' });
+    }
+    role = b.role;
+  }
+  let hospital_ids = u.hospital_ids;
+  if (b.hospitals !== undefined) {
+    const list = cleanHospitalList(b.hospitals);
+    if (!list) return res.status(400).json({ error: 'Pick at least one hospital this user can access' });
+    hospital_ids = JSON.stringify(list);
+  }
+  let active = u.active;
+  if (b.active !== undefined) {
+    const next = b.active ? 1 : 0;
+    if (!next) {
+      if (isSelf) return res.status(400).json({ error: "You can't turn off your own portal access" });
+      if (u.role === 'admin' && adminCount() <= 1) return res.status(400).json({ error: 'This is the last active admin — promote someone else first' });
+    }
+    active = next;
+  }
+  db.prepare('UPDATE users SET name=?, role=?, role_label=?, hospital_ids=?, active=? WHERE id=?')
+    .run(name, role, ROLE_LABEL[role], hospital_ids, active, u.id);
+  // revoking access or changing scope must not leave a live session behind
+  if (!active || hospital_ids !== u.hospital_ids || role !== u.role) db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
+  res.json({ user: rowUser({ ...u, name, role, role_label: ROLE_LABEL[role], hospital_ids, active }) });
+});
+
+app.delete('/api/users/:id', auth, requireRole('admin'), (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  if (u.id === req.user.id) return res.status(400).json({ error: "You can't delete your own account" });
+  if (u.role === 'admin' && adminCount() <= 1) return res.status(400).json({ error: 'This is the last admin — promote someone else first' });
+  db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
+  db.prepare('DELETE FROM users WHERE id=?').run(u.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/users/:id/password', auth, requireRole('admin'), (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  if (S((req.body || {}).password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  db.prepare('UPDATE users SET pw_hash=? WHERE id=?').run(bcrypt.hashSync(S(req.body.password, 200), 10), u.id);
+  db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
+  res.json({ ok: true });
+});
+
+/* ---------- weekly / monthly period data (manual report sections) ---------- */
+function deepClean(v, depth = 0) {
+  if (depth > 4) return null;
+  if (typeof v === 'string') return v.slice(0, 300);
+  if (typeof v === 'number' && isFinite(v)) return v;
+  if (typeof v === 'boolean') return v;
+  if (Array.isArray(v)) return v.slice(0, 200).map(x => deepClean(x, depth + 1));
+  if (v && typeof v === 'object') {
+    const o = {};
+    for (const k of Object.keys(v).slice(0, 40)) o[S(k, 60)] = deepClean(v[k], depth + 1);
+    return o;
+  }
+  return null;
+}
+
+app.put('/api/period/:hid/:ptype/:pkey', auth, (req, res) => {
+  const { hid, ptype, pkey } = req.params;
+  scopeCheck(req, hid);
+  if (!['weekly', 'monthly'].includes(ptype)) return res.status(400).json({ error: 'Bad period type' });
+  if (ptype === 'weekly' && !/^\d{4}-\d{2}-\d{2}$/.test(pkey)) return res.status(400).json({ error: 'Weekly key must be the Monday date' });
+  if (ptype === 'monthly' && !/^\d{4}-\d{2}$/.test(pkey)) return res.status(400).json({ error: 'Monthly key must be YYYY-MM' });
+  const data = deepClean((req.body || {}).data);
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return res.status(400).json({ error: 'Bad data payload' });
+  const json = JSON.stringify(data);
+  if (json.length > 100000) return res.status(400).json({ error: 'Period data too large' });
+  db.prepare('INSERT INTO period_data(hospital_id,ptype,pkey,data,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(hospital_id,ptype,pkey) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at')
+    .run(hid, ptype, pkey, json, Date.now());
+  res.json({ ok: true });
+});
+
+/* ---------- item master ---------- */
+app.post('/api/items', auth, requireRole('admin'), (req, res) => {
+  const b = req.body || {};
+  scopeCheck(req, S(b.hid, 60));
+  const name = S(b.name, 150).trim();
+  if (!name) return res.status(400).json({ error: 'Item name is required' });
+  const nr = N(b.nr), mrp = N(b.mrp);
+  if (nr <= 0 || mrp <= 0) return res.status(400).json({ error: 'Purchase price (NR) and MRP must be positive' });
+  if (nr > mrp) return res.status(400).json({ error: 'NR cannot exceed MRP' });
+  const key = nameKey(name);
+  if (db.prepare('SELECT 1 FROM items WHERE hospital_id=? AND name_key=?').get(b.hid, key))
+    return res.status(409).json({ error: 'That item already exists on the master' });
+  const it = { id: uid('it'), hospital_id: b.hid, name, name_key: key, pack: S(b.pack, 60), nr, mrp,
+    molecule: S(b.molecule, 150).trim(), source: 'manual', updated_at: Date.now() };
+  db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,source,updated_at,molecule) VALUES(?,?,?,?,?,?,?,?,?,?)')
+    .run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.source, it.updated_at, it.molecule);
+  res.json({ item: rowItem(it) });
+});
+
+app.patch('/api/items/:id', auth, requireRole('admin'), (req, res) => {
+  const it = db.prepare('SELECT * FROM items WHERE id=?').get(req.params.id);
+  if (!it) return res.status(404).json({ error: 'Item not found' });
+  scopeCheck(req, it.hospital_id);
+  const b = req.body || {};
+  const nr = b.nr !== undefined ? N(b.nr) : it.nr;
+  const mrp = b.mrp !== undefined ? N(b.mrp) : it.mrp;
+  if (nr <= 0 || mrp <= 0) return res.status(400).json({ error: 'NR and MRP must be positive' });
+  if (nr > mrp) return res.status(400).json({ error: 'NR cannot exceed MRP' });
+  const pack = b.pack !== undefined ? S(b.pack, 60) : it.pack;
+  const molecule = b.molecule !== undefined ? S(b.molecule, 150).trim() : (it.molecule || '');
+  const openingQty = b.openingQty !== undefined ? N(b.openingQty) : it.opening_qty;
+  if (openingQty < 0) return res.status(400).json({ error: 'Opening quantity cannot be negative' });
+  const now = Date.now();
+  const tx = db.transaction(() => {
+    if (nr !== it.nr || mrp !== it.mrp) {
+      db.prepare('INSERT INTO price_log(id,item_id,hospital_id,old_nr,old_mrp,new_nr,new_mrp,note,user_name,ts) VALUES(?,?,?,?,?,?,?,?,?,?)')
+        .run(uid('pl'), it.id, it.hospital_id, it.nr, it.mrp, nr, mrp, S(b.note, 200), req.user.name, now);
+    }
+    db.prepare('UPDATE items SET nr=?, mrp=?, pack=?, molecule=?, opening_qty=?, updated_at=? WHERE id=?').run(nr, mrp, pack, molecule, openingQty, now, it.id);
+  });
+  tx();
+  res.json({ item: rowItem({ ...it, nr, mrp, pack, molecule, opening_qty: openingQty, updated_at: now }) });
+});
+
+app.get('/api/items/:id/history', auth, (req, res) => {
+  const it = db.prepare('SELECT * FROM items WHERE id=?').get(req.params.id);
+  if (!it) return res.status(404).json({ error: 'Item not found' });
+  scopeCheck(req, it.hospital_id);
+  const rows = db.prepare('SELECT * FROM price_log WHERE item_id=? ORDER BY ts DESC LIMIT 30').all(it.id)
+    .map(r => ({ oldNr: r.old_nr, oldMrp: r.old_mrp, newNr: r.new_nr, newMrp: r.new_mrp, note: r.note, user: r.user_name, ts: r.ts }));
+  res.json({ history: rows });
+});
+
+/* opening stock: the one-time count taken when the pharmacy starts with us.
+   Upserts the master (name/pack/nr/mrp) and sets each item's opening quantity. */
+app.post('/api/items/opening', auth, requireRole('admin'), (req, res) => {
+  const { hid, stockDate, rows } = req.body || {};
+  const h = scopeCheck(req, S(hid, 60));
+  if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows must be an array' });
+  const sd = /^\d{4}-\d{2}-\d{2}$/.test(S(stockDate)) ? stockDate : (h.stock_date || h.start_date);
+  if (sd > todayISO()) return res.status(400).json({ error: 'Stock count date cannot be in the future' });
+  const now = Date.now();
+  const created = [], updated = [];
+  const tx = db.transaction(() => {
+    const find = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
+    const ins = db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,opening_qty,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)');
+    const upd = db.prepare('UPDATE items SET opening_qty=?, pack=?, nr=?, mrp=?, updated_at=? WHERE id=?');
+    for (const raw of rows.slice(0, 5000)) {
+      const name = S(raw.name, 150).trim();
+      if (!name) continue;
+      const qty = N(raw.qty);
+      if (qty < 0) continue;
+      const key = nameKey(name);
+      const ex = find.get(hid, key);
+      if (ex) {
+        // keep existing prices unless the file supplies better ones
+        const nr = N(raw.nr) > 0 ? N(raw.nr) : ex.nr;
+        const mrp = N(raw.mrp) > 0 ? N(raw.mrp) : ex.mrp;
+        if (nr > mrp && mrp > 0) continue;
+        upd.run(qty, S(raw.pack, 60) || ex.pack, nr, mrp, now, ex.id);
+        updated.push(rowItem({ ...ex, opening_qty: qty, nr, mrp, pack: S(raw.pack, 60) || ex.pack, updated_at: now }));
+      } else {
+        const nr = N(raw.nr), mrp = N(raw.mrp);
+        if (nr > mrp && mrp > 0) continue;
+        const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack: S(raw.pack, 60), nr, mrp, opening_qty: qty, source: 'opening', updated_at: now };
+        ins.run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.opening_qty, it.source, it.updated_at);
+        created.push(rowItem(it));
+      }
+    }
+    db.prepare('UPDATE hospitals SET stock_date=? WHERE id=?').run(sd, hid);
+  });
+  tx();
+  res.json({ created, updated, stockDate: sd, hospital: rowHosp({ ...h, stock_date: sd }) });
+});
+
+app.post('/api/items/bulk', auth, requireRole('admin'), (req, res) => {
+  const { hid, items } = req.body || {};
+  scopeCheck(req, S(hid, 60));
+  if (!Array.isArray(items)) return res.status(400).json({ error: 'items must be an array' });
+  const now = Date.now();
+  const created = [], filled = [];
+  const tx = db.transaction(() => {
+    const find = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
+    const ins = db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,source,updated_at,molecule) VALUES(?,?,?,?,?,?,?,?,?,?)');
+    const setMol = db.prepare('UPDATE items SET molecule=?, updated_at=? WHERE id=?');
+    for (const raw of items.slice(0, 3000)) {
+      const name = S(raw.name, 150).trim();
+      const nr = N(raw.nr), mrp = N(raw.mrp);
+      if (!name || nr <= 0 || mrp <= 0 || nr > mrp) continue;
+      const key = nameKey(name), mol = S(raw.molecule, 150).trim();
+      const ex = find.get(hid, key);
+      if (ex) {
+        // a re-import does not overwrite prices, but it MAY fill in a molecule
+        // the master is missing — that is how the group comparison gets populated
+        if (mol && !ex.molecule) { setMol.run(mol, now, ex.id); filled.push(rowItem({ ...ex, molecule: mol, updated_at: now })); }
+        continue;
+      }
+      const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack: S(raw.pack, 60), nr, mrp, molecule: mol, source: 'import', updated_at: now };
+      ins.run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.source, it.updated_at, it.molecule);
+      created.push(rowItem(it));
+    }
+  });
+  tx();
+  res.json({ created, filled });
+});
+
+/* ---------- receivables ---------- */
+const recvActions = (rid) => db.prepare('SELECT * FROM receivable_actions WHERE receivable_id=? ORDER BY action_date, entered_at').all(rid);
+function loadRecv(req, id) {
+  const r = db.prepare('SELECT * FROM receivables WHERE id=?').get(id);
+  if (!r) { const e = new Error('Bill not found'); e.status = 404; throw e; }
+  scopeCheck(req, r.hospital_id);
+  return r;
+}
+function pushAction(a) {
+  db.prepare('INSERT INTO receivable_actions(id,receivable_id,hospital_id,type,amount,mode,reason,approver_id,approver_name,action_date,entered_by,entered_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(a.id, a.receivable_id, a.hospital_id, a.type, a.amount, a.mode, a.reason, a.approver_id, a.approver_name, a.action_date, a.entered_by, a.entered_at);
+}
+/* an action can never predate the bill or land in the future */
+function checkActionDate(d, billDate) {
+  const today = todayISO();
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(S(d)) ? d : today;
+  if (date > today) { const e = new Error('Action date cannot be in the future'); e.status = 400; throw e; }
+  if (date < billDate) { const e = new Error(`Action date cannot be before the bill date (${billDate})`); e.status = 400; throw e; }
+  return date;
+}
+
+app.post('/api/receivables', auth, requireRole('admin'), (req, res) => {
+  const b = req.body || {};
+  scopeCheck(req, S(b.hid, 60));
+  const billNo = S(b.billNo, 60).trim(), party = S(b.party, 150).trim();
+  if (!billNo) return res.status(400).json({ error: 'Bill number is required' });
+  if (!party) return res.status(400).json({ error: 'Party name is required' });
+  if (!PARTY_TYPES.some(p => p.v === b.partyType)) return res.status(400).json({ error: 'Choose a valid party type' });
+  const amount = N(b.amount);
+  if (amount <= 0) return res.status(400).json({ error: 'Bill amount must be positive' });
+  const billDate = /^\d{4}-\d{2}-\d{2}$/.test(S(b.billDate)) ? b.billDate : todayISO();
+  if (billDate > todayISO()) return res.status(400).json({ error: 'Bill date cannot be in the future' });
+  if (db.prepare('SELECT 1 FROM receivables WHERE hospital_id=? AND bill_no=?').get(b.hid, billNo))
+    return res.status(409).json({ error: 'That bill number already exists for this hospital' });
+  const r = {
+    id: uid('rcv'), hospital_id: b.hid, bill_no: billNo, bill_date: billDate, party, party_type: b.partyType,
+    amount, next_follow_up_date: null, assigned_to: S(b.assignedTo, 120) || null,
+    priority: b.priority === 'high' ? 'high' : 'normal',
+    ov_value: null, ov_reason: null, ov_by: null, ov_at: null, ov_expires: null,
+    created_by: req.user.name, created_at: Date.now()
+  };
+  db.prepare('INSERT INTO receivables(id,hospital_id,bill_no,bill_date,party,party_type,amount,next_follow_up_date,assigned_to,priority,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(r.id, r.hospital_id, r.bill_no, r.bill_date, r.party, r.party_type, r.amount, r.next_follow_up_date, r.assigned_to, r.priority, r.created_by, r.created_at);
+  res.json({ receivable: rowRecv(r, [], todayISO()), actions: [] });
+});
+
+/* Money only ever moves through an action. */
+app.post('/api/receivables/:id/actions', auth, (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const r = loadRecv(req, req.params.id);
+    const today = todayISO();
+    const type = S(b.type, 30);
+    if (!['receipt', 'adjustment', 'follow_up', 'note'].includes(type))
+      return res.status(400).json({ error: 'Unknown action type' });
+    // a data-entry user chases the money; they never record it moving
+    if ((type === 'receipt' || type === 'adjustment') && req.user.role !== 'admin')
+      return res.status(403).json({ error: 'Only an admin can record receipts and adjustments' });
+    const date = checkActionDate(b.date, r.bill_date);
+    const cur = recvTotals(r, recvActions(r.id));
+    const a = {
+      id: uid('act'), receivable_id: r.id, hospital_id: r.hospital_id, type,
+      amount: null, mode: null, reason: S(b.reason, 300), approver_id: null, approver_name: null,
+      action_date: date, entered_by: req.user.name, entered_at: Date.now()
+    };
+
+    if (type === 'receipt') {
+      const amt = N(b.amount);
+      if (amt <= 0) return res.status(400).json({ error: 'Receipt must be more than zero' });
+      if (amt > cur.due + 1e-9) return res.status(400).json({ error: `Receipt cannot exceed the amount due (${fmtRs(cur.due)})` });
+      if (!RECEIPT_MODES.includes(b.mode)) return res.status(400).json({ error: 'Choose how the money came in (Cash / UPI / Cheque / NEFT)' });
+      a.amount = amt; a.mode = b.mode;
+    } else if (type === 'adjustment') {
+      const amt = N(b.amount);
+      if (!amt) return res.status(400).json({ error: 'Adjustment cannot be zero' });
+      if (!a.reason || a.reason.length < 3) return res.status(400).json({ error: 'An adjustment needs a reason' });
+      if (cur.due + amt < -1e-9) return res.status(400).json({ error: `That would drive the amount due below zero (due is ${fmtRs(cur.due)})` });
+      a.amount = amt;
+      /* Over the threshold the approver is NAMED on the action. It is no longer a
+         gate: with two roles, everyone who can adjust at all is an admin, so a
+         403 here could never fire. What still matters — and what an audit asks —
+         is who signed off on a write-off big enough to matter. */
+      if (Math.abs(amt) > ADJ_THRESHOLD) { a.approver_id = req.user.id; a.approver_name = req.user.name; }
+    } else if (type === 'follow_up') {
+      const nf = S(b.nextFollowUp, 12);
+      if (nf && !/^\d{4}-\d{2}-\d{2}$/.test(nf)) return res.status(400).json({ error: 'Bad follow-up date' });
+      db.prepare('UPDATE receivables SET next_follow_up_date=? WHERE id=?').run(nf || null, r.id);
+      r.next_follow_up_date = nf || null;
+    }
+    pushAction(a);
+    const acts = recvActions(r.id);
+    res.json({ receivable: rowRecv(r, acts, today), actions: acts.map(rowAction), action: rowAction(a) });
+  } catch (err) { next(err); }
+});
+
+/* Override: explains why a bill is old. Admin-only, reasoned, and it expires. */
+app.post('/api/receivables/:id/override', auth, requireRole('admin'), (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const r = loadRecv(req, req.params.id);
+    const today = todayISO();
+    if (!OVERRIDE_VALUES.includes(b.value)) return res.status(400).json({ error: 'Choose a valid override' });
+    const reason = S(b.reason, 300).trim();
+    if (reason.length < 10) return res.status(400).json({ error: 'Override reason must be at least 10 characters — say why this bill is being held' });
+    const setAt = Date.now();
+    const def = addDaysISO(today, OVERRIDE_DEFAULT_DAYS);
+    const expires = /^\d{4}-\d{2}-\d{2}$/.test(S(b.expiresAt)) ? b.expiresAt : def;
+    if (expires <= today) return res.status(400).json({ error: 'Override must expire in the future' });
+    if (expires > addDaysISO(today, OVERRIDE_MAX_DAYS)) return res.status(400).json({ error: `An override can run for at most ${OVERRIDE_MAX_DAYS} days` });
+    db.prepare('UPDATE receivables SET ov_value=?, ov_reason=?, ov_by=?, ov_at=?, ov_expires=? WHERE id=?')
+      .run(b.value, reason, req.user.name, setAt, expires, r.id);
+    Object.assign(r, { ov_value: b.value, ov_reason: reason, ov_by: req.user.name, ov_at: setAt, ov_expires: expires });
+    pushAction({
+      id: uid('act'), receivable_id: r.id, hospital_id: r.hospital_id, type: 'override_set',
+      amount: null, mode: null, reason: `${b.value}: ${reason} (until ${expires})`,
+      approver_id: req.user.id, approver_name: req.user.name,
+      action_date: today, entered_by: req.user.name, entered_at: setAt
+    });
+    const acts = recvActions(r.id);
+    res.json({ receivable: rowRecv(r, acts, today), actions: acts.map(rowAction) });
+  } catch (err) { next(err); }
+});
+
+/* Clearing writes an override_cleared action — the override_set stays on the log. */
+app.delete('/api/receivables/:id/override', auth, requireRole('admin'), (req, res, next) => {
+  try {
+    const r = loadRecv(req, req.params.id);
+    if (!r.ov_value) return res.status(400).json({ error: 'No override to clear' });
+    const today = todayISO();
+    db.prepare('UPDATE receivables SET ov_value=NULL, ov_reason=NULL, ov_by=NULL, ov_at=NULL, ov_expires=NULL WHERE id=?').run(r.id);
+    pushAction({
+      id: uid('act'), receivable_id: r.id, hospital_id: r.hospital_id, type: 'override_cleared',
+      amount: null, mode: null, reason: S((req.body || {}).reason, 300) || `Cleared "${r.ov_value}"`,
+      approver_id: req.user.id, approver_name: req.user.name,
+      action_date: today, entered_by: req.user.name, entered_at: Date.now()
+    });
+    Object.assign(r, { ov_value: null, ov_reason: null, ov_by: null, ov_at: null, ov_expires: null });
+    const acts = recvActions(r.id);
+    res.json({ receivable: rowRecv(r, acts, today), actions: acts.map(rowAction) });
+  } catch (err) { next(err); }
+});
+
+/* Bulk is deliberately limited to assignment and follow-up dates —
+   money never moves in bulk. */
+app.patch('/api/receivables/bulk', auth, (req, res) => {
+  const b = req.body || {};
+  scopeCheck(req, S(b.hid, 60));
+  const ids = Array.isArray(b.ids) ? b.ids.slice(0, 500).map(x => S(x, 60)) : [];
+  if (!ids.length) return res.status(400).json({ error: 'No bills selected' });
+  const sets = [], args = [];
+  if (b.assignedTo !== undefined) { sets.push('assigned_to=?'); args.push(S(b.assignedTo, 120) || null); }
+  if (b.nextFollowUp !== undefined) {
+    const nf = S(b.nextFollowUp, 12);
+    if (nf && !/^\d{4}-\d{2}-\d{2}$/.test(nf)) return res.status(400).json({ error: 'Bad follow-up date' });
+    sets.push('next_follow_up_date=?'); args.push(nf || null);
+  }
+  if (b.priority !== undefined) { sets.push('priority=?'); args.push(b.priority === 'high' ? 'high' : 'normal'); }
+  if (!sets.length) return res.status(400).json({ error: 'Nothing to change' });
+  const today = todayISO();
+  const out = [];
+  const tx = db.transaction(() => {
+    for (const id of ids) {
+      const r = db.prepare('SELECT * FROM receivables WHERE id=? AND hospital_id=?').get(id, b.hid);
+      if (!r) continue;
+      db.prepare(`UPDATE receivables SET ${sets.join(', ')} WHERE id=?`).run(...args, id);
+      const fresh = db.prepare('SELECT * FROM receivables WHERE id=?').get(id);
+      out.push(rowRecv(fresh, recvActions(id), today));
+    }
+  });
+  tx();
+  res.json({ updated: out });
+});
+
+/* XLSX of exactly what the user is looking at */
+app.post('/api/receivables/export', auth, (req, res) => {
+  const b = req.body || {};
+  scopeCheck(req, S(b.hid, 60));
+  const today = todayISO();
+  const ids = Array.isArray(b.ids) ? b.ids.map(x => S(x, 60)) : null;
+  let rows = db.prepare('SELECT * FROM receivables WHERE hospital_id=?').all(b.hid);
+  if (ids) rows = rows.filter(r => ids.includes(r.id));
+  const data = rows.map(r => rowRecv(r, recvActions(r.id), today)).sort((a, z) => z.due - a.due).map(r => ({
+    'Bill No': r.billNo, 'Bill Date': r.billDate, Party: r.party, 'Party Type': r.partyType,
+    'Bill Amount': r.amount, Received: r.received, Adjustments: r.adjustments, 'Amount Due': r.due,
+    'Days Outstanding': r.daysOutstanding, 'Credit Days': r.creditDays,
+    Status: r.effectiveStatus, Overridden: r.override ? 'Yes' : 'No',
+    'Override Reason': r.override ? r.override.reason : '', 'Override Expires': r.override ? r.override.expiresAt : '',
+    'Assigned To': r.assignedTo || '', 'Next Follow-up': r.nextFollowUp || '', Priority: r.priority
+  }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(data.length ? data : [{ Note: 'No receivables match this view' }]), 'Receivables');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${b.hid}-receivables-${today}.xlsx"`);
+  res.send(buf);
+});
+
+/* ---------- stock adjustments ----------
+   Restricted to admin on purpose: if a data-entry user could silently
+   adjust stock to make it balance, the audit would be worthless. */
+app.post('/api/stock/adjust', auth, requireRole('admin'), (req, res) => {
+  const b = req.body || {};
+  const h = scopeCheck(req, S(b.hid, 60));
+  const item = S(b.item, 150).trim();
+  if (!item) return res.status(400).json({ error: 'Pick an item to adjust' });
+  const qty = N(b.qty);
+  if (!qty) return res.status(400).json({ error: 'Adjustment quantity cannot be zero' });
+  const reason = ADJ_REASONS.includes(b.reason) ? b.reason : null;
+  if (!reason) return res.status(400).json({ error: 'Choose a reason for the adjustment' });
+  const today = todayISO();
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(S(b.date)) ? b.date : today;
+  if (date > today) return res.status(400).json({ error: 'Adjustment date cannot be in the future' });
+  const from = h.stock_date || h.start_date;
+  if (from && date < from) return res.status(400).json({ error: `Adjustment must be on or after the stock count date (${from})` });
+
+  const a = {
+    id: uid('adj'), hospital_id: h.id, item_key: nameKey(item), item_name: item,
+    date, qty, reason, note: S(b.note, 200), user_name: req.user.name, created_at: Date.now()
+  };
+  db.prepare('INSERT INTO stock_adjustments(id,hospital_id,item_key,item_name,date,qty,reason,note,user_name,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
+    .run(a.id, a.hospital_id, a.item_key, a.item_name, a.date, a.qty, a.reason, a.note, a.user_name, a.created_at);
+  res.json({ adjustment: rowAdj(a) });
+});
+
+/* reversal is admin-only, and deletes the record rather than editing it —
+   an adjustment history that can be rewritten is not an audit trail */
+app.delete('/api/stock/adjust/:id', auth, requireRole('admin'), (req, res) => {
+  const a = db.prepare('SELECT * FROM stock_adjustments WHERE id=?').get(req.params.id);
+  if (!a) return res.status(404).json({ error: 'Adjustment not found' });
+  scopeCheck(req, a.hospital_id);
+  db.prepare('DELETE FROM stock_adjustments WHERE id=?').run(a.id);
+  res.json({ ok: true });
+});
+
+/* ---------- AI parsing: invoices & Marg GP reports ---------- */
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12 * 1024 * 1024 } });
+let anthropic = null;
+function getAI() {
+  if (!process.env.ANTHROPIC_API_KEY) { const e = new Error('AI parsing is not configured yet — add ANTHROPIC_API_KEY to /root/yajna-pharma/.env and restart'); e.status = 503; throw e; }
+  if (!anthropic) anthropic = new Anthropic();
+  return anthropic;
+}
+
+const INVOICE_SCHEMA = {
+  type: 'object',
+  properties: {
+    vendor: { type: 'string', description: 'Supplier/distributor name printed on the invoice' },
+    invoice_no: { type: 'string' },
+    date: { type: 'string', description: 'Invoice date as YYYY-MM-DD, empty string if unreadable' },
+    lines: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          item: { type: 'string', description: 'Product name exactly as printed, with strength/pack e.g. "Tab. Pantoprazole 40"' },
+          qty: { type: 'number', description: 'Quantity in saleable units (strips/vials/bottles). Include free/scheme quantity.' },
+          nr: { type: 'number', description: 'Net rate per unit INCLUSIVE of GST, after discount. If the invoice shows a GST-exclusive rate, add the GST percentage to compute this.' },
+          mrp: { type: 'number', description: 'MRP per unit as printed' },
+          value: { type: 'number', description: 'Line total = qty x nr (GST-inclusive)' }
+        },
+        required: ['item', 'qty', 'nr', 'mrp', 'value'],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ['vendor', 'invoice_no', 'date', 'lines'],
+  additionalProperties: false
+};
+
+const GP_SCHEMA = {
+  type: 'object',
+  properties: {
+    sales_mrp: { type: 'number', description: 'Total sales at MRP / total sale amount for the day. 0 if not found.' },
+    cogs: { type: 'number', description: 'Total cost of goods sold / purchase cost of items sold. If only gross profit is given, cogs = sales - gross profit. 0 if not derivable.' },
+    cash_sales: { type: 'number', description: 'Cash sales portion, 0 if not present' },
+    credit_sales: { type: 'number', description: 'Credit/insurance sales portion, 0 if not present' },
+    gross_profit: { type: 'number', description: 'Gross profit figure if stated, else sales - cogs, else 0' },
+    items: {
+      type: 'array',
+      description: 'Item-wise sales rows if the report lists individual products. Up to 150 rows, largest sale amount first. Empty array if the report only has bill-wise rows or totals.',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Product name as printed' },
+          qty: { type: 'number', description: 'Quantity sold in units' },
+          amount: { type: 'number', description: 'Sale amount (MRP value) for this item' }
+        },
+        required: ['name', 'qty', 'amount'],
+        additionalProperties: false
+      }
+    },
+    note: { type: 'string', description: 'One line: what totals row/columns you used' }
+  },
+  required: ['sales_mrp', 'cogs', 'cash_sales', 'credit_sales', 'gross_profit', 'items', 'note'],
+  additionalProperties: false
+};
+
+const EXPIRY_SCHEMA = {
+  type: 'object',
+  properties: {
+    as_of: { type: 'string', description: 'The date this stock report refers to, as YYYY-MM-DD. Empty string if not printed.' },
+    note: { type: 'string', description: 'One short line on what was read, or any problem with the file.' },
+    rows: {
+      type: 'array',
+      description: 'Every batch line in the report. One row per item+batch. Skip group headers and total rows.',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Product name exactly as printed, including strength' },
+          batch: { type: 'string', description: 'Batch number exactly as printed, else empty string' },
+          expiry: { type: 'string', description: 'Expiry as YYYY-MM. Indian reports print MM/YY, MM/YYYY, MM-YY or similar — convert. Empty string if not printed.' },
+          qty: { type: 'number', description: 'Closing/balance quantity of THIS batch, in saleable units' },
+          nr: { type: 'number', description: 'Purchase/cost rate per unit INCLUSIVE of GST if printed, else 0' },
+          mrp: { type: 'number', description: 'MRP per unit as printed on this batch, else 0' }
+        },
+        required: ['name', 'batch', 'expiry', 'qty', 'nr', 'mrp'],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ['as_of', 'note', 'rows'],
+  additionalProperties: false
+};
+
+const STOCK_SCHEMA = {
+  type: 'object',
+  properties: {
+    stock_date: { type: 'string', description: 'The date this stock count / report refers to, as YYYY-MM-DD. Empty string if not printed.' },
+    items: {
+      type: 'array',
+      description: 'Every stock line in the report. Skip group headers and total rows.',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Product name exactly as printed, including strength' },
+          qty: { type: 'number', description: 'Closing/balance quantity in stock, in saleable units' },
+          pack: { type: 'string', description: 'Pack size if printed (e.g. "10s", "vial"), else empty string' },
+          nr: { type: 'number', description: 'Purchase/cost rate per unit INCLUSIVE of GST if printed, else 0' },
+          mrp: { type: 'number', description: 'MRP per unit if printed, else 0' }
+        },
+        required: ['name', 'qty', 'pack', 'nr', 'mrp'],
+        additionalProperties: false
+      }
+    },
+    note: { type: 'string', description: 'One line: which columns you read qty/rate/MRP from' }
+  },
+  required: ['stock_date', 'items', 'note'],
+  additionalProperties: false
+};
+
+async function askClaude(content, schema) {
+  const client = getAI();
+  const resp = await client.messages.create({
+    model: 'claude-opus-4-8',
+    max_tokens: 16000,
+    thinking: { type: 'adaptive' },
+    output_config: { format: { type: 'json_schema', schema } },
+    messages: [{ role: 'user', content }]
+  });
+  if (resp.stop_reason === 'refusal') { const e = new Error('The AI declined to process this file'); e.status = 422; throw e; }
+  if (resp.stop_reason === 'max_tokens') { const e = new Error('File too large/complex to parse in one pass — split it and retry'); e.status = 422; throw e; }
+  const text = (resp.content || []).find(b => b.type === 'text');
+  if (!text) { const e = new Error('AI returned no result'); e.status = 502; throw e; }
+  return JSON.parse(text.text);
+}
+
+function fileBlock(file) {
+  const mt = (file.mimetype || '').toLowerCase();
+  const b64 = file.buffer.toString('base64');
+  if (mt === 'application/pdf') return { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: b64 } };
+  if (['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mt)) return { type: 'image', source: { type: 'base64', media_type: mt, data: b64 } };
+  return null;
+}
+
+app.post('/api/parse/invoice', auth, upload.single('file'), async (req, res, next) => {
+  try {
+    const hid = S(req.query.hid, 60);
+    scopeCheck(req, hid);
+    if (!req.file) return res.status(400).json({ error: 'Attach an invoice file (PDF or photo)' });
+    const block = fileBlock(req.file);
+    if (!block) return res.status(400).json({ error: 'Unsupported file type — upload a PDF or JPG/PNG photo of the invoice' });
+
+    const data = await askClaude([
+      block,
+      { type: 'text', text: 'This is a pharmaceutical wholesale purchase invoice from an Indian distributor to a hospital pharmacy. Extract the vendor, invoice number, date and every product line. NR means the net landed cost per saleable unit INCLUSIVE of GST and after any discount — compute it from rate + GST% if the invoice lists pre-GST rates. Skip summary/total rows. Amounts are in rupees; output plain numbers.' }
+    ], INVOICE_SCHEMA);
+
+    // persist the original for the audit trail
+    const dir = path.join(__dirname, 'data', 'uploads', hid);
+    fs.mkdirSync(dir, { recursive: true });
+    const safe = (req.file.originalname || 'invoice').replace(/[^a-zA-Z0-9._-]/g, '_').slice(-80);
+    const fileName = Date.now() + '-' + safe;
+    fs.writeFileSync(path.join(dir, fileName), req.file.buffer);
+
+    // enrich lines with margin comparison against the item master
+    const find = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
+    const lines = (data.lines || []).slice(0, 200).map(l => {
+      const master = find.get(hid, nameKey(l.item));
+      const given = marginPct(l.nr, l.mrp);
+      const expected = master ? marginPct(master.nr, master.mrp) : null;
+      return {
+        item: S(l.item, 150), qty: N(l.qty), nr: N(l.nr), mrp: N(l.mrp), value: N(l.value) || +(N(l.qty) * N(l.nr)).toFixed(2),
+        givenMargin: +given.toFixed(1),
+        expectedMargin: expected == null ? null : +expected.toFixed(1),
+        status: master ? (Math.abs(given - expected) <= MARGIN_TOL ? 'match' : (given < expected ? 'low' : 'high')) : 'new'
+      };
+    });
+    res.json({ vendor: S(data.vendor, 120), invoiceNo: S(data.invoice_no, 60), date: S(data.date, 12), fileName, lines });
+  } catch (err) { next(err); }
+});
+
+/* ---------- the upload templates ----------
+   Three fixed shapes we hand out — sales, opening stock, item master. Each is
+   read by matching column HEADINGS, so a filled sheet needs no AI to interpret:
+   deterministic, instant, and it cannot misread a number. Columns may be in any
+   order and common Marg spellings are accepted; only the headings must survive.
+
+   ONE UNIT THROUGHOUT: a STRIP. Quantities are counts of strips whatever the
+   strip contains, and both rates are for ONE strip. The headings say so out
+   loud, because the single most expensive mistake here is keying tablets into a
+   column the rest of the app reads as strips.
+
+   ⚠️ Margin % is a RATIO — (MRP − net rate) ÷ MRP — so the pack size never
+   enters it. Pack is captured so inventory and the master know what one unit IS
+   (a 10s strip is not a 15s strip), and because value totals are qty × rate. */
+const COL = {
+  name: { hdr: 'Product name',                          match: [/^product/i, /^item/i, /^name/i, /^description/i, /^particular/i] },
+  pack: { hdr: 'Pack size (10s / 15s)',                 match: [/^pack/i, /^strip *size/i, /^unit/i, /^conv/i] },
+  qty:  { hdr: 'Qty sold (strips)',                     match: [/^qty/i, /^quantity/i, /^sold/i, /^strips? *(sold|count)/i, /^nos/i] },
+  open: { hdr: 'Opening stock (strips)',                match: [/^opening/i, /^stock/i, /^balance/i, /^qty/i, /^quantity/i, /closing/i] },
+  nr:   { hdr: 'Net rate — single strip (incl. GST)',   match: [/net *rate/i, /^cost/i, /purchase *rate/i, /^p\.?rate/i, /^ptr/i, /^rate$/i] },
+  mol:  { hdr: 'Molecule / salt', match: [/^molecule/i, /^salt/i, /^generic/i, /composition/i, /^content/i] },
+  mrp:  { hdr: 'MRP — single strip',                    match: [/^mrp/i, /^m\.r\.p/i, /retail/i, /^sale *rate/i] }
+};
+const TEMPLATES = {
+  sales: {
+    file: 'yajna-sales-margin-template.xlsx', sheet: 'Sales',
+    cols: ['name', 'pack', 'qty', 'nr', 'mrp'],
+    need: ['name', 'qty', 'mrp'],
+    eg: [['Tab. Rifaximin 550', '10s', 12, 298, 412], ['Tab. Metformin 500', '15s', 5, 12, 21], ['Inj. Pantoprazole 40', 'vial', 8, 38, 58]],
+    notes: [
+      ['Qty sold (strips)', 'How many STRIPS were sold — never tablets. Part strips are fine: 2.5 is two and a half.'],
+      ['Net rate — single strip', 'What ONE strip cost you, INCLUSIVE of GST. The same basis the purchase entry uses.'],
+      ['MRP — single strip', 'The printed MRP of ONE strip.'],
+      ['What you get back', 'Sale value = Qty × MRP. Cost of goods sold = Qty × Net rate. Margin % = (MRP − Net rate) ÷ MRP.']
+    ]
+  },
+  opening: {
+    file: 'yajna-opening-stock-template.xlsx', sheet: 'Opening stock',
+    cols: ['name', 'pack', 'open', 'nr', 'mrp'],
+    need: ['name', 'open'],
+    eg: [['Tab. Rifaximin 550', '10s', 120, 298, 412], ['Tab. Metformin 500', '15s', 300, 12, 21], ['Inj. Pantoprazole 40', 'vial', 45, 38, 58]],
+    notes: [
+      ['Opening stock (strips)', 'The count of STRIPS on the shelf on the day you started — whatever the strip size. A 10s and a 15s are both just "1 strip" here.'],
+      ['Net rate — single strip', 'What ONE strip cost, INCLUSIVE of GST. This is what the stock is VALUED at.'],
+      ['MRP — single strip', 'The printed MRP of ONE strip.'],
+      ['What you get back', 'Stock value at net rate = Σ strips × net rate. Value at MRP = Σ strips × MRP. Potential margin, the item table and every downstream figure follow from these.'],
+      ['Items already on the master', 'Their opening count is updated; the prices are only overwritten if you supply them.']
+    ]
+  },
+  items: {
+    file: 'yajna-item-master-template.xlsx', sheet: 'Item master',
+    cols: ['name', 'mol', 'pack', 'nr', 'mrp'],
+    need: ['name', 'mrp'],
+    eg: [['Tab. Rifaximin 550', 'Rifaximin 550mg', '10s', 298, 412], ['Tab. Metformin 500', 'Metformin 500mg', '15s', 12, 21], ['Inj. Pantoprazole 40', 'Pantoprazole 40mg', 'vial', 38, 58]],
+    notes: [
+      ['Molecule / salt', 'The generic content — "Rifaximin 550mg". Optional, but it is what lets the All-companies master compare the SAME medicine across hospitals when the brands differ.'],
+      ['Net rate — single strip', 'The negotiated cost of ONE strip, INCLUSIVE of GST.'],
+      ['MRP — single strip', 'The printed MRP of ONE strip.'],
+      ['What you get back', 'Expected margin % = (MRP − Net rate) ÷ MRP. Every purchase line is tallied against it, and a line priced away from it alerts the admin.'],
+      ['No quantity here', 'The master is prices, not stock. Opening counts go in the opening-stock template.']
+    ]
+  }
+};
+
+function buildTemplate(kind) {
+  const T = TEMPLATES[kind];
+  const hdr = T.cols.map(c => COL[c].hdr);
+  const ws = XLSX.utils.aoa_to_sheet([hdr, ...T.eg]);
+  ws['!cols'] = T.cols.map(c => ({ wch: c === 'name' ? 34 : c === 'nr' ? 32 : 20 }));
+  const notes = XLSX.utils.aoa_to_sheet([
+    ['How to fill this sheet'], [],
+    ['Product name', 'Exactly as it appears on the bill — it is matched to the Item Master by name.'],
+    ['Pack size', 'The strip size: 10s, 15s, or vial / btl / amp for anything not in strips.'],
+    ...T.notes, [],
+    ['Everything is per STRIP', 'Quantities count strips whatever the strip holds; both rates are for ONE strip. Margin % is a ratio, so the pack size never changes it — but the VALUES do depend on it, and so does stock.'],
+    ['Column order', 'Any order you like. The columns are found by their headings, so keep the header row.'],
+    ['Rows that are skipped', 'Blank rows, and TOTAL / Grand Total rows.']
+  ]);
+  notes['!cols'] = [{ wch: 28 }, { wch: 96 }];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, T.sheet);
+  XLSX.utils.book_append_sheet(wb, notes, 'How to fill');
+  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+}
+
+/* Deliberately UNAUTHENTICATED. The file is a blank form — column headings,
+   three invented example rows and instructions. It reads nothing from the
+   database and is scoped to no hospital, so a session would gate a document
+   that contains nothing to protect, and would break demo mode for no reason.
+   Anything that reads real data stays behind `auth`. */
+app.get('/api/template/:kind', (req, res) => {
+  const T = TEMPLATES[req.params.kind];
+  if (!T) return res.status(404).json({ error: 'Unknown template' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${T.file}"`);
+  res.send(buildTemplate(req.params.kind));
+});
+
+/* Read a filled template by matching headings. Returns null when the file is not
+   that shape, so the caller can fall back to the AI reader. */
+function readTemplate(buf, kind) {
+  const T = TEMPLATES[kind];
+  let wb;
+  try { wb = XLSX.read(buf, { type: 'buffer' }); } catch (e) { return null; }
+  for (const sn of wb.SheetNames.slice(0, 5)) {
+    const grid = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, blankrows: false });
+    for (let h = 0; h < Math.min(grid.length, 15); h++) {
+      const hdr = (grid[h] || []).map(c => String(c == null ? '' : c).trim());
+      const col = {};
+      /* a heading is claimed by the FIRST field that wants it, in the template's
+         own order — otherwise "Qty" would be taken by both qty and open */
+      const taken = new Set();
+      for (const key of T.cols) {
+        const ix = hdr.findIndex((c, n) => c && !taken.has(n) && COL[key].match.some(p => p.test(c)));
+        if (ix >= 0) { col[key] = ix; taken.add(ix); }
+      }
+      if (T.need.some(k => col[k] === undefined)) continue;
+      const qtyCol = col.qty !== undefined ? col.qty : col.open;
+      const out = [];
+      for (let r = h + 1; r < grid.length; r++) {
+        const row = grid[r] || [];
+        const name = S(row[col.name], 150).trim();
+        if (!name || /^(total|grand total|sub ?total)/i.test(name)) continue;
+        const qty = qtyCol === undefined ? 0 : N(row[qtyCol]);
+        const rec = { name, molecule: S(row[col.mol ?? -1], 150).trim(), pack: S(row[col.pack ?? -1], 30).trim(), qty, nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) };
+        // sales needs something sold; opening allows a zero count; the master has no qty at all
+        if (kind === 'sales' && qty <= 0) continue;
+        if (kind === 'opening' && qty < 0) continue;
+        out.push(rec);
+      }
+      if (out.length) return { rows: out, sheet: sn };
+    }
+  }
+  return null;
+}
+const readSalesTemplate = (buf) => readTemplate(buf, 'sales');
+
+/* The item-master template. No AI fallback: the master is prices, and a price
+   guessed out of a free-form sheet is worse than no price at all. */
+app.post('/api/parse/items', auth, requireRole('admin'), upload.single('file'), (req, res) => {
+  const hid = S(req.query.hid, 60);
+  scopeCheck(req, hid);
+  if (!req.file) return res.status(400).json({ error: 'Attach the filled item-master template' });
+  const tpl = readTemplate(req.file.buffer, 'items');
+  if (!tpl) return res.status(400).json({ error: 'The columns could not be found. Download the Item Master template and keep its header row — Product name, Pack size, Net rate, MRP.' });
+  const rows = tpl.rows.map(r => ({ name: r.name, molecule: r.molecule || '', pack: r.pack, nr: r.nr, mrp: r.mrp }));
+  res.json({
+    source: 'template', sheet: tpl.sheet, rows,
+    note: `Read ${rows.length} row${rows.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}")`
+  });
+});
+
+app.post('/api/parse/gpreport', auth, upload.single('file'), async (req, res, next) => {
+  try {
+    const hid = S(req.query.hid, 60);
+    scopeCheck(req, hid);
+    if (!req.file) return res.status(400).json({ error: 'Attach the sales report (Excel/CSV/PDF)' });
+
+    /* Our own template first: the columns are known, so it is read by matching
+       headings — no AI, nothing to misread, and it works with no API key. */
+    const tpl = readSalesTemplate(req.file.buffer);
+    if (tpl) {
+      const items = tpl.rows.map(r => {
+        const value = r.qty * r.mrp, cost = r.qty * r.nr;
+        return { item: r.name, pack: r.pack, qty: r.qty, nr: r.nr, mrp: r.mrp,
+          amount: +value.toFixed(2), cost: +cost.toFixed(2),
+          // a ratio — the pack size never enters it, only the same unit on both sides
+          marginPct: r.mrp > 0 ? (r.mrp - r.nr) / r.mrp * 100 : 0 };
+      });
+      const salesMrp = items.reduce((a, r) => a + r.amount, 0);
+      const cogs = items.reduce((a, r) => a + r.cost, 0);
+      const noRate = items.filter(r => !(r.nr > 0)).length;
+      return res.json({
+        source: 'template', sheet: tpl.sheet,
+        salesMrp: +salesMrp.toFixed(2), cogs: +cogs.toFixed(2), cash: 0, credit: 0,
+        grossProfit: +(salesMrp - cogs).toFixed(2),
+        marginPct: salesMrp > 0 ? (salesMrp - cogs) / salesMrp * 100 : 0,
+        note: `Read ${items.length} row${items.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}")`
+          + (noRate ? ` · ${noRate} row${noRate === 1 ? ' has' : 's have'} no cost price, so ${noRate === 1 ? 'it counts' : 'they count'} as zero cost` : ''),
+        items
+      });
+    }
+
+    const mt = (req.file.mimetype || '').toLowerCase();
+    const name = (req.file.originalname || '').toLowerCase();
+    let content;
+    const direct = fileBlock(req.file);
+    if (direct) {
+      content = [direct];
+    } else if (/\.(xlsx?|csv)$/.test(name) || mt.includes('sheet') || mt.includes('excel') || mt.includes('csv') || mt === 'text/plain') {
+      const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+      let text = '';
+      for (const sn of wb.SheetNames.slice(0, 5)) {
+        text += `--- sheet: ${sn} ---\n` + XLSX.utils.sheet_to_csv(wb.Sheets[sn]) + '\n';
+      }
+      if (text.length > 300000) text = text.slice(0, 300000) + '\n[truncated]';
+      if (!text.trim()) return res.status(400).json({ error: 'The file appears to be empty' });
+      content = [{ type: 'text', text: 'Report contents (CSV):\n\n' + text }];
+    } else {
+      return res.status(400).json({ error: 'Unsupported file type — upload Excel, CSV, PDF or an image of the report' });
+    }
+    content.push({ type: 'text', text: "This is a daily Gross Profit / sales report exported from Marg ERP for a hospital pharmacy in India. Extract (1) the day's totals — sales at MRP, cost of goods sold (COGS), cash vs credit split if present, and gross profit — from the grand-total row, and (2) the item-wise sales rows (product name, quantity, sale amount) if the report lists individual products; return up to 150 items by sale amount, or an empty items array if the report has no item-wise rows. Amounts in rupees, plain numbers." });
+    const data = await askClaude(content, GP_SCHEMA);
+    const sm = N(data.sales_mrp), cg = N(data.cogs);
+    res.json({
+      source: 'ai',
+      salesMrp: sm, cogs: cg, cash: N(data.cash_sales), credit: N(data.credit_sales),
+      grossProfit: N(data.gross_profit), marginPct: sm > 0 ? (sm - cg) / sm * 100 : 0, note: S(data.note, 300),
+      items: (Array.isArray(data.items) ? data.items : []).slice(0, 300)
+        .map(r => ({ item: S(r.name, 150), qty: N(r.qty), amount: N(r.amount), pack: '', nr: 0, mrp: 0 }))
+        .filter(r => r.item && r.amount > 0)
+    });
+  } catch (err) { next(err); }
+});
+
+/* read an opening-stock file (Marg stock report / count sheet) */
+/* ---------- expiry snapshots ---------- */
+const rowSnap = (r) => ({ id: r.id, asOf: r.as_of, fileName: r.file_name || '', rows: JSON.parse(r.rows),
+  by: r.uploaded_by, at: r.uploaded_at });
+
+/* Indian stock reports print expiry as MM/YY, MM/YYYY, MM-YY, YYYY-MM … */
+function normExpiry(v) {
+  const x = S(v, 12).trim();
+  if (!x) return '';
+  let m = /^(\d{4})[-/](\d{1,2})$/.exec(x);                 // YYYY-MM
+  if (m) return `${m[1]}-${String(+m[2]).padStart(2, '0')}`;
+  m = /^(\d{1,2})[-/](\d{2,4})$/.exec(x);                   // MM/YY or MM/YYYY
+  if (m) {
+    const mo = +m[1]; let yr = +m[2];
+    if (yr < 100) yr += 2000;
+    if (mo >= 1 && mo <= 12 && yr >= 2000 && yr <= 2099) return `${yr}-${String(mo).padStart(2, '0')}`;
+  }
+  return '';
+}
+const cleanSnapRows = (rows) => (Array.isArray(rows) ? rows : []).slice(0, 8000)
+  .map(r => ({ name: S(r.name, 150).trim(), batch: S(r.batch, 40).trim(), expiry: normExpiry(r.expiry),
+    qty: N(r.qty), nr: N(r.nr), mrp: N(r.mrp) }))
+  .filter(r => r.name);
+
+app.post('/api/parse/expiry', auth, requireRole('admin'), upload.single('file'), async (req, res, next) => {
+  try {
+    const hid = S(req.query.hid, 60);
+    scopeCheck(req, hid);
+    if (!req.file) return res.status(400).json({ error: 'Attach the batch/expiry report (Excel/CSV/PDF/photo)' });
+    const mt = (req.file.mimetype || '').toLowerCase();
+    const name = (req.file.originalname || '').toLowerCase();
+    let content;
+    const direct = fileBlock(req.file);
+    if (direct) {
+      content = [direct];
+    } else if (/\.(xlsx?|csv)$/.test(name) || mt.includes('sheet') || mt.includes('excel') || mt.includes('csv') || mt === 'text/plain') {
+      const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+      let text = '';
+      for (const sn of wb.SheetNames.slice(0, 5)) text += `--- sheet: ${sn} ---\n` + XLSX.utils.sheet_to_csv(wb.Sheets[sn]) + '\n';
+      if (text.length > 300000) text = text.slice(0, 300000) + '\n[truncated]';
+      if (!text.trim()) return res.status(400).json({ error: 'The file appears to be empty' });
+      content = [{ type: 'text', text: 'Batch-wise stock report contents (CSV):\n\n' + text }];
+    } else {
+      return res.status(400).json({ error: 'Unsupported file type — upload Excel, CSV, PDF or an image' });
+    }
+    content.push({ type: 'text', text: "This is a BATCH-WISE stock / expiry report from an Indian hospital pharmacy (usually exported from Marg ERP). Extract one row per item AND batch: the product name as printed, the batch number, the expiry, the closing quantity of that batch, and the cost rate and MRP if printed. Expiry is usually MM/YY or MM/YYYY — convert it to YYYY-MM. Skip group headers and total rows. Quantities in saleable units, amounts in rupees." });
+    const data = await askClaude(content, EXPIRY_SCHEMA);
+    const rows = cleanSnapRows(data.rows);
+    res.json({
+      asOf: /^\d{4}-\d{2}-\d{2}$/.test(S(data.as_of)) ? data.as_of : '',
+      note: S(data.note, 300),
+      rows,
+      withExpiry: rows.filter(r => r.expiry).length,
+      withBatch: rows.filter(r => r.batch).length
+    });
+  } catch (err) { next(err); }
+});
+
+/* One snapshot per as-of date: re-uploading the same date replaces it, so a
+   corrected export supersedes rather than double-counts. */
+app.post('/api/snapshots', auth, requireRole('admin'), (req, res) => {
+  const b = req.body || {};
+  scopeCheck(req, S(b.hid, 60));
+  const asOf = S(b.asOf, 12);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(asOf)) return res.status(400).json({ error: 'Pick the date this report is as-of' });
+  if (asOf > todayISO()) return res.status(400).json({ error: 'A stock report cannot be dated in the future' });
+  const rows = cleanSnapRows(b.rows);
+  if (!rows.length) return res.status(400).json({ error: 'No stock rows to save' });
+  const snap = { id: uid('snap'), hospital_id: b.hid, as_of: asOf, file_name: S(b.fileName, 200),
+    rows: JSON.stringify(rows), uploaded_by: req.user.name, uploaded_at: Date.now() };
+  db.prepare('DELETE FROM expiry_snapshots WHERE hospital_id=? AND as_of=?').run(b.hid, asOf);
+  db.prepare('INSERT INTO expiry_snapshots(id,hospital_id,as_of,file_name,rows,uploaded_by,uploaded_at) VALUES(?,?,?,?,?,?,?)')
+    .run(snap.id, snap.hospital_id, snap.as_of, snap.file_name, snap.rows, snap.uploaded_by, snap.uploaded_at);
+  res.json({ snapshot: rowSnap(snap) });
+});
+
+app.delete('/api/snapshots/:id', auth, requireRole('admin'), (req, res) => {
+  const s0 = db.prepare('SELECT * FROM expiry_snapshots WHERE id=?').get(req.params.id);
+  if (!s0) return res.status(404).json({ error: 'Snapshot not found' });
+  scopeCheck(req, s0.hospital_id);
+  db.prepare('DELETE FROM expiry_snapshots WHERE id=?').run(s0.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/parse/stock', auth, upload.single('file'), async (req, res, next) => {
+  try {
+    const hid = S(req.query.hid, 60);
+    scopeCheck(req, hid);
+    if (!req.file) return res.status(400).json({ error: 'Attach the stock report (Excel/CSV/PDF/photo)' });
+
+    // our own opening-stock template reads by heading — no AI, nothing misread
+    const tpl = readTemplate(req.file.buffer, 'opening');
+    if (tpl) {
+      const items = tpl.rows.map(r => ({ name: r.name, qty: r.qty, pack: r.pack, nr: r.nr, mrp: r.mrp }));
+      const noRate = items.filter(r => !(r.nr > 0)).length;
+      return res.json({
+        source: 'template', stockDate: '',
+        note: `Read ${items.length} row${items.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}")`
+          + (noRate ? ` · ${noRate} without a net rate, so ${noRate === 1 ? 'it cannot' : 'they cannot'} be valued until the Item Master has one` : ''),
+        items
+      });
+    }
+
+    const mt = (req.file.mimetype || '').toLowerCase();
+    const name = (req.file.originalname || '').toLowerCase();
+    let content;
+    const direct = fileBlock(req.file);
+    if (direct) {
+      content = [direct];
+    } else if (/\.(xlsx?|csv)$/.test(name) || mt.includes('sheet') || mt.includes('excel') || mt.includes('csv') || mt === 'text/plain') {
+      const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+      let text = '';
+      for (const sn of wb.SheetNames.slice(0, 5)) text += `--- sheet: ${sn} ---\n` + XLSX.utils.sheet_to_csv(wb.Sheets[sn]) + '\n';
+      if (text.length > 300000) text = text.slice(0, 300000) + '\n[truncated]';
+      if (!text.trim()) return res.status(400).json({ error: 'The file appears to be empty' });
+      content = [{ type: 'text', text: 'Stock report contents (CSV):\n\n' + text }];
+    } else {
+      return res.status(400).json({ error: 'Unsupported file type — upload Excel, CSV, PDF or an image' });
+    }
+    content.push({ type: 'text', text: "This is a pharmacy stock / inventory report from an Indian hospital pharmacy (often exported from Marg ERP). Extract every product line with its closing balance quantity, and the pack, purchase rate (inclusive of GST) and MRP where printed. Skip group headers and total rows. Quantities in saleable units, amounts in rupees, plain numbers." });
+    const data = await askClaude(content, STOCK_SCHEMA);
+    res.json({
+      stockDate: /^\d{4}-\d{2}-\d{2}$/.test(S(data.stock_date)) ? data.stock_date : '',
+      note: S(data.note, 300),
+      items: (Array.isArray(data.items) ? data.items : []).slice(0, 5000)
+        .map(r => ({ name: S(r.name, 150), qty: N(r.qty), pack: S(r.pack, 60), nr: N(r.nr), mrp: N(r.mrp) }))
+        .filter(r => r.name && r.qty >= 0)
+    });
+  } catch (err) { next(err); }
+});
+
+app.get('/api/uploads/:hid/:name', auth, (req, res) => {
+  const hid = S(req.params.hid, 60);
+  scopeCheck(req, hid);
+  const name = path.basename(S(req.params.name, 220));
+  const fp = path.join(__dirname, 'data', 'uploads', hid, name);
+  if (!fs.existsSync(fp)) return res.status(404).json({ error: 'File not found' });
+  res.sendFile(fp);
+});
+
+/* ---------- static & errors ---------- */
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'File too large (max 12 MB)' : 'Upload failed: ' + err.code });
+  }
+  if (err instanceof Anthropic.APIError) {
+    console.error('Anthropic API error:', err.status, err.message);
+    if (err.status === 401) return res.status(503).json({ error: 'AI key invalid — check ANTHROPIC_API_KEY' });
+    if (err.status === 429) return res.status(503).json({ error: 'AI is rate-limited right now — retry in a minute' });
+    return res.status(502).json({ error: 'AI parsing failed — try again' });
+  }
+  if (err instanceof SyntaxError && err.message.includes('JSON')) {
+    return res.status(502).json({ error: 'AI returned an unreadable result — try again' });
+  }
+  const status = err.status || 500;
+  if (status >= 500) console.error(err);
+  res.status(status).json({ error: status >= 500 ? 'Server error' : err.message });
+});
+
+app.listen(PORT, '127.0.0.1', () => console.log(`Yajna Pharma console on http://127.0.0.1:${PORT}`));

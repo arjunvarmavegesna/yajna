@@ -1,0 +1,20 @@
+# Secrets — the Anthropic API key lives here. Never commit.
+.env
+.env.*
+
+# The live database: real users, bcrypt password hashes, and every hospital's
+# business data. Backups too.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Uploaded invoices and stock reports — customer documents.
+uploads/
+samples/
+
+node_modules/
+npm-debug.log*
+*.log
+.DS_Store
+!.env.example
