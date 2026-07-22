@@ -3157,12 +3157,32 @@ function generateReport(){
   $('#rpOut').innerHTML = html + `
     <div class="report-actions">
       <button class="btn btn-primary" id="pdfBtn">${IC.print} Download PDF / Print</button>
+      <button class="btn btn-primary" id="waDocBtn" style="background:var(--green);border-color:var(--green)">${IC.wa} Send to ${esc((db.hospitals[hid]||{}).doctor||'doctor')}</button>
       <button class="btn" id="waBtn">${IC.wa} Share on WhatsApp</button>
       <button class="btn" id="cpBtn">${IC.copy} Copy summary</button>
     </div>`;
   // every expiry-dependent section carries its own upload button
   wireExpiryPrompts(hid, ()=> generateReport());
   $('#pdfBtn').onclick = ()=>{ document.body.classList.add('printing'); window.print(); setTimeout(()=>document.body.classList.remove('printing'), 500); };
+  /* straight to the doctor's own number over the BSP — the wa.me share stays
+     for sending to anyone else */
+  $('#waDocBtn').onclick = async ()=>{
+    const h = db.hospitals[hid];
+    if(state.demo){ toast('Sending to the doctor works in live mode','amber'); return; }
+    const phone = (h.doctorPhone||h.phone||'').replace(/\D/g,'');
+    if(!phone){ toast("No WhatsApp number for the doctor — add it under Edit hospital",'red'); return; }
+    const btn=$('#waDocBtn'); btn.disabled=true;
+    try{
+      const r = await api('/wa/report',{method:'POST', body:{hid, text:state.lastSummary}});
+      if(r.sent && r.sent.ok){ toast(`Report sent to ${h.doctor||'the doctor'} on WhatsApp (${r.to})`,'green'); }
+      else{
+        toast((r.sent && r.sent.error) || 'Direct send unavailable — opening your WhatsApp instead','amber');
+        const w = window.open(r.waLink,'_blank');
+        if(!w){ navigator.clipboard && navigator.clipboard.writeText(state.lastSummary); toast('Pop-up blocked — summary copied instead','amber'); }
+      }
+    }catch(err){ toast(err.message,'red'); }
+    btn.disabled=false;
+  };
   $('#waBtn').onclick = ()=>{
     const url = 'https://wa.me/?text=' + encodeURIComponent(state.lastSummary);
     const w = window.open(url, '_blank');
@@ -3834,6 +3854,7 @@ function itemModal(it){
         <div class="field"><label>MRP ₹</label><input class="in num" type="number" min="0" step="0.01" id="itMrp" value="${it?it.mrp:''}"></div>
       </div>
       ${isNew?'':`<div class="field"><label>Note (why did the price change?)</label><input class="in" id="itNote" placeholder="Negotiated with vendor / rate revision"></div>
+      <p class="mini-note">A changed price is sent to ${esc((db.hospitals[state.hospital]||{}).doctor||'the doctor')} on WhatsApp and lands on the master when they approve. Pack and molecule save directly.</p>
       <div id="itHist"></div>`}
     </div>
     <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn btn-primary" id="itGo">${isNew?'Add to master':'Save new price'}</button></div>`);
@@ -3867,10 +3888,26 @@ function itemModal(it){
         const r = await api('/items',{method:'POST', body:{hid:state.hospital, name, pack, molecule, nr, mrp}});
         db.items[state.hospital].push(r.item);
         toast('Item added to master','green');
-      } else {
-        const r = await api('/items/'+it.id,{method:'PATCH', body:{nr, mrp, pack, molecule, note:$('#itNote').value.trim()}});
+      } else if(nr===it.nr && mrp===it.mrp){
+        // nothing moved on the money — pack/molecule are plain edits
+        const r = await api('/items/'+it.id,{method:'PATCH', body:{pack, molecule}});
         Object.assign(it, r.item);
-        toast('Price updated — future purchases tally against the new margin','green');
+        toast('Item updated','green');
+      } else {
+        /* A price CHANGE is the doctor's call (Arjun, Jul 22). It becomes a
+           price-revision entry on the offers tab and goes to them on WhatsApp;
+           the master moves when they tap Approve. */
+        if(pack!==it.pack || molecule!==(it.molecule||'')) await api('/items/'+it.id,{method:'PATCH', body:{pack, molecule}}).then(r=>Object.assign(it,r.item)).catch(()=>{});
+        const note = $('#itNote').value.trim();
+        const co = await api('/offers',{method:'POST', body:{hid:state.hospital, itemId:it.id, item:it.name,
+          kind:'manual', newNr:nr, newMrp:mrp, negotiatedBy:state.user.name, offerDate:todayISO(), notes:note||'Price revision'}});
+        db.offers[state.hospital].unshift(co.offer);
+        const ac = await api('/offers/'+co.offer.id+'/actions',{method:'POST', body:{type:'accepted', note:'Price revision from the Item Master'}});
+        Object.assign(co.offer, ac.offer);
+        db.offerActions[state.hospital] = (db.offerActions[state.hospital]||[]).filter(a=>a.offerId!==co.offer.id).concat(ac.actions);
+        closeModal();
+        await offerSendApproval(co.offer);
+        renderItems(); return;
       }
       closeModal(); renderItems();
     }catch(err){ btn.disabled=false; toast(err.message,'red'); }
@@ -3911,14 +3948,14 @@ function renderNavHospitals(){
    applied — nothing here changes a price by itself. */
 const offMargin = (nr, mrp)=> (num(mrp)>0 ? (num(mrp)-num(nr))/num(mrp)*100 : 0);
 const offExpired = o=> !!o.validTill && o.validTill < todayISO() && o.status!=='applied' && o.status!=='declined';
-const offEff = o=> offExpired(o)? 'expired' : o.status;
+const offEff = o=> offExpired(o)? 'expired' : (o.awaitingDoctor? 'awaiting' : o.status);
 const offSaving = o=> (num(o.oldNr)-num(o.newNr)) * num(o.qtyCommit);
 const offGain = o=> offMargin(o.newNr,o.newMrp) - offMargin(o.oldNr,o.oldMrp);
-const offOverdue = o=> !!o.nextFollowUp && o.nextFollowUp <= todayISO() && (offEff(o)==='proposed' || offEff(o)==='accepted');
-const OFF_CHIP = {proposed:'chip-amber', accepted:'chip-blue', applied:'chip-green', declined:'chip-gray', expired:'chip-red'};
-const OFF_LABEL = {proposed:'Proposed', accepted:'Accepted', applied:'Applied', declined:'Declined', expired:'Expired'};
+const offOverdue = o=> !!o.nextFollowUp && o.nextFollowUp <= todayISO() && ['proposed','accepted','awaiting'].includes(offEff(o));
+const OFF_CHIP = {proposed:'chip-amber', accepted:'chip-blue', awaiting:'chip-blue', applied:'chip-green', declined:'chip-gray', expired:'chip-red'};
+const OFF_LABEL = {proposed:'Proposed', accepted:'Accepted', awaiting:'With the doctor', applied:'Applied', declined:'Declined', expired:'Expired'};
 const OFF_FILTERS = [
-  {id:'open',  t:'Open',      f:o=> offEff(o)==='proposed' || offEff(o)==='accepted'},
+  {id:'open',  t:'Open',      f:o=> ['proposed','accepted','awaiting'].includes(offEff(o))},
   {id:'due',   t:'Follow-up due', f:offOverdue},
   {id:'applied', t:'Applied', f:o=> o.status==='applied'},
   {id:'closed', t:'Declined / expired', f:o=> offEff(o)==='declined' || offEff(o)==='expired'},
@@ -3928,6 +3965,8 @@ const offersOf = hid=> (db.offers[hid]||[]);
 const offActionsOf = (hid,oid)=> (db.offerActions[hid]||[]).filter(a=>a.offerId===oid);
 
 function renderOffers(){
+  state.offView = state.offView || 'offers';
+  if(state.offView === 'history') return renderPriceHistory();
   const hid = state.hospital, T = todayISO();
   const all = offersOf(hid);
   state.offFilter = state.offFilter || 'open';
@@ -3936,7 +3975,7 @@ function renderOffers(){
   const list = all.filter(flt.f)
     .filter(o=> !q || nameKey(o.item).includes(q) || nameKey(o.molecule||'').includes(q) || nameKey(o.vendor||'').includes(q) || nameKey(o.negotiatedBy||'').includes(q))
     .sort((a,z)=> (offOverdue(z)-offOverdue(a)) || (z.offerDate||'').localeCompare(a.offerDate||''));
-  const open = all.filter(o=> offEff(o)==='proposed' || offEff(o)==='accepted');
+  const open = all.filter(o=> ['proposed','accepted','awaiting'].includes(offEff(o)));
   const onTable = open.reduce((a,o)=> a + Math.max(offSaving(o),0), 0);
   const due = all.filter(offOverdue).length;
   const appliedThisMonth = all.filter(o=> o.status==='applied' && o.appliedAt && iso(new Date(o.appliedAt)).slice(0,7)===T.slice(0,7));
@@ -3950,6 +3989,7 @@ function renderOffers(){
       <div class="kpi"><div class="l">Applied this month</div><div class="v num">${appliedThisMonth.length}</div><div class="d">${fmtRs(wonRs)} of buying price taken out</div></div>
     </div>
     <div class="entry-bar">
+      <div class="seg"><button class="active" data-offv="offers">Offers</button><button data-offv="history">Price history</button></div>
       ${OFF_FILTERS.map(f=>`<button class="btn btn-sm ${state.offFilter===f.id?'btn-primary':''}" data-offf="${f.id}">${f.t}${f.id==='due'&&due? ` (${due})`:''}</button>`).join('')}
       <input class="in" id="offSearch" placeholder="Item, molecule, vendor, negotiator…" value="${esc(state.offQuery||'')}" style="width:230px">
       <span style="flex:1"></span>
@@ -3977,11 +4017,62 @@ function renderOffers(){
         </tr>`;
       }).join('') || `<tr><td colspan="9" style="color:var(--faint);padding:16px">${all.length? 'Nothing under this filter.' : 'No offers recorded yet. When a vendor rep proposes a better rate, put it here — an offer nobody wrote down is a discount lost.'}</td></tr>`}
       </tbody></table></div></div>`;
+  $$('[data-offv]').forEach(b=> b.onclick = ()=>{ state.offView = b.dataset.offv; renderOffers(); });
   $$('[data-offf]').forEach(b=> b.onclick = ()=>{ state.offFilter = b.dataset.offf; renderOffers(); });
   const so = $('#offSearch');
   so.oninput = ()=>{ state.offQuery = so.value; renderOffers(); const s2=$('#offSearch'); s2.focus(); s2.setSelectionRange(s2.value.length, s2.value.length); };
   $('#offAdd').onclick = ()=> offerModal();
   $$('[data-offopen]').forEach(b=> b.onclick = ()=> offerDetail(offersOf(hid).find(x=>x.id===b.dataset.offopen)));
+}
+
+/* Every price the master has ever carried: what moved, when, who negotiated it
+   and which doctor said yes. price_log is the one ledger both the offer path and
+   the manual path write, so this view cannot disagree with the item history. */
+function renderPriceHistory(){
+  const hid = state.hospital;
+  const draw = (rows, note)=>{
+    const applied = rows.length;
+    const drop = rows.reduce((a,r)=> a + Math.max(0, num(r.oldNr)-num(r.newNr)), 0);
+    const gained = rows.filter(r=> r.newMargin > r.oldMargin + 0.05).length;
+    $('#content').innerHTML = `
+      <div class="entry-bar">
+        <div class="seg"><button data-offv="offers">Offers</button><button class="active" data-offv="history">Price history</button></div>
+        <span class="eyebrow">${applied} price change${applied===1?'':'s'} on record${gained? ` · ${gained} improved the margin`:''}</span>
+        <span style="flex:1"></span>
+      </div>
+      ${note? `<p class="mini-note" style="margin:-6px 0 12px">${note}</p>`:''}
+      <div class="card"><div class="tbl-scroll"><table class="tbl">
+        <thead><tr><th>Date</th><th>Item</th><th class="r">Net rate ₹</th><th class="r">MRP ₹</th><th class="r">Margin</th><th>How</th><th>Approved by</th></tr></thead>
+        <tbody>${rows.map(r=>{
+          const g = r.newMargin - r.oldMargin;
+          return `<tr>
+            <td class="num" style="color:var(--muted)">${fmtDateShort(iso(new Date(r.ts)))}</td>
+            <td><b>${esc(r.item)}</b>${r.pack? ` <span style="color:var(--faint);font-size:11.5px">${esc(r.pack)}</span>`:''}</td>
+            <td class="r num">${num(r.oldNr)||'—'} → <b>${num(r.newNr)}</b></td>
+            <td class="r num">${num(r.oldMrp)===num(r.newMrp)? num(r.newMrp) : `${num(r.oldMrp)||'—'} → ${num(r.newMrp)}`}</td>
+            <td class="r num" style="color:${g>0.05?'var(--green)':g<-0.05?'var(--red)':'var(--muted)'};font-weight:600">${pct(r.oldMargin)} → ${pct(r.newMargin)}</td>
+            <td style="font-size:12.5px">${r.source==='offer'? `Offer${r.vendor? ' — '+esc(r.vendor):''}` : 'Price revision'}<div style="color:var(--faint)">${esc(r.by)}</div></td>
+            <td style="font-size:12.5px">${r.approvedBy? `<span class="chip chip-green">Dr ✓</span> ${esc(r.approvedBy)}` : '<span style="color:var(--faint)">—</span>'}</td>
+          </tr>`;
+        }).join('') || `<tr><td colspan="7" style="color:var(--faint);padding:16px">No price has moved yet. When an offer is applied — or a revision approved — it lands here with who negotiated it and which doctor signed off.</td></tr>`}
+        </tbody></table></div></div>
+      ${drop>0? `<p class="mini-note">Across all changes the buying rate has come down by a cumulative ₹${drop.toFixed(2)} per strip.</p>`:''}`;
+    $$('[data-offv]').forEach(b=> b.onclick = ()=>{ state.offView = b.dataset.offv; renderOffers(); });
+  };
+  if(state.demo){
+    // demo has no price_log — show what the applied offers imply, same shape
+    const rows = offersOf(hid).filter(o=>o.status==='applied').map(o=>({
+      item:o.item, pack:o.pack, oldNr:o.oldNr, oldMrp:o.oldMrp, newNr:o.newNr, newMrp:o.newMrp,
+      oldMargin:offMargin(o.oldNr,o.oldMrp), newMargin:offMargin(o.newNr,o.newMrp),
+      source:'offer', vendor:o.vendor, by:o.negotiatedBy, approvedBy:o.approvedBy||'', ts:o.appliedAt||Date.now()}));
+    draw(rows, 'Demo mode — built from the demo offers; live mode reads the real price ledger.');
+    return;
+  }
+  draw(state.priceHist && state.priceHistHid===hid ? state.priceHist : [], null);
+  api('/price-history?hid='+encodeURIComponent(hid)).then(r=>{
+    state.priceHist = r.history; state.priceHistHid = hid;
+    if(state.hospTab==='offers' && state.offView==='history') draw(r.history, null);
+  }).catch(err=> toast(err.message,'red'));
 }
 
 function offerModal(){
@@ -4082,7 +4173,7 @@ function offerDetail(o){
   if(!o) return;
   const hid = state.hospital, eff = offEff(o);
   const acts = offActionsOf(hid, o.id);
-  const live = eff==='proposed' || eff==='accepted';
+  const live = eff==='proposed' || eff==='accepted' || eff==='awaiting';
   openModal(`
     <div class="modal-head"><h3>${esc(o.item)} <span class="chip ${OFF_CHIP[eff]||'chip-gray'}" style="margin-left:6px">${OFF_LABEL[eff]||eff}</span></h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
@@ -4095,6 +4186,7 @@ function offerDetail(o){
         <tr><td style="color:var(--muted)">Vendor</td><td><b>${esc(o.vendor||'—')}</b></td><td style="color:var(--muted)">Offered by</td><td>${esc(o.offeredBy||'—')}${o.offeredByPhone? ' · '+esc(o.offeredByPhone):''}</td></tr>
         <tr><td style="color:var(--muted)">Negotiated by</td><td><b>${esc(o.negotiatedBy)}</b></td><td style="color:var(--muted)">Offer date</td><td class="num">${fmtDateShort(o.offerDate)}</td></tr>
         <tr><td style="color:var(--muted)">Valid till</td><td class="num" style="color:${eff==='expired'?'var(--red)':''}">${o.validTill? fmtDateShort(o.validTill):'open-ended'}</td><td style="color:var(--muted)">Next follow-up</td><td class="num" style="color:${offOverdue(o)?'var(--red)':''}">${o.nextFollowUp? fmtDateShort(o.nextFollowUp):'none set'}</td></tr>
+        ${o.approvalSentAt? `<tr><td style="color:var(--muted)">Doctor approval</td><td colspan="3">${o.approvedAt? `<span class="chip chip-green">Approved by ${esc(o.approvedBy)}</span> ${fmtDateShort(iso(new Date(o.approvedAt)))}` : `Sent ${fmtDateShort(iso(new Date(o.approvalSentAt)))} — waiting on WhatsApp`}</td></tr>`:''}
         ${o.molecule? `<tr><td style="color:var(--muted)">Molecule</td><td colspan="3">${esc(o.molecule)}</td></tr>`:''}
         ${o.notes? `<tr><td style="color:var(--muted)">Notes</td><td colspan="3">${esc(o.notes)}</td></tr>`:''}
       </tbody></table></div>
@@ -4115,8 +4207,11 @@ function offerDetail(o){
       ${o.status!=='applied'? `<button class="btn" id="ofDel" style="color:var(--red);border-color:#E8C4C4">Delete</button>`:''}
       <span style="flex:1"></span>
       <button class="btn modal-x">Close</button>
-      ${eff==='accepted'? `<button class="btn btn-primary" id="ofApply">Apply to Item Master</button>`:''}
+      ${o.approvedAt && o.status!=='applied'? `<button class="btn btn-primary" id="ofApply">Apply — approved by ${esc(o.approvedBy)}</button>`
+        : eff==='accepted'? `<button class="btn btn-primary" id="ofSendAppr">Send to doctor for approval</button>`
+        : eff==='awaiting'? `<button class="btn" id="ofSendAppr" title="A resend replaces the link — only the newest one works">Resend to doctor</button>`:''}
     </div>`);
+  const sa = $('#ofSendAppr'); if(sa) sa.onclick = ()=> offerSendApproval(o);
   $$('[data-ofa]').forEach(b=> b.onclick = ()=> offerActionModal(o, b.dataset.ofa));
   const ap = $('#ofApply'); if(ap) ap.onclick = ()=> offerApply(o);
   const dl = $('#ofDel'); if(dl) dl.onclick = async ()=>{
@@ -4185,6 +4280,41 @@ function offerActionModal(o, type){
       closeModal(); toast('Logged','green'); renderOffers();
     }catch(err){ btn.disabled=false; toast(err.message,'red'); }
   };
+}
+
+/* The doctor gets a WhatsApp message with a single-use signed link — Approve on
+   that page IS the apply. If the BSP send cannot go (no key, closed 24h window),
+   the same message opens in the admin's own WhatsApp instead, so the flow never
+   dead-ends on configuration. */
+async function offerSendApproval(o){
+  if(state.demo){ toast('Doctor approval works in live mode — it needs the server to sign the link','amber'); return; }
+  const h = db.hospitals[state.hospital];
+  if(!(h.doctorPhone||h.phone)){ toast("No WhatsApp number for the doctor — add it under Edit hospital",'red'); return; }
+  try{
+    const r = await api('/offers/'+o.id+'/request-approval',{method:'POST'});
+    Object.assign(o, r.offer);
+    db.offerActions[state.hospital] = (db.offerActions[state.hospital]||[]).filter(a=>a.offerId!==o.id).concat(r.actions);
+    closeModal();
+    if(r.sent && r.sent.ok){
+      toast(`Sent to ${h.doctor||'the doctor'} on WhatsApp — the change lands the moment they tap Approve`,'green');
+    } else {
+      openModal(`
+        <div class="modal-head"><h3>Send it from your WhatsApp</h3><button class="modal-x">✕</button></div>
+        <div class="modal-body">
+          <p class="mini-note" style="margin-top:0">${esc(r.sent && r.sent.error || 'Direct send unavailable')} — open WhatsApp with the message ready instead. The approval link inside works either way.</p>
+          <textarea class="in" rows="8" readonly id="aprText">${esc(r.text)}</textarea>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" id="aprCopy">Copy message</button>
+          <span style="flex:1"></span>
+          <button class="btn modal-x">Close</button>
+          ${r.waLink? `<button class="btn btn-primary" id="aprWa">${IC.wa} Open WhatsApp</button>`:''}
+        </div>`);
+      $('#aprCopy').onclick = ()=> navigator.clipboard.writeText(r.text).then(()=>toast('Copied','green'));
+      const aw=$('#aprWa'); if(aw) aw.onclick = ()=> window.open(r.waLink,'_blank');
+    }
+    if(state.hospTab==='offers') renderOffers();   // called from the Item Master too — do not repaint the wrong tab
+  }catch(err){ toast(err.message,'red'); }
 }
 
 async function offerApply(o){
@@ -5719,15 +5849,16 @@ function hospModal(h){
       <div class="field"><label>Doctor / owner</label><input class="in" id="hDoc" value="${esc(h?h.doctor:'')}"></div>
       <div class="field"><label>Location</label><input class="in" id="hLoc" value="${esc(h?h.location:'')}" placeholder="Area, Bhimavaram"></div>
       <div class="grid2">
-        <div class="field"><label>Phone</label><input class="in" id="hPh" value="${esc(h?h.phone:'')}"></div>
-        <div class="field"><label>Start date</label><input class="in" type="date" id="hStart" value="${h?h.startDate:todayISO()}"></div>
+        <div class="field"><label>Hospital phone</label><input class="in" id="hPh" value="${esc(h?h.phone:'')}"></div>
+        <div class="field"><label>Doctor's WhatsApp <span style="color:var(--faint);font-weight:400">— reports &amp; price approvals go here</span></label><input class="in" id="hDocPh" value="${esc(h?(h.doctorPhone||''):'')}" placeholder="+91 98…"></div>
       </div>
+      <div class="field"><label>Start date</label><input class="in" type="date" id="hStart" value="${h?h.startDate:todayISO()}"></div>
     </div>
     <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn btn-primary" id="hSave">${isNew?'Add hospital':'Save changes'}</button></div>`);
   $('#hSave').onclick = async ()=>{
     const name = $('#hName').value.trim();
     if(!name){ toast('Hospital name is required','red'); return; }
-    const body = {name, doctor:$('#hDoc').value.trim(), location:$('#hLoc').value.trim(), phone:$('#hPh').value.trim(), startDate:$('#hStart').value||todayISO()};
+    const body = {name, doctor:$('#hDoc').value.trim(), location:$('#hLoc').value.trim(), phone:$('#hPh').value.trim(), doctorPhone:$('#hDocPh').value.trim(), startDate:$('#hStart').value||todayISO()};
     if(state.demo){
       if(isNew){
         const id = 'h'+Date.now();

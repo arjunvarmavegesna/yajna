@@ -25,6 +25,13 @@ function jar() {
   }};
 }
 
+const form = async (path, body) => {
+  const r = await fetch(B.replace('/api','') + path, { method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  return { status: r.status, text: await r.text() };
+};
+const page = async (path) => { const r = await fetch(B.replace('/api','') + path); return { status: r.status, text: await r.text() }; };
+
 /* ─────────────────────────── API ─────────────────────────── */
 const adm = jar(), stf = jar();
 await adm.req('POST', '/login', { email: 'bhagavan@yajnapharma.in', password: ADMIN_PW });
@@ -62,14 +69,38 @@ ok((await adm.req('POST', `/offers/${off.id}/actions`, { type: 'declined' })).st
 ok((await adm.req('POST', `/offers/${off.id}/actions`, { type: 'accepted', date: addDays(T, -400) })).status === 400, 'an action before the offer existed is refused');
 ok((await adm.req('POST', `/offers/${off.id}/actions`, { type: 'accepted' })).data.offer.status === 'accepted', 'accepting is a decision on the log');
 
-console.log('— only Apply moves a price —');
+console.log('— a price only moves once the DOCTOR says yes —');
 let it = (await adm.req('GET', '/bootstrap')).data.items.viraj.find(x => x.name === 'Tab. Rifaximin 550');
 ok(it.nr === 300, 'accepting the offer left the Item Master alone', it.nr);
 r = await adm.req('POST', `/offers/${off.id}/apply`);
-ok(r.status === 200 && r.data.item.nr === 265, 'applying moves the master to the negotiated rate', r.data.item?.nr);
-ok(r.data.offer.status === 'applied' && !!r.data.offer.appliedAt, 'and the offer becomes history');
-const hist = (await adm.req('GET', `/items/${r.data.item.id}/history`)).data.history;
+ok(r.status === 400 && /doctor/i.test(r.data.error), 'even an accepted offer cannot be applied without the doctor', r.data.error);
+ok((await adm.req('PATCH', '/items/' + it.id, { nr: 111, mrp: 400 })).data.code === 'needs_approval', 'nor can the master be edited around the gate');
+ok((await adm.req('PATCH', '/items/' + it.id, { nr: 300, mrp: 400, pack: '10s' })).status === 200, 'pack and molecule are still plain edits — they describe the item, they do not move its money');
+await adm.req('PATCH', '/hospitals/viraj', { doctorPhone: '+91 90000 11111' });
+r = await adm.req('POST', `/offers/${off.id}/request-approval`);
+ok(r.status === 200 && r.data.offer.awaitingDoctor, 'the offer goes to the doctor over WhatsApp', JSON.stringify(r.data.sent));
+ok(/₹300 → \*₹265\*/.test(r.data.text), 'the message states the exact change', r.data.text.split('\n')[2]);
+ok(r.data.waLink.includes('wa.me/919000011111'), 'and falls back to the admin sending it themselves when the BSP cannot');
+const tok1 = r.data.url.split('/approve/')[1];
+r = await adm.req('POST', `/offers/${off.id}/request-approval`);
+const tok2 = r.data.url.split('/approve/')[1];
+ok(tok1 !== tok2 && (await page('/approve/' + tok1)).status === 404, 'a resend replaces the link — a forwarded old message can approve nothing');
+let pg = await page('/approve/' + tok2);
+ok(pg.status === 200 && /₹300/.test(pg.text) && /₹265/.test(pg.text) && /Approve/.test(pg.text), 'the doctor sees exactly what changes, no login needed');
+ok(/needs a word on why/.test((await form('/approve/' + tok2, 'decision=decline')).text), 'declining without a note is refused on the page too');
+pg = await form('/approve/' + tok2, 'decision=approve&note=fine');
+ok(/Approved/i.test(pg.text) && /applied/i.test(pg.text), 'Approve on the page IS the apply', pg.text.slice(0, 100));
+it = (await adm.req('GET', '/bootstrap')).data.items.viraj.find(x => x.name === 'Tab. Rifaximin 550');
+ok(it.nr === 265, 'the master moved to the approved rate', it.nr);
+r = { data: { item: it } };
+const offRow = (await adm.req('GET', '/bootstrap')).data.offers.viraj.find(x => x.id === off.id);
+ok(offRow.status === 'applied' && offRow.approvedBy === 'Dr. Guna Ranjan', 'recorded as approved by the doctor by name', JSON.stringify({ s: offRow.status, by: offRow.approvedBy }));
+ok((await page('/approve/' + tok2)).status !== 200 || /already approved/i.test((await page('/approve/' + tok2)).text), 'the used link only reports the outcome');
+const hist = (await adm.req('GET', `/items/${it.id}/history`)).data.history;
 ok(hist.some(h => /Zydus/.test(h.note) && /Bhagavan/.test(h.note)), 'the item price history names the vendor and the negotiator, so it reads on its own', JSON.stringify(hist[0]));
+const ph = (await adm.req('GET', '/price-history?hid=viraj')).data.history;
+ok(ph.length === 1 && ph[0].approvedBy === 'Dr. Guna Ranjan' && ph[0].source === 'offer', 'the procurement price history carries who approved it', JSON.stringify(ph[0]));
+ok((await stf.req('GET', '/price-history?hid=mithra')).status === 403, 'a data-entry user cannot read the price history');
 ok((await adm.req('POST', `/offers/${off.id}/apply`)).status === 400, 'it cannot be applied twice');
 ok((await adm.req('DELETE', `/offers/${off.id}`)).status === 400, 'an applied offer is part of the price history and cannot be deleted');
 ok((await adm.req('POST', `/offers/${off.id}/actions`, { type: 'reopened' })).status === 400, 'nor reopened — raise a new offer instead');
@@ -81,6 +112,7 @@ const ex = r.data.offer;
 ok(ex.status === 'proposed', 'the stored status is untouched by the calendar', ex.status);
 ok(ex.expired && ex.effectiveStatus === 'expired', 'but it reads as expired');
 ok((await adm.req('POST', `/offers/${ex.id}/apply`)).status === 400, 'an expired offer cannot be applied');
+ok((await adm.req('POST', `/offers/${ex.id}/request-approval`)).status === 400, 'nor sent to the doctor — their time is not spent on a dead offer');
 r = await adm.req('POST', `/offers/${ex.id}/actions`, { type: 'reopened', note: 'vendor still honours it' });
 ok(r.status === 200 && r.data.offer.status === 'proposed', 'reopening puts it back in play');
 ok((await adm.req('DELETE', `/offers/${ex.id}`)).status === 200, 'an unapplied offer can be deleted');
@@ -189,17 +221,39 @@ doc.querySelector('[data-ofa="note"]').click(); await tick(200);
 w.eval(`$("#oaNote").value="rang, no answer"; $("#oaGo").click()`); await tick(300);
 ok(w.eval('db.offerActions.viraj.length') === 1, 'the note lands on the log', w.eval('db.offerActions.viraj.length'));
 
-console.log('— an accepted offer is the only one that can be applied —');
+console.log('— an accepted offer goes to the doctor, not straight to the master —');
 w.eval('state.offFilter="open"; renderOffers()'); await tick(200);
 const acc = w.eval('db.offers.viraj.findIndex(o=>o.status==="accepted")');
 ok(acc >= 0, 'the demo has one accepted');
 w.eval(`offerDetail(db.offers.viraj[${acc}])`); await tick(300);
-ok(!!doc.querySelector('#ofApply'), 'and it offers Apply to Item Master');
-const before = w.eval(`(()=>{const o=db.offers.viraj[${acc}]; const it=findItem("viraj",o.item); return it? it.nr : -1;})()`);
-w.eval('$("#ofApply").click()'); await tick(400);
-const after = w.eval(`(()=>{const o=db.offers.viraj[${acc}]; const it=findItem("viraj",o.item); return it? it.nr : -1;})()`);
-ok(after < before, 'applying moves the master price down', `${before} → ${after}`);
-ok(w.eval(`db.offers.viraj[${acc}].status`) === 'applied', 'and the offer is marked applied');
+ok(!doc.querySelector('#ofApply'), 'there is NO direct Apply button any more');
+ok(!!doc.querySelector('#ofSendAppr'), 'the primary action is Send to doctor for approval', doc.querySelector('.modal-foot')?.textContent);
+w.eval('$("#ofSendAppr").click()'); await tick(300);
+ok(/live mode/i.test(doc.querySelector('#toastRoot')?.textContent||''), 'demo says approval needs live mode — it must not pretend');
+ok(w.eval(`db.offers.viraj[${acc}].status`) === 'accepted', 'and nothing moved');
+w.eval('closeModal()'); await tick(150);
+
+console.log('— the price history view —');
+w.eval(`db.offers.viraj[${acc}].status='applied'; db.offers.viraj[${acc}].appliedAt=Date.now(); db.offers.viraj[${acc}].approvedBy='Dr. Vikranth Chunduri';`);
+w.eval('state.offView="history"; renderOffers()'); await tick(300);
+ok(/Price history/.test(txt()), 'the offers tab has a Price history view');
+ok(/price change.*on record/i.test(txt()), 'it counts what actually landed');
+ok(/Dr ✓/.test(txt()), 'and shows the doctor sign-off on each row', txt().slice(0,80));
+w.eval('state.offView="offers"; renderOffers()'); await tick(200);
+ok(!!doc.querySelector('[data-offopen]'), 'and switches back to the offers');
+
+console.log('— the hospital dialog carries the doctor\'s WhatsApp —');
+w.eval('hospModal(db.hospitals.viraj)'); await tick(250);
+ok(!!doc.querySelector('#hDocPh'), 'there is a field for the doctor\'s own number');
+ok(/reports.*price approvals go here/i.test(doc.querySelector('.modal-body').textContent), 'and it says what it is for');
+w.eval('closeModal()'); await tick(150);
+
+console.log('— the report can go straight to the doctor —');
+w.eval('openHospital("viraj","reports")'); await tick(400);
+w.eval('generateReport()'); await tick(600);
+ok(!!doc.querySelector('#waDocBtn'), 'the generated report has a Send-to-doctor button');
+ok(new RegExp(w.eval('db.hospitals.viraj.doctor').split(' ')[0]).test(doc.querySelector('#waDocBtn').textContent), 'named after the actual doctor', doc.querySelector('#waDocBtn').textContent);
+ok(!!doc.querySelector('#waBtn'), 'the plain WhatsApp share stays for anyone else');
 
 console.log('— the all-companies master screen —');
 w.eval('go("master")'); await tick(400);

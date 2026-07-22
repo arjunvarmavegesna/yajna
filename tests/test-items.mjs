@@ -41,10 +41,19 @@ ok(r.status === 200 && r.data.item.key === 'tab. pantoprazole 40', 'item created
 const itemId = r.data.item.id;
 r = await mgr.req('POST', '/items', { hid: 'mithra', name: '  TAB.  Pantoprazole   40 ', nr: 40, mrp: 60 });
 ok(r.status === 409, 'duplicate (case/space-insensitive) rejected');
+// a price change no longer lands directly — it rides the doctor-approval flow
 r = await mgr.req('PATCH', '/items/' + itemId, { nr: 36, mrp: 58, note: 'negotiated with Sun Pharma' });
-ok(r.status === 200 && r.data.item.nr === 36, 'price updated (negotiation)');
+ok(r.status === 400 && r.data.code === 'needs_approval', 'a direct price edit is refused — the doctor approves prices now');
+await adm.req('PATCH', '/hospitals/mithra', { doctorPhone: '+91 90000 22222' });
+r = await mgr.req('POST', '/offers', { hid: 'mithra', itemId, item: 'Tab. Pantoprazole 40', kind: 'manual', newNr: 36, newMrp: 58, negotiatedBy: 'Ravi Teja', notes: 'negotiated with Sun Pharma' });
+await mgr.req('POST', `/offers/${r.data.offer.id}/actions`, { type: 'accepted' });
+const apr = await mgr.req('POST', `/offers/${r.data.offer.id}/request-approval`);
+const aprTok = apr.data.url.split('/approve/')[1];
+await fetch('http://127.0.0.1:3061/approve/' + aprTok, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'decision=approve' });
 r = await adm.req('GET', '/items/' + itemId + '/history');
-ok(r.status === 200 && r.data.history.length === 1 && r.data.history[0].oldNr === 38 && r.data.history[0].note.includes('negotiated'), 'price change logged with note');
+ok(r.status === 200 && r.data.history.length === 1 && r.data.history[0].oldNr === 38 && r.data.history[0].newNr === 36, 'the approved change is on the item history');
+ok(r.data.history[0].note.includes('negotiated'), 'with the negotiation note');
+ok((await adm.req('GET', '/bootstrap')).data.items.mithra.find(i => i.id === itemId).nr === 36, 'and the master carries 36 — same end state, now with a sign-off');
 r = await mgr.req('POST', '/items/bulk', { hid: 'mithra', items: [
   { name: 'Inj. Ceftriaxone 1g', nr: 42, mrp: 66, pack: 'vial' },
   { name: 'tab. pantoprazole 40', nr: 1, mrp: 2 },       // dup

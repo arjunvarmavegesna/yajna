@@ -181,6 +181,25 @@ CREATE INDEX IF NOT EXISTS idx_plog_item ON price_log(item_id);
      Rifaximin 550" at one and "Rifagut 550" at another are the same purchase
      decision. Optional: an item without one still works everywhere else. */
   if (!icols.includes('molecule')) db.exec("ALTER TABLE items ADD COLUMN molecule TEXT NOT NULL DEFAULT ''");
+{
+  const hcols = db.prepare('PRAGMA table_info(hospitals)').all().map(c => c.name);
+  // the doctor's own WhatsApp number — reports and price approvals go THERE, not
+  // to the hospital's front desk
+  if (!hcols.includes('doctor_phone')) db.exec("ALTER TABLE hospitals ADD COLUMN doctor_phone TEXT DEFAULT ''");
+  const pcols = db.prepare('PRAGMA table_info(price_log)').all().map(c => c.name);
+  if (!pcols.includes('source')) db.exec("ALTER TABLE price_log ADD COLUMN source TEXT DEFAULT 'manual'");
+  if (!pcols.includes('offer_id')) db.exec('ALTER TABLE price_log ADD COLUMN offer_id TEXT');
+  if (!pcols.includes('approved_by')) db.exec("ALTER TABLE price_log ADD COLUMN approved_by TEXT DEFAULT ''");
+  const ocols = db.prepare('PRAGMA table_info(margin_offers)').all().map(c => c.name);
+  // the token is stored HASHED — the database never holds anything that opens the
+  // approval page by itself
+  if (!ocols.includes('approval_hash')) db.exec('ALTER TABLE margin_offers ADD COLUMN approval_hash TEXT');
+  if (!ocols.includes('approval_sent_at')) db.exec('ALTER TABLE margin_offers ADD COLUMN approval_sent_at INTEGER');
+  if (!ocols.includes('approval_expires')) db.exec('ALTER TABLE margin_offers ADD COLUMN approval_expires INTEGER');
+  if (!ocols.includes('approved_by')) db.exec("ALTER TABLE margin_offers ADD COLUMN approved_by TEXT DEFAULT ''");
+  if (!ocols.includes('approved_at')) db.exec('ALTER TABLE margin_offers ADD COLUMN approved_at INTEGER');
+  if (!ocols.includes('kind')) db.exec("ALTER TABLE margin_offers ADD COLUMN kind TEXT DEFAULT 'offer'");
+}
   const hcols = db.prepare('PRAGMA table_info(hospitals)').all().map(c => c.name);
   if (!hcols.includes('stock_date')) db.exec('ALTER TABLE hospitals ADD COLUMN stock_date TEXT');
   // pharmacies dispense by expiry, not receipt order — FEFO is the shipped default
@@ -348,7 +367,7 @@ const rowUser = (u) => u && ({
 const ROLES = ['admin', 'user'];
 const ROLE_LABEL = { admin: 'Yajna Admin', user: 'Data entry' };
 const ISSUE_METHODS = ['fefo', 'fifo'];
-const rowHosp = (h) => ({ id: h.id, name: h.name, doctor: h.doctor, location: h.location, phone: h.phone, startDate: h.start_date, stockDate: h.stock_date || null, issueMethod: h.issue_method || 'fefo', active: !!h.active, base: h.base });
+const rowHosp = (h) => ({ id: h.id, name: h.name, doctor: h.doctor, location: h.location, phone: h.phone, doctorPhone: h.doctor_phone || '', startDate: h.start_date, stockDate: h.stock_date || null, issueMethod: h.issue_method || 'fefo', active: !!h.active, base: h.base });
 const rowVendor = (v) => ({ id: v.id, name: v.name, creditDays: v.credit_days, openingBal: v.opening_bal, phone: v.phone, addedOn: v.added_on });
 const rowPay = (p) => ({ id: p.id, vendorId: p.vendor_id, vendorName: p.vendor_name, amount: p.amount, date: p.date, note: p.note });
 const rowNotif = (n) => ({ id: n.id, type: n.type, hid: n.hospital_id, date: n.date, msg: n.msg, ts: n.ts, read: !!n.read });
@@ -562,7 +581,7 @@ app.get('/api/bootstrap', auth, (req, res) => {
     ? (allowed.length ? db.prepare(`SELECT * FROM hospitals WHERE id IN (${allowed.map(() => '?').join(',')})`).all(...allowed) : [])
     : db.prepare('SELECT * FROM hospitals').all();
   const hids = hs.map(h => h.id);
-  const out = { user: rowUser(req.user), hospitals: {}, vendors: {}, payments: {}, dailyData: {}, hvTracked: {}, reportPrefs: {}, notifications: [], items: {}, adjustments: {}, offers: {}, offerActions: {}, receivables: {}, recvActions: {}, snapshots: {}, periodData: {}, offerStates: OFFER_STATES, offerActionTypes: OFFER_ACTIONS, adjReasons: ADJ_REASONS, issueMethods: ISSUE_METHODS, bounceReasons: BOUNCE_REASONS, bounceActions: BOUNCE_ACTIONS, cashVarThreshold: CASH_VAR_THRESHOLD, partyTypes: PARTY_TYPES, receiptModes: RECEIPT_MODES, overrideValues: OVERRIDE_VALUES, adjThreshold: ADJ_THRESHOLD, overrideMaxDays: OVERRIDE_MAX_DAYS, overrideDefaultDays: OVERRIDE_DEFAULT_DAYS, aiEnabled: !!process.env.ANTHROPIC_API_KEY };
+  const out = { user: rowUser(req.user), hospitals: {}, vendors: {}, payments: {}, dailyData: {}, hvTracked: {}, reportPrefs: {}, notifications: [], items: {}, adjustments: {}, offers: {}, offerActions: {}, receivables: {}, recvActions: {}, snapshots: {}, periodData: {}, offerStates: OFFER_STATES, offerActionTypes: OFFER_ACTIONS, adjReasons: ADJ_REASONS, issueMethods: ISSUE_METHODS, bounceReasons: BOUNCE_REASONS, bounceActions: BOUNCE_ACTIONS, cashVarThreshold: CASH_VAR_THRESHOLD, partyTypes: PARTY_TYPES, receiptModes: RECEIPT_MODES, overrideValues: OVERRIDE_VALUES, adjThreshold: ADJ_THRESHOLD, overrideMaxDays: OVERRIDE_MAX_DAYS, overrideDefaultDays: OVERRIDE_DEFAULT_DAYS, aiEnabled: !!process.env.ANTHROPIC_API_KEY, waEnabled: waEnabled() };
   for (const h of hs) {
     out.hospitals[h.id] = rowHosp(h);
     out.vendors[h.id] = db.prepare('SELECT * FROM vendors WHERE hospital_id=? ORDER BY name').all(h.id).map(rowVendor);
@@ -736,10 +755,11 @@ app.post('/api/hospitals', auth, requireRole('admin'), (req, res) => {
   if (!name) return res.status(400).json({ error: 'Hospital name is required' });
   const h = {
     id: uid('h'), name, doctor: S(b.doctor, 150), location: S(b.location, 200), phone: S(b.phone, 40),
+    doctor_phone: S(b.doctorPhone, 40),
     start_date: /^\d{4}-\d{2}-\d{2}$/.test(S(b.startDate)) ? b.startDate : todayISO(), active: 1, base: 50000
   };
-  db.prepare('INSERT INTO hospitals(id,name,doctor,location,phone,start_date,active,base) VALUES(?,?,?,?,?,?,1,?)')
-    .run(h.id, h.name, h.doctor, h.location, h.phone, h.start_date, h.base);
+  db.prepare('INSERT INTO hospitals(id,name,doctor,location,phone,doctor_phone,start_date,active,base) VALUES(?,?,?,?,?,?,?,1,?)')
+    .run(h.id, h.name, h.doctor, h.location, h.phone, h.doctor_phone, h.start_date, h.base);
   res.json({ hospital: rowHosp(h) });
 });
 
@@ -752,12 +772,13 @@ app.patch('/api/hospitals/:id', auth, requireRole('admin'), (req, res) => {
     doctor: b.doctor !== undefined ? S(b.doctor, 150) : h.doctor,
     location: b.location !== undefined ? S(b.location, 200) : h.location,
     phone: b.phone !== undefined ? S(b.phone, 40) : h.phone,
+    doctor_phone: b.doctorPhone !== undefined ? S(b.doctorPhone, 40) : (h.doctor_phone || ''),
     start_date: (b.startDate !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(S(b.startDate))) ? b.startDate : h.start_date,
     issue_method: (b.issueMethod !== undefined && ISSUE_METHODS.includes(b.issueMethod)) ? b.issueMethod : (h.issue_method || 'fefo'),
     active: b.active !== undefined ? (b.active ? 1 : 0) : h.active
   };
-  db.prepare('UPDATE hospitals SET name=?,doctor=?,location=?,phone=?,start_date=?,issue_method=?,active=? WHERE id=?')
-    .run(upd.name, upd.doctor, upd.location, upd.phone, upd.start_date, upd.issue_method, upd.active, h.id);
+  db.prepare('UPDATE hospitals SET name=?,doctor=?,location=?,phone=?,doctor_phone=?,start_date=?,issue_method=?,active=? WHERE id=?')
+    .run(upd.name, upd.doctor, upd.location, upd.phone, upd.doctor_phone, upd.start_date, upd.issue_method, upd.active, h.id);
   res.json({ hospital: rowHosp({ id: h.id, base: h.base, ...upd }) });
 });
 
@@ -940,6 +961,11 @@ function rowOffer(o, today) {
     validTill: o.valid_till || null, nextFollowUp: o.next_follow_up || null,
     status: o.status, expired, effectiveStatus: expired ? 'expired' : o.status,
     notes: o.notes || '', appliedAt: o.applied_at || null,
+    kind: o.kind || 'offer',
+    approvalSentAt: o.approval_sent_at || null,
+    approvedBy: o.approved_by || '', approvedAt: o.approved_at || null,
+    // accepted + sent to the doctor + not yet decided = the ball is in their court
+    awaitingDoctor: o.status === 'accepted' && !!o.approval_sent_at && !o.approved_at,
     createdBy: o.created_by, createdAt: o.created_at
   };
 }
@@ -984,14 +1010,15 @@ app.post('/api/offers', auth, requireRole('admin'), (req, res) => {
     qty_commit: N(b.qtyCommit), valid_till: validTill,
     next_follow_up: /^\d{4}-\d{2}-\d{2}$/.test(S(b.nextFollowUp)) ? b.nextFollowUp : null,
     status: 'proposed', notes: S(b.notes, 400), applied_at: null,
+    kind: b.kind === 'manual' ? 'manual' : 'offer',
     created_by: req.user.name, created_at: Date.now()
   };
   db.prepare(`INSERT INTO margin_offers(id,hospital_id,item_id,item_name,molecule,pack,vendor,offered_by,offered_by_phone,
-    negotiated_by,offer_date,old_nr,old_mrp,new_nr,new_mrp,qty_commit,valid_till,next_follow_up,status,notes,applied_at,created_by,created_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    negotiated_by,offer_date,old_nr,old_mrp,new_nr,new_mrp,qty_commit,valid_till,next_follow_up,status,notes,applied_at,kind,created_by,created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(o.id, o.hospital_id, o.item_id, o.item_name, o.molecule, o.pack, o.vendor, o.offered_by, o.offered_by_phone,
       o.negotiated_by, o.offer_date, o.old_nr, o.old_mrp, o.new_nr, o.new_mrp, o.qty_commit, o.valid_till,
-      o.next_follow_up, o.status, o.notes, o.applied_at, o.created_by, o.created_at);
+      o.next_follow_up, o.status, o.notes, o.applied_at, o.kind, o.created_by, o.created_at);
   res.json({ offer: rowOffer(o, todayISO()), actions: [] });
 });
 
@@ -1049,28 +1076,33 @@ app.post('/api/offers/:id/actions', auth, requireRole('admin'), (req, res, next)
 
 /* Applying is the ONLY thing that moves the Item Master, and it writes the
    ordinary price_log entry too — so the item's own history still tells the whole
-   story without anyone needing to know the offer tracker exists. */
-app.post('/api/offers/:id/apply', auth, requireRole('admin'), (req, res) => {
-  const o = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(req.params.id);
-  if (!o) return res.status(404).json({ error: 'Offer not found' });
-  scopeCheck(req, o.hospital_id);
-  if (o.status === 'applied') return res.status(400).json({ error: 'Already applied' });
-  if (o.status === 'declined') return res.status(400).json({ error: 'This offer was declined — reopen it first' });
-  const today = todayISO();
-  if (o.valid_till && o.valid_till < today) return res.status(400).json({ error: `The offer expired on ${o.valid_till} — reopen it with a new validity if the vendor still honours it` });
+   story without anyone needing to know the offer tracker exists.
 
+   Since Jul 22 the doctor stands between accept and apply: it is their money the
+   price moves, so a change lands only after they have said yes — from WhatsApp,
+   on a signed single-use link, no console login needed. */
+function applyOfferErr(o, today) {
+  if (o.status === 'applied') return 'Already applied';
+  if (o.status === 'declined') return 'This offer was declined — reopen it first';
+  if (o.valid_till && o.valid_till < today) return `The offer expired on ${o.valid_till} — reopen it with a new validity if the vendor still honours it`;
+  return null;
+}
+function applyOffer(o, byName, approvedBy) {
+  const today = todayISO();
   let it = o.item_id ? db.prepare('SELECT * FROM items WHERE id=?').get(o.item_id) : null;
   if (!it) it = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?').get(o.hospital_id, nameKey(o.item_name));
   const now = Date.now();
   const newNr = N(o.new_nr), newMrp = N(o.new_mrp) || (it ? N(it.mrp) : 0);
-  if (newMrp <= 0) return res.status(400).json({ error: 'No MRP to price against — set one on the Item Master first' });
-  if (newNr > newMrp) return res.status(400).json({ error: 'The offered rate is above the MRP' });
-
+  if (newMrp <= 0) return { error: 'No MRP to price against — set one on the Item Master first' };
+  if (newNr > newMrp) return { error: 'The offered rate is above the MRP' };
+  const src = (o.kind === 'manual') ? 'manual' : 'offer';
+  const note = o.kind === 'manual'
+    ? `${o.notes || 'Price revision'} — by ${o.negotiated_by}`
+    : `Offer from ${o.vendor || 'vendor'}${o.offered_by ? ' (' + o.offered_by + ')' : ''}, negotiated by ${o.negotiated_by}`;
   const tx = db.transaction(() => {
     if (it) {
-      db.prepare('INSERT INTO price_log(id,item_id,hospital_id,old_nr,old_mrp,new_nr,new_mrp,note,user_name,ts) VALUES(?,?,?,?,?,?,?,?,?,?)')
-        .run(uid('pl'), it.id, it.hospital_id, it.nr, it.mrp, newNr, newMrp,
-          `Offer from ${o.vendor || 'vendor'}${o.offered_by ? ' (' + o.offered_by + ')' : ''}, negotiated by ${o.negotiated_by}`, req.user.name, now);
+      db.prepare('INSERT INTO price_log(id,item_id,hospital_id,old_nr,old_mrp,new_nr,new_mrp,note,user_name,ts,source,offer_id,approved_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(uid('pl'), it.id, it.hospital_id, it.nr, it.mrp, newNr, newMrp, note, byName, now, src, o.id, approvedBy || '');
       db.prepare('UPDATE items SET nr=?, mrp=?, updated_at=? WHERE id=?').run(newNr, newMrp, now, it.id);
     } else {
       // the offer names an item the master has never seen — create it, or the
@@ -1083,11 +1115,184 @@ app.post('/api/offers/:id/apply', auth, requireRole('admin'), (req, res) => {
       db.prepare('UPDATE margin_offers SET item_id=? WHERE id=?').run(nit.id, o.id);
     }
     db.prepare("UPDATE margin_offers SET status='applied', applied_at=? WHERE id=?").run(now, o.id);
-    pushOfferAction(o, 'applied', `Item Master moved to ${newNr} / ${newMrp}`, today, req.user.name);
+    pushOfferAction(o, 'applied', `Item Master moved to ${newNr} / ${newMrp}${approvedBy ? ` — approved by ${approvedBy}` : ''}`, today, byName);
   });
   tx();
+  return { item: db.prepare('SELECT * FROM items WHERE id=?').get(it.id) };
+}
+
+app.post('/api/offers/:id/apply', auth, requireRole('admin'), (req, res) => {
+  const o = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Offer not found' });
+  scopeCheck(req, o.hospital_id);
+  const today = todayISO();
+  const bad = applyOfferErr(o, today);
+  if (bad) return res.status(400).json({ error: bad });
+  /* The gate. A price change is the doctor's decision — the console records it,
+     it does not make it. */
+  if (!o.approved_at) return res.status(400).json({ error: "Needs the doctor's approval first — send it from the offer and the change lands when they tap Approve" });
+  const r = applyOffer(o, req.user.name, o.approved_by);
+  if (r.error) return res.status(400).json({ error: r.error });
   const fresh = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(o.id);
-  res.json({ offer: rowOffer(fresh, today), actions: offerActions(o.id).map(rowOfferAction), item: rowItem(db.prepare('SELECT * FROM items WHERE id=?').get(fresh.item_id)) });
+  res.json({ offer: rowOffer(fresh, today), actions: offerActions(o.id).map(rowOfferAction), item: rowItem(r.item) });
+});
+
+const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/* ---------- WhatsApp (ThinkAI BSP) ----------
+   Session sends via the ThinkAI console API — the same shape the mithra backend
+   uses. A send failure is returned, never thrown: the caller always gets a
+   wa.me fallback link, so a closed 24h window cannot block an approval. */
+const WA_BASE = process.env.TAI_API_BASE || 'https://console.thinkaisolutions.com/api/v1';
+const waEnabled = () => !!process.env.TAI_API_KEY;
+async function sendWA(phone, text) {
+  if (!waEnabled()) return { ok: false, error: 'WhatsApp sending is not configured (TAI_API_KEY)' };
+  const digits = String(phone).replace(/\D/g, '');
+  if (digits.length < 10) return { ok: false, error: 'Not a usable phone number' };
+  try {
+    const r = await fetch(`${WA_BASE}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.TAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: `+${digits}`, type: 'session', text }),
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) return { ok: true };
+    // the classic: outside the 24h service window — the wa.me fallback covers it
+    return { ok: false, status: r.status, error: (data && (data.error?.message || data.error || data.message)) || `send failed (${r.status})` };
+  } catch (e) { return { ok: false, error: e.message || 'network error' }; }
+}
+
+/* ---------- doctor approval over WhatsApp ----------
+   The doctor is not a console user and should not need to become one to say yes
+   to a rate. They get a WhatsApp message with a signed single-use link; the page
+   shows exactly what changes and two buttons. Approve applies it on the spot. */
+const APPROVAL_DAYS = 7;
+const hashToken = (t) => crypto.createHash('sha256').update(t).digest('hex');
+
+function approvalText(o, h, url) {
+  const oldM = offerMargin(o.old_nr, o.old_mrp).toFixed(1), newM = offerMargin(o.new_nr, o.new_mrp).toFixed(1);
+  return `*Price approval — ${h.name}*\n\n` +
+    `${o.item_name}${o.pack ? ' (' + o.pack + ')' : ''}\n` +
+    `Purchase rate: ₹${N(o.old_nr) || '—'} → *₹${N(o.new_nr)}* per strip\n` +
+    `Margin: ${oldM}% → ${newM}%\n` +
+    (o.vendor ? `Vendor: ${o.vendor}${o.offered_by ? ' (' + o.offered_by + ')' : ''}\n` : '') +
+    `Negotiated by: ${o.negotiated_by}\n\n` +
+    `Approve or decline here (link works once, for ${APPROVAL_DAYS} days):\n${url}\n\n— Yajna Pharma Solutions`;
+}
+
+app.post('/api/offers/:id/request-approval', auth, requireRole('admin'), async (req, res) => {
+  const o = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Offer not found' });
+  const h = scopeCheck(req, o.hospital_id);
+  const today = todayISO();
+  const bad = applyOfferErr(o, today);
+  if (bad) return res.status(400).json({ error: bad });
+  if (o.status !== 'accepted') return res.status(400).json({ error: 'Accept the offer first — the doctor should only ever see a rate you are ready to take' });
+  if (o.approved_at) return res.status(400).json({ error: `Already approved by ${o.approved_by} — apply it` });
+
+  // re-sending replaces the token: only the LATEST link works, so a message
+  // forwarded around later cannot approve anything
+  const token = crypto.randomBytes(24).toString('base64url');
+  const now = Date.now();
+  db.prepare('UPDATE margin_offers SET approval_hash=?, approval_sent_at=?, approval_expires=? WHERE id=?')
+    .run(hashToken(token), now, now + APPROVAL_DAYS * 86400000, o.id);
+  pushOfferAction(o, 'note', `Sent to ${h.doctor || 'the doctor'} for approval`, today, req.user.name);
+
+  const base = process.env.APP_BASE_URL || 'https://yajna.thinkaisolotions.com';
+  const url = `${base}/approve/${token}`;
+  const text = approvalText(o, h, url);
+  const phone = (h.doctor_phone || h.phone || '').replace(/\D/g, '');
+  const sent = phone ? await sendWA(phone, text) : { ok: false, error: 'No WhatsApp number for the doctor — add it under Edit hospital' };
+
+  const fresh = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(o.id);
+  res.json({
+    offer: rowOffer(fresh, today), actions: offerActions(o.id).map(rowOfferAction),
+    url, text, sent,
+    waLink: phone ? `https://wa.me/${phone}?text=${encodeURIComponent(text)}` : null
+  });
+});
+
+const approvalPage = (title, body, buttons) => `<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>${title} — Yajna Pharma</title>
+<style>
+  body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;background:#F4F6F5;margin:0;padding:18px;color:#17211D}
+  .card{max-width:430px;margin:24px auto;background:#fff;border-radius:14px;padding:22px;box-shadow:0 2px 14px rgba(0,0,0,.07)}
+  h2{margin:0 0 4px;font-size:19px} .sub{color:#6B7A73;font-size:13px;margin-bottom:16px}
+  table{width:100%;border-collapse:collapse;font-size:14.5px}
+  td{padding:7px 0;border-bottom:1px solid #EDF0EE} td:first-child{color:#6B7A73}
+  td:last-child{text-align:right;font-weight:600}
+  .big{font-size:17px} .green{color:#0F6E56}
+  .btns{display:flex;gap:10px;margin-top:20px}
+  button,.done{flex:1;padding:13px 0;border-radius:10px;border:none;font-size:15.5px;font-weight:700;cursor:pointer}
+  .ok{background:#0F6E56;color:#fff} .no{background:#fff;color:#B3402E;border:1.5px solid #E5C0B8}
+  textarea{width:100%;box-sizing:border-box;margin-top:14px;border:1px solid #D8DEDA;border-radius:9px;padding:10px;font:inherit;font-size:14px}
+  .done{text-align:center;background:#EAF3EF;color:#0F6E56;cursor:default}
+  .foot{text-align:center;color:#9AA6A0;font-size:12px;margin-top:18px}
+</style></head><body><div class="card"><h2>${title}</h2>${body}${buttons || ''}</div>
+<div class="foot">Yajna Pharma Solutions · Bhimavaram</div></body></html>`;
+
+function findApprovalOffer(token) {
+  if (!/^[A-Za-z0-9_-]{20,50}$/.test(token || '')) return null;
+  return db.prepare('SELECT * FROM margin_offers WHERE approval_hash=?').get(hashToken(token)) || null;
+}
+
+/* Both routes are PUBLIC: the token IS the credential. It is unguessable
+   (192 random bits, stored hashed), single-purpose, and expires. */
+app.get('/approve/:token', (req, res) => {
+  const o = findApprovalOffer(req.params.token);
+  res.type('html');
+  if (!o) return res.status(404).send(approvalPage('Link not valid', `<div class="sub">This approval link is not recognised — it may have been replaced by a newer one. Ask Yajna to resend it.</div>`));
+  const h = db.prepare('SELECT * FROM hospitals WHERE id=?').get(o.hospital_id) || { name: '', doctor: '' };
+  const rows = `<table>
+    <tr><td>Item</td><td>${esc(o.item_name)}${o.pack ? ' · ' + esc(o.pack) : ''}</td></tr>
+    <tr><td>Purchase rate / strip</td><td class="big">₹${N(o.old_nr) || '—'} → <span class="green">₹${N(o.new_nr)}</span></td></tr>
+    <tr><td>Margin</td><td>${offerMargin(o.old_nr, o.old_mrp).toFixed(1)}% → <span class="green">${offerMargin(o.new_nr, o.new_mrp).toFixed(1)}%</span></td></tr>
+    ${o.vendor ? `<tr><td>Vendor</td><td>${esc(o.vendor)}</td></tr>` : ''}
+    <tr><td>Negotiated by</td><td>${esc(o.negotiated_by)}</td></tr>
+  </table>`;
+  if (o.status === 'applied') return res.send(approvalPage(esc(h.name), `<div class="sub">This change was already approved${o.approved_by ? ' by ' + esc(o.approved_by) : ''} and is on the Item Master.</div>${rows}<div class="btns"><div class="done">✓ Approved &amp; applied</div></div>`));
+  if (o.status === 'declined') return res.send(approvalPage(esc(h.name), `<div class="sub">This change was declined.</div>${rows}<div class="btns"><div class="done" style="background:#F7ECEA;color:#B3402E">Declined</div></div>`));
+  if ((o.approval_expires || 0) < Date.now()) return res.send(approvalPage('Link expired', `<div class="sub">This link has expired. Ask Yajna to resend the approval.</div>${rows}`));
+  return res.send(approvalPage(esc(h.name),
+    `<div class="sub">${esc(h.doctor || 'Doctor')} — Yajna is asking your approval for this purchase-price change.</div>${rows}
+     <form method="POST" action="/approve/${esc(req.params.token)}">
+       <textarea name="note" rows="2" placeholder="Note (optional — required if declining)"></textarea>
+       <div class="btns">
+         <button class="no" name="decision" value="decline">Decline</button>
+         <button class="ok" name="decision" value="approve">Approve</button>
+       </div></form>`));
+});
+
+app.post('/approve/:token', express.urlencoded({ extended: false }), (req, res) => {
+  const o = findApprovalOffer(req.params.token);
+  res.type('html');
+  if (!o) return res.status(404).send(approvalPage('Link not valid', `<div class="sub">This approval link is not recognised.</div>`));
+  const h = db.prepare('SELECT * FROM hospitals WHERE id=?').get(o.hospital_id) || { name: '', doctor: 'Doctor' };
+  if (o.status === 'applied' || o.status === 'declined')
+    return res.send(approvalPage(esc(h.name), `<div class="sub">Already decided — nothing further to do.</div>`));
+  if ((o.approval_expires || 0) < Date.now())
+    return res.send(approvalPage('Link expired', `<div class="sub">This link has expired. Ask Yajna to resend the approval.</div>`));
+  const decision = String(req.body.decision || '');
+  const note = S(req.body.note, 300).trim();
+  const today = todayISO(), now = Date.now();
+  const who = h.doctor || 'Doctor';
+  if (decision === 'approve') {
+    db.prepare("UPDATE margin_offers SET approved_by=?, approved_at=?, approval_hash=NULL WHERE id=?").run(who, now, o.id);
+    pushOfferAction(o, 'note', `Approved by ${who} over WhatsApp${note ? ' — ' + note : ''}`, today, who);
+    const fresh = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(o.id);
+    const r = applyOffer(fresh, who, who);   // approval IS the go-ahead — it lands immediately
+    if (r.error) return res.send(approvalPage(esc(h.name), `<div class="sub">Approved, but it could not be applied: ${esc(r.error)}. Yajna has the approval on record and will resolve it.</div>`));
+    return res.send(approvalPage(esc(h.name), `<div class="sub">Done. The Item Master now carries ₹${N(fresh.new_nr)} per strip, recorded as approved by you.</div><div class="btns"><div class="done">✓ Approved &amp; applied</div></div>`));
+  }
+  if (decision === 'decline') {
+    if (!note) return res.send(approvalPage(esc(h.name), `<div class="sub">A declined price needs a word on why — go back and add a note.</div>`));
+    db.prepare("UPDATE margin_offers SET status='declined', approval_hash=NULL WHERE id=?").run(o.id);
+    pushOfferAction(o, 'declined', `Declined by ${who} over WhatsApp — ${note}`, today, who);
+    return res.send(approvalPage(esc(h.name), `<div class="sub">Declined and recorded. Yajna will see your note.</div><div class="btns"><div class="done" style="background:#F7ECEA;color:#B3402E">Declined</div></div>`));
+  }
+  return res.status(400).send(approvalPage('Nothing chosen', `<div class="sub">Use the Approve or Decline button.</div>`));
 });
 
 app.delete('/api/offers/:id', auth, requireRole('admin'), (req, res) => {
@@ -1098,6 +1303,43 @@ app.delete('/api/offers/:id', auth, requireRole('admin'), (req, res) => {
   db.prepare('DELETE FROM margin_offer_actions WHERE offer_id=?').run(o.id);
   db.prepare('DELETE FROM margin_offers WHERE id=?').run(o.id);
   res.json({ ok: true, id: o.id });
+});
+
+/* ---------- procurement price history ----------
+   Every price the master has ever carried, hospital-wide: what moved, when, who
+   negotiated it, and which doctor said yes. This IS the "offers that updated the
+   Item Master" view — price_log is the one ledger both paths write. */
+app.get('/api/price-history', auth, requireRole('admin'), (req, res) => {
+  const hid = S(req.query.hid, 60);
+  scopeCheck(req, hid);
+  const rows = db.prepare(`
+    SELECT pl.*, i.name AS item_name, i.pack AS item_pack, o.vendor AS offer_vendor, o.offered_by AS offer_by
+    FROM price_log pl
+    LEFT JOIN items i ON i.id = pl.item_id
+    LEFT JOIN margin_offers o ON o.id = pl.offer_id
+    WHERE pl.hospital_id = ? ORDER BY pl.ts DESC LIMIT 500`).all(hid);
+  res.json({ history: rows.map(r => ({
+    id: r.id, itemId: r.item_id, item: r.item_name || '(item removed)', pack: r.item_pack || '',
+    oldNr: N(r.old_nr), oldMrp: N(r.old_mrp), newNr: N(r.new_nr), newMrp: N(r.new_mrp),
+    oldMargin: offerMargin(r.old_nr, r.old_mrp), newMargin: offerMargin(r.new_nr, r.new_mrp),
+    source: r.source || 'manual', offerId: r.offer_id || null,
+    vendor: r.offer_vendor || '', offeredBy: r.offer_by || '',
+    approvedBy: r.approved_by || '', note: r.note || '', by: r.user_name || '', ts: r.ts
+  })) });
+});
+
+/* ---------- send a report to the doctor ----------
+   The client already builds the WhatsApp summary for every report — this just
+   carries it the last mile, to the doctor's own number, over the BSP. */
+app.post('/api/wa/report', auth, requireRole('admin'), async (req, res) => {
+  const b = req.body || {};
+  const h = scopeCheck(req, S(b.hid, 60));
+  const text = S(b.text, 3500).trim();
+  if (!text) return res.status(400).json({ error: 'Nothing to send — generate the report first' });
+  const phone = (h.doctor_phone || h.phone || '').replace(/\D/g, '');
+  if (!phone) return res.status(400).json({ error: "No WhatsApp number for the doctor — add it under Edit hospital" });
+  const sent = await sendWA(phone, text);
+  res.json({ sent, to: `+${phone}`, waLink: `https://wa.me/${phone}?text=${encodeURIComponent(text)}` });
 });
 
 /* ---------- the group item master ----------
@@ -1316,6 +1558,12 @@ app.patch('/api/items/:id', auth, requireRole('admin'), (req, res) => {
   const mrp = b.mrp !== undefined ? N(b.mrp) : it.mrp;
   if (nr <= 0 || mrp <= 0) return res.status(400).json({ error: 'NR and MRP must be positive' });
   if (nr > mrp) return res.status(400).json({ error: 'NR cannot exceed MRP' });
+  /* A price change on the master is the doctor's call, not an edit (Arjun,
+     Jul 22). Pack / molecule / opening stay direct edits — they describe the
+     item, they do not move its money. Imports are untouched: they capture what
+     already is, this guards what CHANGES. */
+  if (nr !== it.nr || mrp !== it.mrp)
+    return res.status(400).json({ error: "Price changes need the doctor's approval — record it as a price change on the Margin offers tab and it lands once they tap Approve", code: 'needs_approval' });
   const pack = b.pack !== undefined ? S(b.pack, 60) : it.pack;
   const molecule = b.molecule !== undefined ? S(b.molecule, 150).trim() : (it.molecule || '');
   const openingQty = b.openingQty !== undefined ? N(b.openingQty) : it.opening_qty;
