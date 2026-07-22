@@ -2267,8 +2267,8 @@ function invLineModal(e, i, j, locked){
         <p class="ivnote" id="lmMaster"></p></div>
       <div class="subhead" style="margin-top:6px"><h4>From the invoice</h4><div class="rule"></div></div>
       <div class="grid2">
-        <div class="field"><label>Purchase qty — what you are billed for</label><input class="in num" type="number" min="0" step="1" id="lmPqty" value="${esc(L.pqty)}"></div>
-        <div class="field"><label>Offer qty — free / scheme units</label><input class="in num" type="number" min="0" step="1" id="lmOqty" value="${esc(L.oqty)}"></div>
+        <div class="field"><label>Purchase qty — strips (part strips fine: 1.5)</label><input class="in num" type="number" min="0" step="any" id="lmPqty" value="${esc(L.pqty)}"></div>
+        <div class="field"><label>Offer qty — free / scheme strips</label><input class="in num" type="number" min="0" step="any" id="lmOqty" value="${esc(L.oqty)}"></div>
         <div class="field"><label>Rate ₹ — per unit, before discount and tax</label><input class="in num" type="number" min="0" step="0.01" id="lmRate" value="${esc(L.rate)}"></div>
         <div class="field"><label>Vendor discount %</label><input class="in num" type="number" min="0" max="100" step="0.01" id="lmDisc" value="${esc(L.disc)}"></div>
         <div class="field"><label>GST %</label><select class="in" id="lmGst">${GST_SLABS.map(g=>`<option value="${g}" ${num(L.gst)===g?'selected':''}>${g}%</option>`).join('')}</select></div>
@@ -2752,9 +2752,51 @@ async function downloadTemplate(kind, label){
   }catch(err){ toast('Could not download the template','red'); }
 }
 
+/* ---------- tablets → strips ----------
+   The ledger's unit is a STRIP, always. But the pharmacy software counts loose
+   tablets — 15 tablets of a 10s pack is 1.5 strips, not 15. The conversion
+   happens at the door, in the open, with the user saying which unit the file
+   counts: qty ÷ pack, and the per-unit rates × pack so every rupee stays put
+   (15 × ₹30/tablet ≡ 1.5 × ₹300/strip). */
+function packUnits(pack){
+  const m = String(pack||'').match(/\d+/);
+  const u = m? parseInt(m[0],10) : 0;
+  return u>=1? u : null;   // 'vial', 'btl' — no strip size to divide by
+}
+function tabletsToStrips(rows, hid, nameField){
+  const out = [], unknown = [];
+  rows.forEach(r=>{
+    const name = r[nameField];
+    const u = packUnits(r.pack) || packUnits((findItem(hid, name)||{}).pack);
+    if(!u){ unknown.push(name); out.push({...r}); return; }
+    out.push({...r, qty: num(r.qty)/u, nr: num(r.nr)*u, mrp: num(r.mrp)*u});
+  });
+  return {rows: out, unknown};
+}
+const UNITS_KEY = 'yps_file_units';
+function fileUnits(){ try{ return localStorage.getItem(UNITS_KEY)==='tablets'? 'tablets':'strips'; }catch(e){ return 'strips'; } }
+function setFileUnits(u){ try{ localStorage.setItem(UNITS_KEY, u); }catch(e){} }
+function unitsSeg(id, mode){
+  return `<div class="entry-bar" style="margin:10px 0 4px">
+    <span class="eyebrow">This file counts</span>
+    <div class="seg">
+      <button class="${mode==='strips'?'active':''}" data-${id}="strips">Strips</button>
+      <button class="${mode==='tablets'?'active':''}" data-${id}="tablets">Tablets (loose)</button>
+    </div>
+    <span class="eyebrow" style="font-weight:400">${mode==='tablets'? 'each qty ÷ pack size — 15 tablets of a 10s = 1.5 strips; rates scale with it, so no rupee moves':'quantities are taken as strips, as the template asks'}</span>
+  </div>`;
+}
+
 function gpUploadModal(e, locked){
   if(state.demo){ toast('Report reading works in live mode only','amber'); return; }
   let parsed = null;
+  let units = fileUnits();
+  // the rows AS THE LEDGER WILL SEE THEM — converted when the file counts tablets
+  const viewItems = ()=>{
+    const items = (parsed && parsed.items)||[];
+    if(units!=='tablets') return {rows:items, unknown:[]};
+    return tabletsToStrips(items, state.hospital, 'item');
+  };
   openModal(`
     <div class="modal-head"><h3>Upload the day's sales</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
@@ -2769,14 +2811,10 @@ function gpUploadModal(e, locked){
 
   $('#gpTpl').onclick = ()=> downloadTemplate('sales', 'Sales & margin');
 
-  $('#gpParse').onclick = async ()=>{
-    const f = $('#gpFile').files[0];
-    if(!f){ toast('Choose the report file first','red'); return; }
-    const btn=$('#gpParse'); btn.disabled=true; btn.textContent='Reading…';
-    try{
-      parsed = await apiUpload(`/parse/gpreport?hid=${encodeURIComponent(state.hospital)}`, f);
+  const renderPrev = ()=>{
       const m = parsed.marginPct ?? (parsed.salesMrp? (parsed.salesMrp-parsed.cogs)/parsed.salesMrp*100 : 0);
-      const items = parsed.items||[];
+      const cv = viewItems();
+      const items = cv.rows;
       const priced = items.filter(r=> num(r.mrp)>0);
       // rows whose margin disagrees with the Item Master are the whole point of reading per item
       const off = priced.map(r=>({...r, st: lineStatus(state.hospital, {item:r.item, pqty:1, oqty:0, rate:num(r.nr), disc:0, gst:0, mrp:num(r.mrp)})}))
@@ -2797,9 +2835,20 @@ function gpUploadModal(e, locked){
           }).join('')}</tbody></table>
           <p class="mini-note">${priced.length>8? `First 8 of ${priced.length} priced rows. `:''}Margin % is <b>(MRP − net rate) ÷ MRP</b> — a ratio, so the strip size never enters it. It only needs both rates on the same basis, and they are: both per strip.</p>`
           : (items.length? '<p class="mini-note">These rows carry no cost price, so only the day\'s totals can be filled — not the per-item margin.</p>':'')}
-        ${off.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${off.length} item${off.length===1?'':'s'} priced away from the Item Master: ${off.slice(0,4).map(r=>esc(r.item)).join(', ')}${off.length>4?` and ${off.length-4} more`:''}. Saving the day alerts the admin.</p>`:''}`;
+        ${off.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${off.length} item${off.length===1?'':'s'} priced away from the Item Master: ${off.slice(0,4).map(r=>esc(r.item)).join(', ')}${off.length>4?` and ${off.length-4} more`:''}. Saving the day alerts the admin.</p>`:''}
+        ${items.length? unitsSeg('gpu', units) : ''}
+        ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by (${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}) — their counts are kept as-is. Add the pack on the Item Master and re-read.</p>`:''}`;
+      $$('[data-gpu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.gpu; setFileUnits(units); renderPrev(); });
       $('#gpApply').disabled = !(parsed.salesMrp>0);
       if(!(parsed.salesMrp>0)) $('#gpPrev').insertAdjacentHTML('beforeend','<p style="color:var(--red);font-size:13px">No sales value could be worked out from this file.</p>');
+  };
+  $('#gpParse').onclick = async ()=>{
+    const f = $('#gpFile').files[0];
+    if(!f){ toast('Choose the report file first','red'); return; }
+    const btn=$('#gpParse'); btn.disabled=true; btn.textContent='Reading…';
+    try{
+      parsed = await apiUpload(`/parse/gpreport?hid=${encodeURIComponent(state.hospital)}`, f);
+      renderPrev();
     }catch(err){ $('#gpPrev').innerHTML = `<p style="color:var(--red);font-size:13px">${esc(err.message)}</p>`; }
     btn.disabled=false; btn.textContent='Read report';
   };
@@ -2809,7 +2858,8 @@ function gpUploadModal(e, locked){
     if(parsed.cogs>0) e.sales.cogs = parsed.cogs;
     if(parsed.cash>0) e.sales.cash = parsed.cash;
     if(parsed.credit>0) e.sales.credit = parsed.credit;
-    if(parsed.items && parsed.items.length) e.itemSales = parsed.items.map(r=>({
+    // what lands on the entry is the STRIP view — the conversion, if any, is done
+    if(parsed.items && parsed.items.length) e.itemSales = viewItems().rows.map(r=>({
       item:r.item, qty:num(r.qty), amount:num(r.amount),
       pack:r.pack||'', nr:num(r.nr), mrp:num(r.mrp), cost:num(r.cost)
     }));
@@ -5575,6 +5625,8 @@ function ledgerModal(hid, key){
 function openingStockModal(hid){
   const h = db.hospitals[hid]||{};
   let parsed = null;
+  let rawRows = null, lastNote = '';
+  let units = fileUnits();
   openModal(`
     <div class="modal-head"><h3>Opening stock — ${esc(h.name||'')}</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
@@ -5592,7 +5644,10 @@ function openingStockModal(hid){
 
   const ot=$('#osTpl'); if(ot) ot.onclick = ()=> downloadTemplate('opening', 'Opening stock');
 
-  const preview = (rows, note)=>{
+  const preview = (rows0, note)=>{
+    rawRows = rows0; lastNote = note||'';
+    const cv = units==='tablets'? tabletsToStrips(rows0, hid, 'name') : {rows:rows0, unknown:[]};
+    const rows = cv.rows;
     parsed = rows;
     const known = rows.filter(r=> findItem(hid, r.name)).length;
     const valNr = rows.reduce((a,r)=> a + num(r.qty)*(num(r.nr) || num((findItem(hid,r.name)||{}).nr)), 0);
@@ -5606,8 +5661,11 @@ function openingStockModal(hid){
         <thead><tr><th>Product</th><th>Pack</th><th class="r">Strips</th><th class="r">Net rate/strip</th><th class="r">MRP/strip</th><th></th></tr></thead>
         <tbody>${rows.slice(0,200).map(r=>`<tr><td>${esc(r.name)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${fmtN(r.qty)}</td><td class="r num">${r.nr||'—'}</td><td class="r num">${r.mrp||'—'}</td>
           <td>${findItem(hid,r.name)? '<span class="chip chip-blue">On master</span>':'<span class="chip chip-green">New item</span>'}</td></tr>`).join('')}</tbody></table></div>
-      <p class="mini-note">${rows.length} item${rows.length===1?'':'s'} · ${known} already on the master (opening qty updated) · ${rows.length-known} will be added.${note? ' '+esc(note):''}</p>` :
+      <p class="mini-note">${rows.length} item${rows.length===1?'':'s'} · ${known} already on the master (opening qty updated) · ${rows.length-known} will be added.${note? ' '+esc(note):''}</p>
+      ${unitsSeg('osu', units)}
+      ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}` :
       '<p class="mini-note">No valid rows found.</p>';
+    $$('[data-osu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.osu; setFileUnits(units); preview(rawRows, lastNote); });
     $('#osGo').disabled = rows.length===0;
   };
   const parseText = txt => preview(txt.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).map(line=>{
