@@ -1223,6 +1223,27 @@ app.post('/wa/webhook', (req, res) => {
   } catch (err) { console.error('[wa] webhook handling error:', err.message); }
 });
 
+/* Template sends deliver REGARDLESS of the 24h window — the fix for a doctor
+   who has not messaged the business number that day. The template name and
+   language live in env so a rename never touches code. Variables are Meta
+   template params: single-line strings, filled positionally. */
+async function sendWATemplate(phone, templateName, languageCode, variables) {
+  if (!waEnabled()) return { ok: false, error: 'WhatsApp sending is not configured (TAI_API_KEY)' };
+  const digits = String(phone).replace(/\D/g, '');
+  if (digits.length < 10) return { ok: false, error: 'Not a usable phone number' };
+  try {
+    const r = await fetch(`${WA_BASE}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.TAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: `+${digits}`, type: 'template', templateName, languageCode, variables }),
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) return { ok: true, via: 'template' };
+    return { ok: false, status: r.status, error: (data && (data.error?.message || data.error || data.message)) || `template send failed (${r.status})` };
+  } catch (e) { return { ok: false, error: e.message || 'network error' }; }
+}
+
 /* ---------- doctor approval over WhatsApp ----------
    The doctor is not a console user and should not need to become one to say yes
    to a rate. They get a WhatsApp message with a signed single-use link; the page
@@ -1263,7 +1284,21 @@ app.post('/api/offers/:id/request-approval', auth, requireRole('admin'), async (
   const url = `${base}/approve/${token}`;
   const text = approvalText(o, h, url);
   const phone = (h.doctor_phone || h.phone || '').replace(/\D/g, '');
-  const sent = phone ? await sendWA(phone, text) : { ok: false, error: 'No WhatsApp number for the doctor — add it under Edit hospital' };
+  /* template first (no window needed), session second (window open), and the
+     caller always gets the wa.me fallback regardless */
+  let sent = { ok: false, error: 'No WhatsApp number for the doctor — add it under Edit hospital' };
+  if (phone) {
+    const tpl = process.env.TAI_APPROVAL_TEMPLATE;
+    if (tpl) sent = await sendWATemplate(phone, tpl, process.env.TAI_TEMPLATE_LANG || 'en_US',
+      [h.doctor || 'Doctor', h.name,
+       `${o.item_name}${o.pack ? ' (' + o.pack + ')' : ''} — ₹${N(o.old_nr) || 0} to ₹${N(o.new_nr)} per strip`,
+       token]);
+    if (!sent.ok) {
+      const s2 = await sendWA(phone, text);
+      if (s2.ok || !process.env.TAI_APPROVAL_TEMPLATE) sent = s2;
+      else sent = { ok: false, error: `template: ${sent.error}; session: ${s2.error}` };
+    }
+  }
 
   const fresh = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(o.id);
   res.json({
