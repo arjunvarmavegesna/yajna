@@ -2196,6 +2196,11 @@ const COL = {
   open: { hdr: 'Opening stock (strips)',                match: [/^opening/i, /^stock/i, /^balance/i, /^qty/i, /^quantity/i, /closing/i] },
   nr:   { hdr: 'Net rate — single strip (incl. GST)',   match: [/net *rate/i, /^cost/i, /purchase *rate/i, /^p\.?rate/i, /^ptr/i, /^rate$/i] },
   mol:  { hdr: 'Molecule / salt', match: [/^molecule/i, /^salt/i, /^generic/i, /composition/i, /^content/i] },
+  pqty: { hdr: 'Purchase Qty (strips)', match: [/purchase *qty/i, /^qty/i, /billed/i] },
+  oqty: { hdr: 'Offer Qty (free / scheme)', match: [/offer/i, /free/i, /scheme/i] },
+  rate: { hdr: 'Rate ₹ (per strip, pre-disc/tax)', match: [/^rate/i, /^p\.? *rate/i, /^price/i] },
+  disc: { hdr: 'Vendor Disc %', match: [/disc/i] },
+  gst:  { hdr: 'GST %', match: [/^gst/i, /^tax/i] },
   mrp:  { hdr: 'MRP — single strip',                    match: [/^mrp/i, /^m\.r\.p/i, /retail/i, /^sale *rate/i] }
 };
 const TEMPLATES = {
@@ -2224,6 +2229,26 @@ const TEMPLATES = {
       ['Items already on the master', 'Their opening count is updated; the prices are only overwritten if you supply them.']
     ]
   },
+  purchase: {
+    file: 'yajna-purchase-upload-template.xlsx', sheet: 'Purchase',
+    /* LINE INPUTS ONLY — no vendor column (the vendor is chosen at upload and
+       the whole file lands under them), no calculated columns, no totals. The
+       app derives total qty, net rate, margin from these seven via calcLine. */
+    cols: ['name', 'pqty', 'oqty', 'rate', 'disc', 'gst', 'mrp'],
+    hdrs: { name: 'Item', mrp: 'MRP ₹ (per strip)' },
+    need: ['name', 'pqty'],
+    eg: [['Tab. Rifaximin 550', 10, 1, 85, 10, 12, 120]],
+    notes: [
+      ['Purchase Qty (strips)', 'STRIPS billed by the vendor. Part strips are fine: 2.5 is two and a half. Must be 0 or more.'],
+      ['Offer Qty (free / scheme)', 'Free / scheme strips — they enter stock and dilute the net rate, but you are not billed for them. 0 if none.'],
+      ['Rate ₹', 'Per strip, BEFORE discount and BEFORE GST — exactly as printed on the bill. Must be 0 or more.'],
+      ['Vendor Disc %', 'A percentage between 0 and 100, never rupees.'],
+      ['GST %', 'One of 0, 5, 12 or 18.'],
+      ['MRP ₹', 'Printed MRP of one strip. Must be 0 or more.'],
+      ['What the app computes', 'Total Qty = purchase + offer · Net Rate = billed amount ÷ total qty · Margin % = (MRP − net rate) ÷ MRP — the same calcLine math as manual entry, so nothing can disagree.'],
+      ['One vendor per file', 'There is no vendor column on purpose. You name the vendor when uploading and every line lands under them.']
+    ]
+  },
   items: {
     file: 'yajna-item-master-template.xlsx', sheet: 'Item master',
     cols: ['name', 'mol', 'pack', 'nr', 'mrp'],
@@ -2241,9 +2266,28 @@ const TEMPLATES = {
 
 function buildTemplate(kind) {
   const T = TEMPLATES[kind];
-  const hdr = T.cols.map(c => COL[c].hdr);
-  const ws = XLSX.utils.aoa_to_sheet([hdr, ...T.eg]);
-  ws['!cols'] = T.cols.map(c => ({ wch: c === 'name' ? 34 : c === 'nr' ? 32 : 20 }));
+  const hdr = T.cols.map(c => (T.hdrs && T.hdrs[c]) || COL[c].hdr);
+  let ws;
+  if (kind === 'purchase') {
+    /* branding band + legend above the header. readTemplate scans the first 15
+       rows for the header, so the band costs nothing at read time. (This xlsx
+       build cannot write cell colours — the band and legend carry the branding
+       in text; the validations live in the legend and are ENFORCED at parse.) */
+    ws = XLSX.utils.aoa_to_sheet([
+      ['YAJNA PHARMA SOLUTIONS — Purchase Upload'],
+      ['One vendor per file (named at upload) · all quantities in STRIPS · qty/rate/MRP ≥ 0 · disc 0–100% · GST one of 0/5/12/18 · the app computes total qty, net rate and margin'],
+      [],
+      hdr, ...T.eg
+    ]);
+    ws['!merges'] = [
+      { s: { r: 0, c: 0 }, e: { r: 0, c: hdr.length - 1 } },
+      { s: { r: 1, c: 0 }, e: { r: 1, c: hdr.length - 1 } }
+    ];
+    ws['!cols'] = T.cols.map(c => ({ wch: c === 'name' ? 34 : c === 'rate' ? 30 : c === 'pqty' || c === 'oqty' ? 22 : 16 }));
+  } else {
+    ws = XLSX.utils.aoa_to_sheet([hdr, ...T.eg]);
+    ws['!cols'] = T.cols.map(c => ({ wch: c === 'name' ? 34 : c === 'nr' ? 32 : 20 }));
+  }
   const notes = XLSX.utils.aoa_to_sheet([
     ['How to fill this sheet'], [],
     ['Product name', 'Exactly as it appears on the bill — it is matched to the Item Master by name.'],
@@ -2298,6 +2342,17 @@ function readTemplate(buf, kind) {
         const row = grid[r] || [];
         const name = S(row[col.name], 150).trim();
         if (!name || /^(total|grand total|sub ?total)/i.test(name)) continue;
+        if (kind === 'purchase') {
+          /* raw INPUTS only — cleanEntry + calcLine derive everything on save,
+             so the sheet can never smuggle in a wrong net rate */
+          const l = { item: name, pqty: N(row[col.pqty]), oqty: N(row[col.oqty ?? -1]),
+            rate: N(row[col.rate ?? -1]), disc: N(row[col.disc ?? -1]), gst: N(row[col.gst ?? -1]), mrp: N(row[col.mrp ?? -1]) };
+          if (l.pqty < 0 || l.rate < 0 || l.mrp < 0) continue;              // legend rule: ≥ 0
+          l.disc = Math.min(100, Math.max(0, l.disc));                       // legend rule: 0–100
+          if (l.pqty + l.oqty <= 0) continue;                                // nothing moved
+          out.push(l);
+          continue;
+        }
         const qty = qtyCol === undefined ? 0 : N(row[qtyCol]);
         const rec = { name, molecule: S(row[col.mol ?? -1], 150).trim(), pack: S(row[col.pack ?? -1], 30).trim(), qty, nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) };
         // sales needs something sold; opening allows a zero count; the master has no qty at all
@@ -2314,6 +2369,29 @@ const readSalesTemplate = (buf) => readTemplate(buf, 'sales');
 
 /* The item-master template. No AI fallback: the master is prices, and a price
    guessed out of a free-form sheet is worse than no price at all. */
+/* Bulk purchase upload: ONE vendor (from the popup, never the sheet) + the
+   filled template. The response is a PREVIEW — nothing touches the day until
+   the client appends the invoice and saves through the ordinary entry path,
+   where cleanEntry + calcLine recompute every derived figure. */
+app.post('/api/parse/purchase', auth, requireRole('admin'), upload.single('file'), (req, res) => {
+  const hid = S(req.query.hid, 60);
+  scopeCheck(req, hid);
+  const vendor = S((req.body && req.body.vendor) || req.query.vendor, 120).trim();
+  if (!vendor) return res.status(400).json({ error: 'Vendor name is required — the whole file lands under one vendor' });
+  if (!req.file) return res.status(400).json({ error: 'Attach the filled purchase template' });
+  const tpl = readTemplate(req.file.buffer, 'purchase');
+  if (!tpl) return res.status(400).json({ error: 'The columns could not be found. Download the Purchase upload template and keep its header row — Item, Purchase Qty (strips), Offer Qty, Rate ₹, Vendor Disc %, GST %, MRP ₹.' });
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(S(req.query.date)) ? req.query.date : todayISO();
+  const lines = tpl.rows.slice(0, 500);
+  const invoice = { id: uid('inv'), vendor, invoiceNo: '', date, fileName: req.file.originalname || '', lines };
+  // the preview shows what calcLine WILL derive — same math, so the numbers the
+  // user approves are the numbers the day will carry
+  const preview = lines.map(l => { const d = calcLine(l); return { ...l,
+    tqty: d.tqty, nr: +d.nr.toFixed(2), pamt: +d.pamt.toFixed(2), marginPct: +d.marginPct.toFixed(2) }; });
+  res.json({ source: 'template', sheet: tpl.sheet, invoice, preview,
+    note: `Read ${lines.length} line${lines.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}") — all for ${vendor}` });
+});
+
 app.post('/api/parse/items', auth, requireRole('admin'), upload.single('file'), (req, res) => {
   const hid = S(req.query.hid, 60);
   scopeCheck(req, hid);

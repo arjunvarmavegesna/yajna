@@ -485,8 +485,9 @@ async function api(path, opts={}){
 }
 
 /* file-upload variant (multipart) for invoice / report parsing */
-async function apiUpload(path, file){
+async function apiUpload(path, file, fields){
   const fd = new FormData();
+  Object.entries(fields||{}).forEach(([k,v])=> fd.append(k, v));   // fields first so multer has them before the stream
   fd.append('file', file);
   let res;
   try{ res = await fetch('/api'+path, {method:'POST', body:fd, credentials:'same-origin'}); }
@@ -2095,7 +2096,9 @@ function renderEntryTab(e, locked){
 function tabPurchase(e, locked){
   const c = calcEntry(e);
   return `
-  <div class="subhead"><h4>Purchase entry</h4><div class="rule"></div>${locked?'':`<button class="btn btn-sm btn-primary" id="invManualTop">${IC.plus} Add invoice manually</button>`}</div>
+  <div class="subhead"><h4>Purchase entry</h4><div class="rule"></div>${locked?'':`<button class="btn btn-sm" id="purTpl" title="The purchase sheet — seven input columns, one vendor per file, the app computes the rest">${IC.dl} Template</button>
+    <button class="btn btn-sm" id="purUpl">${IC.up} Upload filled template</button>
+    <button class="btn btn-sm btn-primary" id="invManualTop">${IC.plus} Add invoice manually</button>`}</div>
   <p class="mini-note" style="margin:-4px 0 10px">Add each vendor invoice below and type its item lines — the vendor, item count and purchase value in this table fill in from the invoice automatically, and every line is margin-tallied against the Item Master.</p>
   <div class="tbl-scroll"><table class="row-tbl" id="purchTbl">
     <thead><tr><th style="width:46%">Vendor (auto-suggest)</th><th style="width:17%">Items (SKU)</th><th style="width:27%">Value at cost (Rs.)</th><th></th></tr></thead>
@@ -2670,6 +2673,8 @@ function wireEntryTab(e, locked){
     invLineModal(e, e.invoices.length-1, null, locked);
   };
   const imt=$('#invManualTop'); if(imt) imt.onclick=addManualInv;
+  const pt=$('#purTpl'); if(pt) pt.onclick=()=> downloadTemplate('purchase', 'Purchase upload');
+  const pu=$('#purUpl'); if(pu) pu.onclick=()=> purchaseUploadModal(e, locked);
   const gp=$('#gpBtn'); if(gp) gp.onclick=()=> gpUploadModal(e, locked);
   const gpt=$('#gpTplTop'); if(gpt) gpt.onclick=()=> downloadTemplate('sales', 'Sales & margin');
 }
@@ -2846,6 +2851,113 @@ function unitsSeg(id, mode){
     </div>
     <span class="eyebrow" style="font-weight:400">${mode==='tablets'? 'each qty ÷ pack size — 15 tablets of a 10s = 1.5 strips; rates scale with it, so no rupee moves':'quantities are taken as strips, as the template asks'}</span>
   </div>`;
+}
+
+/* Purchase lines carry pqty AND oqty, so tabletsToStrips (qty/nr/mrp) does not
+   fit — this converter divides BOTH quantities and scales rate & MRP by the pack
+   from the Item Master, keeping every rupee where it was: 10 tablets × ₹8.5 ≡
+   1 strip × ₹85. disc/gst are percentages — unit-proof, untouched. */
+function purchaseToStrips(lines, hid){
+  const out = [], unknown = [];
+  lines.forEach(l=>{
+    const u = packUnits((findItem(hid, l.item)||{}).pack);
+    if(!u){ unknown.push(l.item); out.push({...l, srcPqty:num(l.pqty), packU:null}); return; }
+    out.push({...l, pqty:num(l.pqty)/u, oqty:num(l.oqty)/u, rate:num(l.rate)*u, mrp:num(l.mrp)*u, srcPqty:num(l.pqty), packU:u});
+  });
+  return {rows:out, unknown};
+}
+
+/* One vendor + one filled template = one invoice appended to the day. The sheet
+   carries only the seven inputs; calcLine derives the rest, exactly as if each
+   line had been keyed in the dialog. */
+function purchaseUploadModal(e, locked){
+  if(state.demo){ toast('Template reading works in live mode only','amber'); return; }
+  if(locked){ toast('This day is locked','red'); return; }
+  let parsed = null;
+  let units = fileUnits(state.hospital, 'template');   // our template asks for strips
+  const viewLines = ()=>{
+    const lines = (parsed && parsed.invoice.lines)||[];
+    if(units!=='tablets') return {rows: lines.map(l=>({...l, srcPqty:num(l.pqty), packU:null})), unknown:[]};
+    return purchaseToStrips(lines, state.hospital);
+  };
+  openModal(`
+    <div class="modal-head"><h3>Upload purchase lines — ${fmtDate(state.date)}</h3><button class="modal-x">✕</button></div>
+    <div class="modal-body">
+      <div class="lock-note" style="margin-bottom:12px">
+        <div><b>One vendor per file.</b> Every row lands as a purchase line under the vendor named below — the sheet has no vendor column on purpose. The app computes total qty, net rate and margin with the same math as manual entry.</div>
+        <button class="btn btn-sm" id="puTpl" style="margin-left:auto;flex:none">${IC.dl} Download template</button>
+      </div>
+      <div class="field" style="position:relative"><label>Vendor name — required</label>
+        <input class="in" id="puVendor" placeholder="Start typing — suggests from this hospital's vendors" autocomplete="off"></div>
+      <div class="field"><label>Filled purchase template (Excel)</label><input class="in" type="file" id="puFile" accept=".xls,.xlsx"></div>
+      <div id="puPrev"><p class="mini-note">Seven inputs per line — Item, Purchase Qty (strips), Offer Qty, Rate ₹, Vendor Disc %, GST %, MRP ₹. Everything else is derived.</p></div>
+    </div>
+    <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn" id="puParse">Read file</button><button class="btn btn-primary" id="puGo" disabled>Add to day</button></div>`);
+  $('#puTpl').onclick = ()=> downloadTemplate('purchase', 'Purchase upload');
+  attachSuggest($('#puVendor'), ()=>{});
+
+  const renderPuPrev = ()=>{
+    const cv = viewLines();
+    const rows = cv.rows;
+    const totals = rows.reduce((a,l)=>{ const d=calcLine(l); a.amt+=d.pamt; a.tq+=d.tqty; return a; }, {amt:0, tq:0});
+    $('#puPrev').innerHTML = `
+      <p class="mini-note">${esc(parsed.note||'')}</p>
+      <div class="tbl-scroll" style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:7px"><table class="tbl">
+        <thead><tr><th>Item</th><th class="r">Purchase qty</th><th class="r">Offer</th><th class="r">Rate</th><th class="r">Disc%</th><th class="r">GST%</th><th class="r">MRP</th><th class="r" title="Billed amount ÷ total qty — computed by the app, never read from the sheet">Net rate</th><th class="r">Margin %</th><th></th></tr></thead>
+        <tbody>${rows.slice(0,200).map(l=>{
+          const d = calcLine(l);
+          const st = lineStatus(state.hospital, l);
+          return `<tr><td>${esc(l.item)}</td>
+            <td class="r num">${units==='tablets' && l.packU? `${fmtQ(l.srcPqty)} → <b>${fmtQ(d.pqty)}</b> <span style="color:var(--faint)">(${l.packU}s)</span>` : fmtQ(d.pqty)}</td>
+            <td class="r num">${d.oqty? fmtQ(d.oqty):'—'}</td>
+            <td class="r num">${r2(d.rate)}</td><td class="r num">${d.disc||'—'}</td><td class="r num">${d.gst||'—'}</td><td class="r num">${r2(d.mrp)}</td>
+            <td class="r num" style="font-weight:600">${r2(d.nr)}</td>
+            <td class="r num" style="font-weight:700;color:${marginCol(st.status)}">${pct(d.marginPct)}</td>
+            <td>${marginChip(st.status)}</td></tr>`;
+        }).join('')}</tbody></table></div>
+      <p class="mini-note">${rows.length} line${rows.length===1?'':'s'} · ${fmtQ(totals.tq)} strips in · purchase value ${fmtRs(totals.amt)} — all under <b>${esc($('#puVendor').value.trim())}</b>.</p>
+      ${unitsSeg('puu', units)}
+      ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} item${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size on the Item Master to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}`;
+    $$('[data-puu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.puu; setFileUnits(state.hospital, 'template', units); renderPuPrev(); });
+    $('#puGo').disabled = !rows.length;
+  };
+
+  $('#puParse').onclick = async ()=>{
+    const vendor = $('#puVendor').value.trim();
+    if(!vendor){ toast('Name the vendor first — every line lands under them','red'); return; }
+    const f = $('#puFile').files[0];
+    if(!f){ toast('Choose the filled template','red'); return; }
+    const btn=$('#puParse'); btn.disabled=true; btn.textContent='Reading…';
+    try{
+      parsed = await apiUpload(`/parse/purchase?hid=${encodeURIComponent(state.hospital)}&date=${encodeURIComponent(state.date)}`, f, {vendor});
+      renderPuPrev();
+    }catch(err){ $('#puPrev').innerHTML = `<p style="color:var(--red);font-size:13px">${esc(err.message)}</p>`; }
+    btn.disabled=false; btn.textContent='Read file';
+  };
+
+  $('#puGo').onclick = async ()=>{
+    if(!parsed) return;
+    const vendor = $('#puVendor').value.trim();
+    if(!vendor){ toast('Name the vendor first','red'); return; }
+    const known = (db.vendors[state.hospital]||[]).some(v=> v.name.toLowerCase()===vendor.toLowerCase());
+    if(!known && confirm(`"${vendor}" is not in the vendor book yet. Add them so future uploads suggest the name?`)){
+      try{
+        const r = await api('/vendors/bulk',{method:'POST', body:{hid:state.hospital, vendors:[{name:vendor, credit:30}]}});
+        (r.created||[]).forEach(v=> db.vendors[state.hospital].push(v));
+      }catch(err){ /* the entry save auto-registers anyway */ }
+    }
+    // strip the preview annotations — the day stores the seven raw inputs only
+    const lines = viewLines().rows.map(({srcPqty, packU, ...rest})=> rest);
+    const inv = { id:'inv'+Date.now(), vendor, invoiceNo:'', date:state.date, fileName:parsed.invoice.fileName||'', lines };
+    e.invoices = e.invoices||[];
+    e.invoices.push(inv);                 // APPEND — a second file for the same vendor/day is a second invoice
+    syncInvoicePurchase(e, inv);          // its derived purchase-summary row, like a manual invoice
+    markDirty();
+    closeModal();
+    renderEntryTab(e, locked);
+    await saveEntry(e);
+    toast(`${lines.length} purchase line${lines.length===1?'':'s'} added under ${vendor} — each tallied against the Item Master`,'green');
+  };
 }
 
 function gpUploadModal(e, locked){
