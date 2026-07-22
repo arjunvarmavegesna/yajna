@@ -2114,8 +2114,7 @@ function renderEntryTab(e, locked){
 function tabPurchase(e, locked){
   const c = calcEntry(e);
   return `
-  <div class="subhead"><h4>Purchase entry</h4><div class="rule"></div>${locked?'':`<button class="btn btn-sm" id="purTpl" title="The purchase sheet — seven input columns, one vendor per file, the app computes the rest">${IC.dl} Template</button>
-    <button class="btn btn-sm" id="purUpl">${IC.up} Upload filled template</button>
+  <div class="subhead"><h4>Purchase entry</h4><div class="rule"></div>${locked?'':`<button class="btn btn-sm" id="purUpl" title="One vendor + invoice number + the filled template — every row lands as a purchase line">${IC.up} Bulk upload of purchase</button>
     <button class="btn btn-sm btn-primary" id="invManualTop">${IC.plus} Add invoice manually</button>`}</div>
   <p class="mini-note" style="margin:-4px 0 10px">Add each vendor invoice below and type its item lines — the vendor, item count and purchase value in this table fill in from the invoice automatically, and every line is margin-tallied against the Item Master.</p>
   <div class="tbl-scroll"><table class="row-tbl" id="purchTbl">
@@ -2691,7 +2690,6 @@ function wireEntryTab(e, locked){
     invLineModal(e, e.invoices.length-1, null, locked);
   };
   const imt=$('#invManualTop'); if(imt) imt.onclick=addManualInv;
-  const pt=$('#purTpl'); if(pt) pt.onclick=()=> downloadTemplate('purchase', 'Purchase upload');
   const pu=$('#purUpl'); if(pu) pu.onclick=()=> purchaseUploadModal(e, locked);
   const gp=$('#gpBtn'); if(gp) gp.onclick=()=> gpUploadModal(e, locked);
   const gpt=$('#gpTplTop'); if(gpt) gpt.onclick=()=> downloadTemplate('sales', 'Sales & margin');
@@ -2899,14 +2897,18 @@ function purchaseUploadModal(e, locked){
     return purchaseToStrips(lines, state.hospital);
   };
   openModal(`
-    <div class="modal-head"><h3>Upload purchase lines — ${fmtDate(state.date)}</h3><button class="modal-x">✕</button></div>
+    <div class="modal-head"><h3>Bulk upload of purchase — ${fmtDate(state.date)}</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
       <div class="lock-note" style="margin-bottom:12px">
         <div><b>One vendor per file.</b> Every row lands as a purchase line under the vendor named below — the sheet has no vendor column on purpose. The app computes total qty, net rate and margin with the same math as manual entry.</div>
         <button class="btn btn-sm" id="puTpl" style="margin-left:auto;flex:none">${IC.dl} Download template</button>
       </div>
-      <div class="field" style="position:relative"><label>Vendor name — required</label>
-        <input class="in" id="puVendor" placeholder="Start typing — suggests from this hospital's vendors" autocomplete="off"></div>
+      <div class="grid2">
+        <div class="field" style="position:relative"><label>Vendor name — required</label>
+          <input class="in" id="puVendor" placeholder="Start typing — suggests from this hospital's vendors" autocomplete="off"></div>
+        <div class="field"><label>Invoice number</label>
+          <input class="in" id="puInvNo" placeholder="As printed on the bill"></div>
+      </div>
       <div class="field"><label>Filled purchase template (Excel)</label><input class="in" type="file" id="puFile" accept=".xls,.xlsx"></div>
       <div id="puPrev"><p class="mini-note">Seven inputs per line — Item, Purchase Qty (strips), Offer Qty, Rate ₹, Vendor Disc %, GST %, MRP ₹. Everything else is derived.</p></div>
     </div>
@@ -2947,7 +2949,7 @@ function purchaseUploadModal(e, locked){
     if(!f){ toast('Choose the filled template','red'); return; }
     const btn=$('#puParse'); btn.disabled=true; btn.textContent='Reading…';
     try{
-      parsed = await apiUpload(`/parse/purchase?hid=${encodeURIComponent(state.hospital)}&date=${encodeURIComponent(state.date)}`, f, {vendor});
+      parsed = await apiUpload(`/parse/purchase?hid=${encodeURIComponent(state.hospital)}&date=${encodeURIComponent(state.date)}`, f, {vendor, invoiceNo: $('#puInvNo').value.trim()});
       renderPuPrev();
     }catch(err){ $('#puPrev').innerHTML = `<p style="color:var(--red);font-size:13px">${esc(err.message)}</p>`; }
     btn.disabled=false; btn.textContent='Read file';
@@ -2966,7 +2968,7 @@ function purchaseUploadModal(e, locked){
     }
     // strip the preview annotations — the day stores the seven raw inputs only
     const lines = viewLines().rows.map(({srcPqty, packU, ...rest})=> rest);
-    const inv = { id:'inv'+Date.now(), vendor, invoiceNo:'', date:state.date, fileName:parsed.invoice.fileName||'', lines };
+    const inv = { id:'inv'+Date.now(), vendor, invoiceNo:$('#puInvNo').value.trim(), date:state.date, fileName:parsed.invoice.fileName||'', lines };
     e.invoices = e.invoices||[];
     e.invoices.push(inv);                 // APPEND — a second file for the same vendor/day is a second invoice
     syncInvoicePurchase(e, inv);          // its derived purchase-summary row, like a manual invoice

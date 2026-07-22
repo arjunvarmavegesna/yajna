@@ -72,11 +72,11 @@ r = await post(`/parse/purchase?hid=viraj&date=${T}`, Buffer.from('foo,bar\n1,2'
 ok(r.status === 400 && /header/i.test(r.data.error), 'a wrong-shaped file names the required headers', r.data.error);
 
 console.log('— one vendor, five lines, calcLine is the only math —');
-r = await post(`/parse/purchase?hid=viraj&date=${T}`, fillPurchase(buf, five), 'p.xlsx', { vendor: 'Mankind Associates' });
+r = await post(`/parse/purchase?hid=viraj&date=${T}`, fillPurchase(buf, five), 'p.xlsx', { vendor: 'Mankind Associates', invoiceNo: 'MA-2041' });
 ok(r.status === 200 && r.data.source === 'template', 'the filled template reads without AI', r.data.error);
 const inv = r.data.invoice;
 ok(inv.vendor === 'Mankind Associates' && inv.lines.length === 5, 'ONE invoice, five lines, all under the popup vendor', `${inv.vendor}/${inv.lines.length}`);
-ok(inv.invoiceNo === '' && inv.date === T, 'blank invoice number, the selected entry date');
+ok(inv.invoiceNo === 'MA-2041' && inv.date === T, 'the popup invoice number rides on the invoice, with the selected entry date', inv.invoiceNo);
 ok(!('nr' in inv.lines[0]) && !('value' in inv.lines[0]), 'the stored lines are RAW inputs — no derived field is trusted from a sheet', JSON.stringify(inv.lines[0]));
 const p0 = r.data.preview[0];
 ok(p0.tqty === 11, 'preview: 10 + 1 free = 11 total qty', p0.tqty);
@@ -119,9 +119,12 @@ const w = dom.window, doc = w.document;
 await tick(400);
 doc.querySelector('[data-quick="admin"]').click(); await tick(700);
 w.eval(`openHospital('viraj','entry'); state.entryTab = 0; renderEntry();`); await tick(400);
-ok(!!doc.querySelector('#purTpl'), 'the Purchase tab offers the template download');
-ok(!!doc.querySelector('#purUpl'), 'and the bulk upload, beside Add invoice manually');
-ok(!!doc.querySelector('#invManualTop'), 'which is still there');
+ok(!doc.querySelector('#purTpl'), 'NO standalone template button on the main section — it lives inside the popup');
+ok(!!doc.querySelector('#purUpl') && /Bulk upload of purchase/.test(doc.querySelector('#purUpl').textContent), 'the toolbar offers Bulk upload of purchase', doc.querySelector('#purUpl')?.textContent);
+ok(!!doc.querySelector('#invManualTop'), 'Add invoice manually stands beside it, fully independent');
+doc.querySelector('#invManualTop').click(); await tick(300);
+ok(!!doc.querySelector('#lmItem'), 'manual entry still opens its own line dialog — untouched by the bulk path');
+w.eval('closeModal()'); await tick(200);
 doc.querySelector('#purUpl').click(); await tick(200);
 ok(/live mode/i.test(doc.querySelector('#toastRoot')?.textContent || ''), 'demo mode says the upload needs live mode — it does not pretend');
 

@@ -2496,12 +2496,13 @@ app.post('/api/parse/purchase', auth, requireRole('admin'), upload.single('file'
   scopeCheck(req, hid);
   const vendor = S((req.body && req.body.vendor) || req.query.vendor, 120).trim();
   if (!vendor) return res.status(400).json({ error: 'Vendor name is required — the whole file lands under one vendor' });
+  const invoiceNo = S((req.body && req.body.invoiceNo) || req.query.invoiceNo, 60).trim();
   if (!req.file) return res.status(400).json({ error: 'Attach the filled purchase template' });
   const tpl = readTemplate(req.file.buffer, 'purchase');
   if (!tpl) return res.status(400).json({ error: 'The columns could not be found. Download the Purchase upload template and keep its header row — Item, Purchase Qty (strips), Offer Qty, Rate ₹, Vendor Disc %, GST %, MRP ₹.' });
   const date = /^\d{4}-\d{2}-\d{2}$/.test(S(req.query.date)) ? req.query.date : todayISO();
   const lines = tpl.rows.slice(0, 500);
-  const invoice = { id: uid('inv'), vendor, invoiceNo: '', date, fileName: req.file.originalname || '', lines };
+  const invoice = { id: uid('inv'), vendor, invoiceNo, date, fileName: req.file.originalname || '', lines };
   // the preview shows what calcLine WILL derive — same math, so the numbers the
   // user approves are the numbers the day will carry
   const preview = lines.map(l => { const d = calcLine(l); return { ...l,
