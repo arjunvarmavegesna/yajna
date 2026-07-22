@@ -181,6 +181,8 @@ CREATE INDEX IF NOT EXISTS idx_plog_item ON price_log(item_id);
      Rifaximin 550" at one and "Rifagut 550" at another are the same purchase
      decision. Optional: an item without one still works everywhere else. */
   if (!icols.includes('molecule')) db.exec("ALTER TABLE items ADD COLUMN molecule TEXT NOT NULL DEFAULT ''");
+// who we WANT to buy this from next — overrides "who we last bought it from"
+if (!icols.includes('preferred_vendor')) db.exec("ALTER TABLE items ADD COLUMN preferred_vendor TEXT NOT NULL DEFAULT ''");
 {
   const hcols = db.prepare('PRAGMA table_info(hospitals)').all().map(c => c.name);
   // the doctor's own WhatsApp number — reports and price approvals go THERE, not
@@ -371,7 +373,7 @@ const rowHosp = (h) => ({ id: h.id, name: h.name, doctor: h.doctor, location: h.
 const rowVendor = (v) => ({ id: v.id, name: v.name, creditDays: v.credit_days, openingBal: v.opening_bal, phone: v.phone, addedOn: v.added_on });
 const rowPay = (p) => ({ id: p.id, vendorId: p.vendor_id, vendorName: p.vendor_name, amount: p.amount, date: p.date, note: p.note });
 const rowNotif = (n) => ({ id: n.id, type: n.type, hid: n.hospital_id, date: n.date, msg: n.msg, ts: n.ts, read: !!n.read });
-const rowItem = (i) => ({ molecule: i.molecule || '', id: i.id, name: i.name, key: i.name_key, pack: i.pack, nr: i.nr, mrp: i.mrp, openingQty: i.opening_qty || 0, source: i.source, updatedAt: i.updated_at });
+const rowItem = (i) => ({ molecule: i.molecule || '', preferredVendor: i.preferred_vendor || '', id: i.id, name: i.name, key: i.name_key, pack: i.pack, nr: i.nr, mrp: i.mrp, openingQty: i.opening_qty || 0, source: i.source, updatedAt: i.updated_at });
 const rowAdj = (a) => ({ id: a.id, key: a.item_key, item: a.item_name, date: a.date, qty: a.qty, reason: a.reason, note: a.note, user: a.user_name, ts: a.created_at });
 
 /* why stock was corrected — required, because an unexplained adjustment is the
@@ -1577,6 +1579,7 @@ app.patch('/api/items/:id', auth, requireRole('admin'), (req, res) => {
     return res.status(400).json({ error: "Price changes need the doctor's approval — record it as a price change on the Margin offers tab and it lands once they tap Approve", code: 'needs_approval' });
   const pack = b.pack !== undefined ? S(b.pack, 60) : it.pack;
   const molecule = b.molecule !== undefined ? S(b.molecule, 150).trim() : (it.molecule || '');
+  const preferredVendor = b.preferredVendor !== undefined ? S(b.preferredVendor, 120).trim() : (it.preferred_vendor || '');
   const openingQty = b.openingQty !== undefined ? N(b.openingQty) : it.opening_qty;
   if (openingQty < 0) return res.status(400).json({ error: 'Opening quantity cannot be negative' });
   const now = Date.now();
@@ -1585,10 +1588,10 @@ app.patch('/api/items/:id', auth, requireRole('admin'), (req, res) => {
       db.prepare('INSERT INTO price_log(id,item_id,hospital_id,old_nr,old_mrp,new_nr,new_mrp,note,user_name,ts) VALUES(?,?,?,?,?,?,?,?,?,?)')
         .run(uid('pl'), it.id, it.hospital_id, it.nr, it.mrp, nr, mrp, S(b.note, 200), req.user.name, now);
     }
-    db.prepare('UPDATE items SET nr=?, mrp=?, pack=?, molecule=?, opening_qty=?, updated_at=? WHERE id=?').run(nr, mrp, pack, molecule, openingQty, now, it.id);
+    db.prepare('UPDATE items SET nr=?, mrp=?, pack=?, molecule=?, preferred_vendor=?, opening_qty=?, updated_at=? WHERE id=?').run(nr, mrp, pack, molecule, preferredVendor, openingQty, now, it.id);
   });
   tx();
-  res.json({ item: rowItem({ ...it, nr, mrp, pack, molecule, opening_qty: openingQty, updated_at: now }) });
+  res.json({ item: rowItem({ ...it, nr, mrp, pack, molecule, preferred_vendor: preferredVendor, opening_qty: openingQty, updated_at: now }) });
 });
 
 app.get('/api/items/:id/history', auth, (req, res) => {

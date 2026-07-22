@@ -1546,6 +1546,7 @@ function stockLedger(hid){
       if(!ev.line.exp) issues.noExpiry++;
       const lot = addLot({key, name:String(ev.line.item).trim(), batchNo: bn||'—', exp: ev.line.exp||null,
         nr: d.nr, mrp: d.mrp, received: ev.date, synthetic: bn? null : 'unbatched',
+        vendor: ev.inv.vendor||'',
         src: (ev.inv.vendor||'')+(ev.inv.invoiceNo? ' #'+ev.inv.invoiceNo : '')});
       lot.remaining = ev.qty; lot.qtyReceived = ev.qty;
       move(ev.date, lot, 'purchase', ev.qty, lot.src);
@@ -4956,7 +4957,7 @@ async function exportRecvXlsx(hid, ids){
 /* A position has no natural range, so the tab offers the three things a range
    query on stock can honestly mean: a snapshot, a movement, or a series of
    snapshots. Never a sum. */
-const INV_MODES = [['asof','As of date'],['between','Between two dates'],['trend','Trend']];
+const INV_MODES = [['asof','As of date'],['between','Between two dates'],['trend','Trend'],['reorder','Reorder']];
 const INV_QUICK = [
   ['today','Today', ()=> todayISO()],
   ['yday','Yesterday', ()=> addDays(todayISO(),-1)],
@@ -5011,7 +5012,174 @@ function renderInventory(){
 
   if(v.mode==='asof') invAsOfView(hid, canEdit);
   else if(v.mode==='between') invBetweenView(hid);
+  else if(v.mode==='reorder') invReorderView(hid, canEdit);
   else invTrendView(hid);
+}
+
+/* ---------------- reorder planning ----------------
+   The reorder level is not typed in anywhere — it IS the consumption. Strips
+   sold over the recent window give a use-per-day; cover days turn that into a
+   need; what is already on the shelf comes off; the remainder is the suggestion.
+   Change any past day and the whole plan self-corrects, like everything else. */
+const REORDER_LOOKBACK = 30;   // days of sales the rate is measured over
+
+function reorderData(hid, coverDays){
+  const today = todayISO();
+  const from = stockDateOf(hid);
+  const winStart = addDays(today, -(REORDER_LOOKBACK-1));
+  const start = from && from > winStart ? from : winStart;
+  const windowDays = Math.max(1, Math.round((new Date(today+'T12:00:00') - new Date(start+'T12:00:00'))/86400000) + 1);
+
+  // strips sold per item inside the window — from the entries themselves
+  const sold = {};
+  Object.entries(db.dailyData[hid]||{}).forEach(([d,e])=>{
+    if(!e.savedAt || d < start || d > today) return;
+    (e.itemSales||[]).forEach(sl=>{ const k=nameKey(sl.item); if(k && num(sl.qty)>0) sold[k]=(sold[k]||0)+num(sl.qty); });
+  });
+
+  const snap = stockAsOf(hid, today);
+  const stockBy = {}; snap.items.forEach(m=> stockBy[m.key]=m);
+
+  // the most recent real purchase lot per item = who we last bought it from
+  const lastBuy = {};
+  stockLedger(hid).lots.forEach(l=>{
+    // a real purchase is any lot that came off an invoice — it carries a vendor.
+    // 'unbatched' only means no batch number was keyed, not that nobody sold it.
+    if(!l.vendor || !l.qtyReceived) return;
+    if(!lastBuy[l.key] || l.received > lastBuy[l.key].received) lastBuy[l.key] = l;
+  });
+  const vendorInfo = name=>{
+    const v = (db.vendors[hid]||[]).find(x=> x.name.toLowerCase()===String(name||'').toLowerCase());
+    return v? {phone:v.phone||'', creditDays:v.creditDays} : null;
+  };
+
+  const rows = (db.items[hid]||[]).map(it=>{
+    const m = stockBy[it.key];
+    const onHand = m? m.stock : 0;
+    const soldQty = sold[it.key]||0;
+    const rate = soldQty / windowDays;                       // strips per day
+    const daysLeft = rate>0? onHand/rate : null;             // null = not moving
+    const need = Math.ceil(rate * coverDays);
+    const suggest = Math.max(0, need - Math.max(onHand,0));  // negative stock is a data problem, not extra shelf
+    const lb = lastBuy[it.key]||null;
+    const preferred = it.preferredVendor||'';
+    const vendorName = preferred || (lb? lb.vendor : '');
+    return {key:it.key, id:it.id, name:it.name, pack:it.pack||'',
+      onHand, rate, soldQty, daysLeft, need, suggest,
+      nr: num(it.nr), orderValue: suggest*num(it.nr),
+      lastVendor: lb? {name:lb.vendor||'—', date:lb.received, nr:lb.nr} : null,
+      preferred, vendorName, vendorMeta: vendorInfo(vendorName)};
+  });
+  return {rows, windowDays, coverDays};
+}
+
+function invReorderView(hid, canEdit){
+  const v = invState();
+  v.cover = v.cover || 15;
+  v.roNeedOnly = v.roNeedOnly ?? true;
+  const R = reorderData(hid, v.cover);
+  const q = nameKey(state.roQuery||'');
+  let rows = R.rows.filter(r=> !q || r.key.includes(q) || nameKey(r.vendorName||'').includes(q));
+  if(v.roNeedOnly) rows = rows.filter(r=> r.suggest>0);
+  // most urgent first: least days of cover left; the never-moving sink to the end
+  rows.sort((a,z)=> (a.daysLeft??1e9) - (z.daysLeft??1e9) || z.orderValue - a.orderValue);
+
+  const needing = R.rows.filter(r=> r.suggest>0);
+  const orderStrips = needing.reduce((a,r)=>a+r.suggest,0);
+  const orderValue = needing.reduce((a,r)=>a+r.orderValue,0);
+  const runsOut = R.rows.filter(r=> r.daysLeft!=null && r.daysLeft <= 7).length;
+  const still = R.rows.filter(r=> r.soldQty===0).length;
+
+  $('#invBody').innerHTML = `
+    <div class="kpis">
+      <div class="kpi ${needing.length?'warn':'good'}"><div class="l">Items to reorder</div><div class="v num">${needing.length}</div><div class="d">to stay covered for ${v.cover} days</div></div>
+      <div class="kpi"><div class="l">Strips to order</div><div class="v num">${orderStrips}</div><div class="d">worth ${fmtRs(orderValue)} at today's net rates</div></div>
+      <div class="kpi ${runsOut?'bad':'good'}"><div class="l">Running out within a week</div><div class="v num">${runsOut||'Nil'}</div><div class="d">at the current rate of sale</div></div>
+      <div class="kpi"><div class="l">Not moving</div><div class="v num">${still}</div><div class="d">no sale in the last ${R.windowDays} days — nothing suggested</div></div>
+    </div>
+    <div class="entry-bar">
+      <span class="eyebrow">Cover for</span>
+      <div class="seg">
+        <button class="${v.cover===15?'active':''}" data-rocov="15">15 days</button>
+        <button class="${v.cover===30?'active':''}" data-rocov="30">30 days</button>
+        <button class="${v.cover!==15&&v.cover!==30?'active':''}" data-rocov="custom">Custom</button>
+      </div>
+      ${v.cover!==15&&v.cover!==30? `<input class="in num" type="number" min="1" max="365" id="roDays" value="${v.cover}" style="width:80px"> <span class="eyebrow">days</span>`:''}
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)"><input type="checkbox" id="roNeed" ${v.roNeedOnly?'checked':''}> Only what needs ordering</label>
+      <input class="in" id="roSearch" placeholder="Item or vendor…" value="${esc(state.roQuery||'')}" style="width:190px">
+      <span style="flex:1"></span>
+      <button class="btn btn-sm" id="roCopy" title="The order list as text, grouped by vendor — paste it into WhatsApp">${IC.copy} Copy order list</button>
+    </div>
+    <p class="mini-note" style="margin:-6px 0 12px">Use per day is measured from the strips actually sold in the last ${R.windowDays} days — the reorder level is the consumption, not a number anyone keys in. Suggested = ${v.cover}-day need − stock on hand.</p>
+    <div class="card"><div class="tbl-scroll"><table class="tbl">
+      <thead><tr><th>Product name</th><th>Pack</th><th class="r">On hand</th>
+        <th class="r" title="Strips sold in the window ÷ days">Use / day</th>
+        <th class="r" title="On hand ÷ use per day">Days left</th>
+        <th class="r">Need (${v.cover}d)</th>
+        <th class="r" title="Need minus what is on the shelf, rounded up to whole strips">Suggest order</th>
+        <th>Vendor</th>${canEdit?'<th></th>':''}
+      </tr></thead>
+      <tbody>${rows.slice(0,400).map(r=>{
+        const urgency = r.daysLeft==null? 'var(--faint)' : r.daysLeft<=7? 'var(--red)' : r.daysLeft<=v.cover? 'var(--amber)' : 'var(--green)';
+        return `<tr>
+          <td><b>${esc(r.name)}</b></td>
+          <td style="color:var(--muted)">${esc(r.pack||'—')}</td>
+          <td class="r num" style="color:${r.onHand<0?'var(--red)':'var(--ink)'}">${r.onHand}</td>
+          <td class="r num">${r.rate>0? r.rate.toFixed(r.rate<1?2:1) : '—'}</td>
+          <td class="r num" style="color:${urgency};font-weight:600">${r.daysLeft==null? 'not moving' : r.daysLeft>999? '999+' : Math.floor(r.daysLeft)+'d'}</td>
+          <td class="r num">${r.need||'—'}</td>
+          <td class="r num" style="font-weight:700;color:${r.suggest>0?'var(--ink)':'var(--faint)'}">${r.suggest||'—'}${r.suggest>0? `<div style="font-size:11px;color:var(--faint);font-weight:400">${fmtRs(r.orderValue)}</div>`:''}</td>
+          <td style="font-size:12.5px">${r.vendorName? `${esc(r.vendorName)}${r.preferred? ' <span class="chip chip-blue" style="font-size:10px" title="Set as the preferred vendor for this item">preferred</span>':''}
+              <div style="color:var(--faint)">${r.preferred? (r.lastVendor? `last: ${esc(r.lastVendor.name)} · ${fmtDateShort(r.lastVendor.date)}` : 'never bought yet') : (r.lastVendor? `bought ${fmtDateShort(r.lastVendor.date)} @ ₹${r.lastVendor.nr}` : '')}${r.vendorMeta&&r.vendorMeta.phone? ' · '+esc(r.vendorMeta.phone):''}</div>`
+            : '<span style="color:var(--faint)">no purchase on record</span>'}</td>
+          ${canEdit? `<td><button class="btn btn-sm" data-rovend="${esc(r.id||'')}" ${r.id?'':'disabled title="Not on the item master"'}>${r.preferred?'Change':'Set'} vendor</button></td>`:''}
+        </tr>`;
+      }).join('') || `<tr><td colspan="9" style="color:var(--faint);padding:16px">${v.roNeedOnly? `Nothing needs ordering for the next ${v.cover} days — the shelf covers it.` : 'No items on the master yet.'}</td></tr>`}
+      </tbody></table></div></div>
+    ${rows.length>400? '<p class="mini-note">Showing the 400 most urgent — search to narrow it.</p>':''}`;
+
+  $$('[data-rocov]').forEach(b=> b.onclick = ()=>{ v.cover = b.dataset.rocov==='custom'? (v.cover===15||v.cover===30? 21 : v.cover) : +b.dataset.rocov; renderInventory(); });
+  const rd=$('#roDays'); if(rd) rd.onchange = ()=>{ v.cover = Math.max(1, Math.min(365, Math.round(num(rd.value))||21)); renderInventory(); };
+  $('#roNeed').onchange = e=>{ v.roNeedOnly = e.target.checked; renderInventory(); };
+  const rs=$('#roSearch');
+  rs.oninput = ()=>{ state.roQuery = rs.value; renderInventory(); const s2=$('#roSearch'); s2.focus(); s2.setSelectionRange(s2.value.length, s2.value.length); };
+  $('#roCopy').onclick = ()=>{
+    // grouped by vendor so each list can go straight to that vendor's WhatsApp
+    const byV = {};
+    needing.forEach(r=> (byV[r.vendorName||'(no vendor on record)'] = byV[r.vendorName||'(no vendor on record)']||[]).push(r));
+    const text = `*Order list — ${esc(db.hospitals[hid].name)}* (${v.cover}-day cover, ${fmtDate(todayISO())})\n\n` +
+      Object.entries(byV).map(([vn,list])=> `*${vn}*\n` + list.map(r=> `• ${r.name}${r.pack? ' ('+r.pack+')':''} — ${r.suggest} strips`).join('\n')).join('\n\n');
+    navigator.clipboard.writeText(text.replace(/&amp;/g,'&')).then(()=> toast('Order list copied — paste it into WhatsApp','green'));
+  };
+  $$('[data-rovend]').forEach(b=> b.onclick = ()=>{ const it=(db.items[hid]||[]).find(x=>x.id===b.dataset.rovend); if(it) vendorPickModal(hid, it); });
+}
+
+/* Preferred vendor: who the NEXT order should go to — it never rewrites who the
+   last one came from; both stay visible so a switch is a visible decision. */
+function vendorPickModal(hid, it){
+  openModal(`
+    <div class="modal-head"><h3>Vendor for ${esc(it.name)}</h3><button class="modal-x">✕</button></div>
+    <div class="modal-body">
+      <datalist id="rvList">${(db.vendors[hid]||[]).map(x=>`<option value="${esc(x.name)}">`).join('')}</datalist>
+      <div class="field"><label>Preferred vendor for the next order</label>
+        <input class="in" id="rvName" list="rvList" value="${esc(it.preferredVendor||'')}" placeholder="Pick from your vendors or type a new name"></div>
+      <p class="mini-note">Leave it blank to fall back to whoever the last purchase came from. A name not on the Vendors list is kept as-is — it is registered as a vendor automatically when the first invoice arrives.</p>
+    </div>
+    <div class="modal-foot">
+      ${it.preferredVendor? `<button class="btn" id="rvClear" style="color:var(--red);border-color:#E8C4C4">Clear preference</button>`:''}
+      <span style="flex:1"></span>
+      <button class="btn modal-x">Cancel</button><button class="btn btn-primary" id="rvGo">Save</button></div>`);
+  const save = async (name)=>{
+    if(state.demo){ it.preferredVendor = name; closeModal(); toast(name? 'Preferred vendor set (demo)':'Preference cleared (demo)','green'); renderInventory(); return; }
+    try{
+      const r = await api('/items/'+it.id,{method:'PATCH', body:{preferredVendor:name}});
+      Object.assign(it, r.item);
+      closeModal(); toast(name? `Next order for ${it.name} points at ${name}` : 'Preference cleared — back to the last-bought vendor','green');
+      renderInventory();
+    }catch(err){ toast(err.message,'red'); }
+  };
+  $('#rvGo').onclick = ()=> save($('#rvName').value.trim());
+  const rc=$('#rvClear'); if(rc) rc.onclick = ()=> save('');
 }
 
 /* the two banners that must appear on any figure that cannot be trusted */
