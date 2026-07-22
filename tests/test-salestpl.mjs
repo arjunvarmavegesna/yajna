@@ -251,8 +251,8 @@ const invHdrs = [...doc.querySelectorAll('#invBody thead th')].map(t => t.textCo
 ok(invHdrs[0] === 'Product name' && invHdrs[1] === 'Pack size', 'the table opens with Product name and Pack size', invHdrs.slice(0, 2).join('|'));
 ok(/Net rate \/ strip/.test(invHdrs[2]), 'then Net rate / strip', invHdrs[2]);
 ok(/MRP \/ strip/.test(invHdrs[3]), 'then MRP / strip', invHdrs[3]);
-ok(invHdrs.includes('Opening'), 'opening strips are still there');
-['In stock', 'Value (NR)', 'MRP value', 'Pot. margin ₹', 'Pot. margin %'].forEach(h =>
+ok(invHdrs.includes('Opening / strip'), 'opening strips are still there — now labelled / strip');
+['In stock / strip', 'Value (NR)', 'MRP value', 'Pot. margin ₹', 'Pot. margin %'].forEach(h =>
   ok(invHdrs.includes(h), `and everything derived is untouched: ${h}`));
 const cells = [...doc.querySelector('#invBody tbody tr').querySelectorAll('td')].map(t => t.textContent.trim());
 ok(/17\.50/.test(cells[2]), 'the row shows the weighted net rate', cells[2]);

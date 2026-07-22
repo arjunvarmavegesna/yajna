@@ -5379,8 +5379,8 @@ function invAsOfView(hid, canEdit){
       <thead><tr><th>Product name</th><th>Pack size</th>
         <th class="r" title="Cost of ONE strip, inclusive of GST. Where lots differ this is the weighted average of the lots holding stock — open the row for the true per-lot rates.">Net rate / strip ₹</th>
         <th class="r" title="Printed MRP of ONE strip, weighted the same way">MRP / strip ₹</th>
-        <th class="r" title="Strips">Opening</th><th class="r" title="Strips">Purchased</th><th class="r" title="Strips">Sold</th><th class="r" title="Strips">RTV</th><th class="r" title="Strips">Adjusted</th>
-        <th class="r" title="Strips on hand">In stock</th><th class="r" title="Strips × net rate of one strip">Value (NR)</th><th class="r" title="Strips × MRP of one strip">MRP value</th><th class="r">Pot. margin ₹</th><th class="r">Pot. margin %</th>
+        <th class="r" title="Strips">Opening / strip</th><th class="r" title="Strips">Purchased / strip</th><th class="r" title="Strips">Sold / strip</th><th class="r" title="Strips">RTV / strip</th><th class="r" title="Strips">Adjusted / strip</th>
+        <th class="r" title="Strips on hand">In stock / strip</th><th class="r" title="Strips × net rate of one strip">Value (NR)</th><th class="r" title="Strips × MRP of one strip">MRP value</th><th class="r">Pot. margin ₹</th><th class="r">Pot. margin %</th>
         ${tb? '<th>Nearest expiry</th>':''}<th class="r" title="One lot per purchase line — each carries its own frozen net rate">Lots</th><th>Last move</th><th></th></tr></thead>
       <tbody>${list.slice(0,400).map(i=>{
         const col = i.stock<0? 'var(--red)' : i.stock===0? 'var(--amber)' : 'var(--ink)';
