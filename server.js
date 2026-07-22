@@ -964,8 +964,8 @@ function rowOffer(o, today) {
     kind: o.kind || 'offer',
     approvalSentAt: o.approval_sent_at || null,
     approvedBy: o.approved_by || '', approvedAt: o.approved_at || null,
-    // accepted + sent to the doctor + not yet decided = the ball is in their court
-    awaitingDoctor: o.status === 'accepted' && !!o.approval_sent_at && !o.approved_at,
+    // proposed + sent to the doctor + not yet decided = the ball is in their court
+    awaitingDoctor: o.status === 'proposed' && !!o.approval_sent_at && !o.approved_at,
     createdBy: o.created_by, createdAt: o.created_at
   };
 }
@@ -1051,12 +1051,17 @@ app.post('/api/offers/:id/actions', auth, requireRole('admin'), (req, res, next)
       if (mrp > 0 && nr > mrp) return res.status(400).json({ error: 'The revised rate is above the MRP' });
       upd.new_nr = nr; upd.new_mrp = mrp;
       if (!S(b.note, 400).trim()) return res.status(400).json({ error: 'Say what changed' });
-    } else if (type === 'accepted' || type === 'declined') {
+    } else if (type === 'accepted') {
+      /* Acceptance is the DOCTOR's move (Arjun, Jul 22) — it happens on their
+         approval page, never from the console. */
+      return res.status(400).json({ error: 'Acceptance comes from the doctor — send the offer to them on WhatsApp and it moves to accepted when they agree' });
+    } else if (type === 'declined') {
       if (o.status === 'applied') return res.status(400).json({ error: 'This offer is already applied to the Item Master' });
       upd.status = type;
-      if (type === 'declined' && !S(b.note, 400).trim()) return res.status(400).json({ error: 'Why was it declined? That is the part worth keeping.' });
+      if (!S(b.note, 400).trim()) return res.status(400).json({ error: 'Why was it declined? That is the part worth keeping.' });
     } else if (type === 'reopened') {
       upd.status = 'proposed';
+      upd.approved_by = ''; upd.approved_at = null; upd.approval_hash = null; upd.approval_sent_at = null;
       if (o.status === 'applied') return res.status(400).json({ error: 'An applied offer is history — raise a new one instead' });
     } else if (type === 'applied') {
       return res.status(400).json({ error: 'Use Apply to the Item Master — it moves the price and logs itself' });
@@ -1130,7 +1135,7 @@ app.post('/api/offers/:id/apply', auth, requireRole('admin'), (req, res) => {
   if (bad) return res.status(400).json({ error: bad });
   /* The gate. A price change is the doctor's decision — the console records it,
      it does not make it. */
-  if (!o.approved_at) return res.status(400).json({ error: "Needs the doctor's approval first — send it from the offer and the change lands when they tap Approve" });
+  if (!o.approved_at) return res.status(400).json({ error: "Needs the doctor's approval first — send it to them from the offer; once they agree it shows as accepted and you can add it here" });
   const r = applyOffer(o, req.user.name, o.approved_by);
   if (r.error) return res.status(400).json({ error: r.error });
   const fresh = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(o.id);
@@ -1188,8 +1193,8 @@ app.post('/api/offers/:id/request-approval', auth, requireRole('admin'), async (
   const today = todayISO();
   const bad = applyOfferErr(o, today);
   if (bad) return res.status(400).json({ error: bad });
-  if (o.status !== 'accepted') return res.status(400).json({ error: 'Accept the offer first — the doctor should only ever see a rate you are ready to take' });
-  if (o.approved_at) return res.status(400).json({ error: `Already approved by ${o.approved_by} — apply it` });
+  if (o.status === 'accepted' || o.approved_at) return res.status(400).json({ error: `${o.approved_by || 'The doctor'} already approved this — add it to the Item Master` });
+  if (o.status !== 'proposed') return res.status(400).json({ error: 'Only an open offer can be sent for approval' });
 
   // re-sending replaces the token: only the LATEST link works, so a message
   // forwarded around later cannot approve anything
@@ -1253,16 +1258,21 @@ app.get('/approve/:token', (req, res) => {
     <tr><td>Negotiated by</td><td>${esc(o.negotiated_by)}</td></tr>
   </table>`;
   if (o.status === 'applied') return res.send(approvalPage(esc(h.name), `<div class="sub">This change was already approved${o.approved_by ? ' by ' + esc(o.approved_by) : ''} and is on the Item Master.</div>${rows}<div class="btns"><div class="done">✓ Approved &amp; applied</div></div>`));
+  if (o.status === 'accepted') return res.send(approvalPage(esc(h.name), `<div class="sub">Already approved${o.approved_by ? ' by ' + esc(o.approved_by) : ''} — Yajna is adding it to the Item Master.</div>${rows}<div class="btns"><div class="done">✓ Approved</div></div>`));
   if (o.status === 'declined') return res.send(approvalPage(esc(h.name), `<div class="sub">This change was declined.</div>${rows}<div class="btns"><div class="done" style="background:#F7ECEA;color:#B3402E">Declined</div></div>`));
   if ((o.approval_expires || 0) < Date.now()) return res.send(approvalPage('Link expired', `<div class="sub">This link has expired. Ask Yajna to resend the approval.</div>${rows}`));
   return res.send(approvalPage(esc(h.name),
     `<div class="sub">${esc(h.doctor || 'Doctor')} — Yajna is asking your approval for this purchase-price change.</div>${rows}
      <form method="POST" action="/approve/${esc(req.params.token)}">
        <textarea name="note" rows="2" placeholder="Note (optional — required if declining)"></textarea>
+       <label style="display:flex;gap:9px;align-items:flex-start;margin-top:13px;font-size:14px;cursor:pointer">
+         <input type="checkbox" name="agree" value="1" id="agr" style="margin-top:2px;width:17px;height:17px">
+         <span>I agree to the revised purchase rate of <b>₹${N(o.new_nr)}</b> per strip for ${esc(o.item_name)}.</span></label>
        <div class="btns">
          <button class="no" name="decision" value="decline">Decline</button>
-         <button class="ok" name="decision" value="approve">Approve</button>
-       </div></form>`));
+         <button class="ok" name="decision" value="approve" id="apr" disabled style="opacity:.45">Approve</button>
+       </div></form>
+     <script>document.getElementById('agr').onchange=function(){var b=document.getElementById('apr');b.disabled=!this.checked;b.style.opacity=this.checked?'1':'.45';};</script>`));
 });
 
 app.post('/approve/:token', express.urlencoded({ extended: false }), (req, res) => {
@@ -1270,7 +1280,7 @@ app.post('/approve/:token', express.urlencoded({ extended: false }), (req, res) 
   res.type('html');
   if (!o) return res.status(404).send(approvalPage('Link not valid', `<div class="sub">This approval link is not recognised.</div>`));
   const h = db.prepare('SELECT * FROM hospitals WHERE id=?').get(o.hospital_id) || { name: '', doctor: 'Doctor' };
-  if (o.status === 'applied' || o.status === 'declined')
+  if (o.status !== 'proposed')
     return res.send(approvalPage(esc(h.name), `<div class="sub">Already decided — nothing further to do.</div>`));
   if ((o.approval_expires || 0) < Date.now())
     return res.send(approvalPage('Link expired', `<div class="sub">This link has expired. Ask Yajna to resend the approval.</div>`));
@@ -1279,12 +1289,13 @@ app.post('/approve/:token', express.urlencoded({ extended: false }), (req, res) 
   const today = todayISO(), now = Date.now();
   const who = h.doctor || 'Doctor';
   if (decision === 'approve') {
-    db.prepare("UPDATE margin_offers SET approved_by=?, approved_at=?, approval_hash=NULL WHERE id=?").run(who, now, o.id);
-    pushOfferAction(o, 'note', `Approved by ${who} over WhatsApp${note ? ' — ' + note : ''}`, today, who);
-    const fresh = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(o.id);
-    const r = applyOffer(fresh, who, who);   // approval IS the go-ahead — it lands immediately
-    if (r.error) return res.send(approvalPage(esc(h.name), `<div class="sub">Approved, but it could not be applied: ${esc(r.error)}. Yajna has the approval on record and will resolve it.</div>`));
-    return res.send(approvalPage(esc(h.name), `<div class="sub">Done. The Item Master now carries ₹${N(fresh.new_nr)} per strip, recorded as approved by you.</div><div class="btns"><div class="done">✓ Approved &amp; applied</div></div>`));
+    if (!req.body.agree) return res.send(approvalPage(esc(h.name), `<div class="sub">Tick "I agree to the revised purchase rate" and press Approve again — the tick is your sign-off.</div>`));
+    /* The doctor's yes moves the offer to ACCEPTED. The Item Master itself moves
+       when the manager applies it — approval is the doctor's decision, applying
+       is Yajna's act, and the log shows both hands. */
+    db.prepare("UPDATE margin_offers SET status='accepted', approved_by=?, approved_at=?, approval_hash=NULL WHERE id=?").run(who, now, o.id);
+    pushOfferAction(o, 'accepted', `Approved by ${who} over WhatsApp${note ? ' — ' + note : ''}`, today, who);
+    return res.send(approvalPage(esc(h.name), `<div class="sub">Recorded, thank you. Yajna will now add ₹${N(o.new_nr)} per strip to the Item Master.</div><div class="btns"><div class="done">✓ Approved</div></div>`));
   }
   if (decision === 'decline') {
     if (!note) return res.send(approvalPage(esc(h.name), `<div class="sub">A declined price needs a word on why — go back and add a note.</div>`));

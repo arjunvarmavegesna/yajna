@@ -756,6 +756,7 @@ function buildSeed(){
 
 /* two offers per hospital so the tracker shows what it is for: one being chased
    and overdue, one accepted and waiting to be applied */
+const doctorOf = hid=> (db.hospitals[hid]||{}).doctor || 'Doctor';
 function seedOffers(hid){
   const T = todayISO(), r = rngFor('offers:'+hid), items = db.items[hid]||[];
   const pick = n=> items[Math.floor(r()*items.length)] || items[n] || null;
@@ -772,6 +773,7 @@ function seedOffers(hid){
       qtyCommit: 100*(n+1), validTill: addDays(T, 12-n*4),
       nextFollowUp: n===0? addDays(T,-2) : addDays(T,3),
       status: n===0? 'proposed':'accepted', notes: n===0? 'Rate holds only on a full-box commitment':'',
+      approvedBy: n===1? doctorOf(hid) : '', approvedAt: n===1? Date.now() : null,
       appliedAt:null, createdBy:'Bhagavan', createdAt:Date.now()
     };
   }).filter(Boolean);
@@ -3902,9 +3904,6 @@ function itemModal(it){
         const co = await api('/offers',{method:'POST', body:{hid:state.hospital, itemId:it.id, item:it.name,
           kind:'manual', newNr:nr, newMrp:mrp, negotiatedBy:state.user.name, offerDate:todayISO(), notes:note||'Price revision'}});
         db.offers[state.hospital].unshift(co.offer);
-        const ac = await api('/offers/'+co.offer.id+'/actions',{method:'POST', body:{type:'accepted', note:'Price revision from the Item Master'}});
-        Object.assign(co.offer, ac.offer);
-        db.offerActions[state.hospital] = (db.offerActions[state.hospital]||[]).filter(a=>a.offerId!==co.offer.id).concat(ac.actions);
         closeModal();
         await offerSendApproval(co.offer);
         renderItems(); return;
@@ -3953,7 +3952,7 @@ const offSaving = o=> (num(o.oldNr)-num(o.newNr)) * num(o.qtyCommit);
 const offGain = o=> offMargin(o.newNr,o.newMrp) - offMargin(o.oldNr,o.oldMrp);
 const offOverdue = o=> !!o.nextFollowUp && o.nextFollowUp <= todayISO() && ['proposed','accepted','awaiting'].includes(offEff(o));
 const OFF_CHIP = {proposed:'chip-amber', accepted:'chip-blue', awaiting:'chip-blue', applied:'chip-green', declined:'chip-gray', expired:'chip-red'};
-const OFF_LABEL = {proposed:'Proposed', accepted:'Accepted', awaiting:'With the doctor', applied:'Applied', declined:'Declined', expired:'Expired'};
+const OFF_LABEL = {proposed:'Proposed', accepted:'Doctor approved', awaiting:'With the doctor', applied:'Applied', declined:'Declined', expired:'Expired'};
 const OFF_FILTERS = [
   {id:'open',  t:'Open',      f:o=> ['proposed','accepted','awaiting'].includes(offEff(o))},
   {id:'due',   t:'Follow-up due', f:offOverdue},
@@ -3983,7 +3982,7 @@ function renderOffers(){
 
   $('#content').innerHTML = `
     <div class="kpis">
-      <div class="kpi"><div class="l">Offers on the table</div><div class="v num">${open.length}</div><div class="d">proposed or accepted, not yet applied</div></div>
+      <div class="kpi"><div class="l">Offers on the table</div><div class="v num">${open.length}</div><div class="d">proposed, with the doctor, or approved — not yet on the master</div></div>
       <div class="kpi"><div class="l">Worth if closed</div><div class="v num" style="color:var(--green)">${fmtRs(onTable)}</div><div class="d">rate cut × the quantity committed</div></div>
       <div class="kpi"><div class="l">Follow-ups due</div><div class="v num" style="color:${due?'var(--red)':'var(--green)'}">${due||'Nil'}</div><div class="d">${due? 'someone is waiting on us':'nothing overdue'}</div></div>
       <div class="kpi"><div class="l">Applied this month</div><div class="v num">${appliedThisMonth.length}</div><div class="d">${fmtRs(wonRs)} of buying price taken out</div></div>
@@ -4196,7 +4195,6 @@ function offerDetail(o){
         <button class="btn btn-sm" data-ofa="follow_up">Log a follow-up</button>
         <button class="btn btn-sm" data-ofa="revised">Rate revised</button>
         <button class="btn btn-sm" data-ofa="note">Note</button>
-        ${eff==='proposed'? `<button class="btn btn-sm" data-ofa="accepted">Accept</button>`:''}
         <button class="btn btn-sm" data-ofa="declined" style="color:var(--red);border-color:#E8C4C4">Decline</button>
       </div>`: eff==='expired'? `<p class="mini-note" style="margin-top:12px">This offer expired on ${fmtDateShort(o.validTill)}. If the vendor still honours it, reopen it with a fresh validity.</p>
         <div class="entry-bar" style="margin-top:8px"><button class="btn btn-sm" data-ofa="reopened">Reopen</button></div>`
@@ -4207,8 +4205,8 @@ function offerDetail(o){
       ${o.status!=='applied'? `<button class="btn" id="ofDel" style="color:var(--red);border-color:#E8C4C4">Delete</button>`:''}
       <span style="flex:1"></span>
       <button class="btn modal-x">Close</button>
-      ${o.approvedAt && o.status!=='applied'? `<button class="btn btn-primary" id="ofApply">Apply — approved by ${esc(o.approvedBy)}</button>`
-        : eff==='accepted'? `<button class="btn btn-primary" id="ofSendAppr">Send to doctor for approval</button>`
+      ${eff==='accepted'? `<button class="btn btn-primary" id="ofApply">Add to Item Master${o.approvedBy? ` — approved by ${esc(o.approvedBy)}`:''}</button>`
+        : eff==='proposed'? `<button class="btn btn-primary" id="ofSendAppr">Send to doctor for approval</button>`
         : eff==='awaiting'? `<button class="btn" id="ofSendAppr" title="A resend replaces the link — only the newest one works">Resend to doctor</button>`:''}
     </div>`);
   const sa = $('#ofSendAppr'); if(sa) sa.onclick = ()=> offerSendApproval(o);

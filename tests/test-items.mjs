@@ -46,10 +46,11 @@ r = await mgr.req('PATCH', '/items/' + itemId, { nr: 36, mrp: 58, note: 'negotia
 ok(r.status === 400 && r.data.code === 'needs_approval', 'a direct price edit is refused — the doctor approves prices now');
 await adm.req('PATCH', '/hospitals/mithra', { doctorPhone: '+91 90000 22222' });
 r = await mgr.req('POST', '/offers', { hid: 'mithra', itemId, item: 'Tab. Pantoprazole 40', kind: 'manual', newNr: 36, newMrp: 58, negotiatedBy: 'Ravi Teja', notes: 'negotiated with Sun Pharma' });
-await mgr.req('POST', `/offers/${r.data.offer.id}/actions`, { type: 'accepted' });
-const apr = await mgr.req('POST', `/offers/${r.data.offer.id}/request-approval`);
+const offId = r.data.offer.id;
+const apr = await mgr.req('POST', `/offers/${offId}/request-approval`);
 const aprTok = apr.data.url.split('/approve/')[1];
-await fetch('http://127.0.0.1:3061/approve/' + aprTok, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'decision=approve' });
+await fetch('http://127.0.0.1:3061/approve/' + aprTok, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'decision=approve&agree=1' });
+await mgr.req('POST', `/offers/${offId}/apply`);   // the doctor agreed; the manager adds it
 r = await adm.req('GET', '/items/' + itemId + '/history');
 ok(r.status === 200 && r.data.history.length === 1 && r.data.history[0].oldNr === 38 && r.data.history[0].newNr === 36, 'the approved change is on the item history');
 ok(r.data.history[0].note.includes('negotiated'), 'with the negotiation note');
