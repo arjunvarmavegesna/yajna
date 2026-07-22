@@ -110,6 +110,28 @@ CREATE INDEX IF NOT EXISTS idx_snap_h ON expiry_snapshots(hospital_id);
    it is chased, then accepted or declined, and only then does it touch the Item
    Master. The point is the FOLLOW-UP — an offer nobody chases is a discount lost,
    so who offered it, who is negotiating, and when it expires all live here. */
+/* Items seen on a purchase that the master does not know. They are NOT added —
+   they wait here for a manager, because "Rifaximn 550" is usually a typo of an
+   item we already have, and an auto-add would mint a phantom. */
+CREATE TABLE IF NOT EXISTS pending_items(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL,
+  name TEXT NOT NULL, name_key TEXT NOT NULL,
+  nr REAL DEFAULT 0, mrp REAL DEFAULT 0,
+  source_vendor TEXT DEFAULT '', first_date TEXT NOT NULL, last_date TEXT NOT NULL,
+  seen_count INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','matched','dismissed')),
+  matched_item_id TEXT, resolved_by TEXT DEFAULT '', resolved_at INTEGER,
+  created_at INTEGER NOT NULL,
+  UNIQUE(hospital_id, name_key)
+);
+/* A matched misspelling becomes an ALIAS: every future purchase carrying it
+   resolves straight to the real item — the same typo never asks twice. */
+CREATE TABLE IF NOT EXISTS item_aliases(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL,
+  alias_key TEXT NOT NULL, item_id TEXT NOT NULL,
+  created_by TEXT DEFAULT '', created_at INTEGER NOT NULL,
+  UNIQUE(hospital_id, alias_key)
+);
 CREATE TABLE IF NOT EXISTS margin_offers(
   id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL,
   item_id TEXT, item_name TEXT NOT NULL, molecule TEXT DEFAULT '', pack TEXT DEFAULT '',
@@ -585,7 +607,7 @@ app.get('/api/bootstrap', auth, (req, res) => {
     ? (allowed.length ? db.prepare(`SELECT * FROM hospitals WHERE id IN (${allowed.map(() => '?').join(',')})`).all(...allowed) : [])
     : db.prepare('SELECT * FROM hospitals').all();
   const hids = hs.map(h => h.id);
-  const out = { user: rowUser(req.user), hospitals: {}, vendors: {}, payments: {}, dailyData: {}, hvTracked: {}, reportPrefs: {}, notifications: [], items: {}, adjustments: {}, offers: {}, offerActions: {}, receivables: {}, recvActions: {}, snapshots: {}, periodData: {}, offerStates: OFFER_STATES, offerActionTypes: OFFER_ACTIONS, adjReasons: ADJ_REASONS, issueMethods: ISSUE_METHODS, bounceReasons: BOUNCE_REASONS, bounceActions: BOUNCE_ACTIONS, cashVarThreshold: CASH_VAR_THRESHOLD, partyTypes: PARTY_TYPES, receiptModes: RECEIPT_MODES, overrideValues: OVERRIDE_VALUES, adjThreshold: ADJ_THRESHOLD, overrideMaxDays: OVERRIDE_MAX_DAYS, overrideDefaultDays: OVERRIDE_DEFAULT_DAYS, aiEnabled: !!process.env.ANTHROPIC_API_KEY, waEnabled: waEnabled() };
+  const out = { user: rowUser(req.user), hospitals: {}, vendors: {}, payments: {}, dailyData: {}, hvTracked: {}, reportPrefs: {}, notifications: [], items: {}, adjustments: {}, pendingItems: {}, aliases: {}, offers: {}, offerActions: {}, receivables: {}, recvActions: {}, snapshots: {}, periodData: {}, offerStates: OFFER_STATES, offerActionTypes: OFFER_ACTIONS, adjReasons: ADJ_REASONS, issueMethods: ISSUE_METHODS, bounceReasons: BOUNCE_REASONS, bounceActions: BOUNCE_ACTIONS, cashVarThreshold: CASH_VAR_THRESHOLD, partyTypes: PARTY_TYPES, receiptModes: RECEIPT_MODES, overrideValues: OVERRIDE_VALUES, adjThreshold: ADJ_THRESHOLD, overrideMaxDays: OVERRIDE_MAX_DAYS, overrideDefaultDays: OVERRIDE_DEFAULT_DAYS, aiEnabled: !!process.env.ANTHROPIC_API_KEY, waEnabled: waEnabled() };
   for (const h of hs) {
     out.hospitals[h.id] = rowHosp(h);
     out.vendors[h.id] = db.prepare('SELECT * FROM vendors WHERE hospital_id=? ORDER BY name').all(h.id).map(rowVendor);
@@ -599,6 +621,8 @@ app.get('/api/bootstrap', auth, (req, res) => {
     out.hvTracked[h.id] = hv ? JSON.parse(hv.drugs) : [];
     out.items[h.id] = db.prepare('SELECT * FROM items WHERE hospital_id=? ORDER BY name').all(h.id).map(rowItem);
     out.adjustments[h.id] = db.prepare('SELECT * FROM stock_adjustments WHERE hospital_id=? ORDER BY date DESC, created_at DESC').all(h.id).map(rowAdj);
+    out.pendingItems[h.id] = db.prepare("SELECT * FROM pending_items WHERE hospital_id=? ORDER BY status='pending' DESC, last_date DESC").all(h.id).map(rowPending);
+    out.aliases[h.id] = db.prepare('SELECT * FROM item_aliases WHERE hospital_id=?').all(h.id).map(rowAlias);
     out.offers[h.id] = db.prepare('SELECT * FROM margin_offers WHERE hospital_id=? ORDER BY offer_date DESC, created_at DESC').all(h.id).map(o => rowOffer(o, todayISO()));
     out.offerActions[h.id] = db.prepare('SELECT * FROM margin_offer_actions WHERE hospital_id=? ORDER BY action_date, at').all(h.id).map(rowOfferAction);
     {
@@ -670,22 +694,38 @@ app.put('/api/entries/:hid/:date', auth, (req, res) => {
     db.prepare('INSERT INTO hv_tracked(hospital_id,drugs) VALUES(?,?) ON CONFLICT(hospital_id) DO UPDATE SET drugs=excluded.drugs')
       .run(hid, JSON.stringify(drugs));
 
-    // item master: auto-register unknown invoice items; margin-tally known ones
-    const itemsAdded = [];
+    /* Unknown invoice items are NOT auto-added any more (Arjun, Jul 22): a typo
+       or a case slip would mint a duplicate. They queue as PENDING for a manager
+       to approve as new — or match to the item they actually are, which leaves
+       an alias so the same spelling resolves itself forever after. */
+    const itemsAdded = [];      // kept in the response shape; nothing lands here from invoices now
+    const pendingTouched = [];
     const marginAlerts = [];
     const findItem = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
+    const findAlias = db.prepare('SELECT i.* FROM item_aliases a JOIN items i ON i.id=a.item_id WHERE a.hospital_id=? AND a.alias_key=?');
     for (const inv of entry.invoices) {
       for (const l of inv.lines) {
         const name = (l.item || '').trim();
         if (!name) continue;
         const key = nameKey(name);
-        const existing = findItem.get(hid, key);
+        const existing = findItem.get(hid, key) || findAlias.get(hid, key);
         if (!existing) {
-          if (N(l.nr) > 0 && N(l.mrp) > 0) {
-            const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack: '', nr: N(l.nr), mrp: N(l.mrp), source: 'invoice', updated_at: savedAt };
-            db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
-              .run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.source, it.updated_at);
-            itemsAdded.push(rowItem(it));
+          const pend = db.prepare('SELECT * FROM pending_items WHERE hospital_id=? AND name_key=?').get(hid, key);
+          if (pend) {
+            // seen again — bump the count, keep the LATEST rates, and reopen a
+            // dismissed one (it is clearly still being bought)
+            db.prepare(`UPDATE pending_items SET seen_count=seen_count+1, last_date=?, nr=?, mrp=?,
+              source_vendor=?, status=CASE WHEN status='dismissed' THEN 'pending' ELSE status END WHERE id=?`)
+              .run(date, N(l.nr) || pend.nr, N(l.mrp) || pend.mrp, inv.vendor || pend.source_vendor, pend.id);
+            pendingTouched.push(pend.id);
+          } else {
+            const pi = { id: uid('pi'), hospital_id: hid, name, name_key: key, nr: N(l.nr), mrp: N(l.mrp),
+              source_vendor: inv.vendor || '', first_date: date, last_date: date, seen_count: 1,
+              status: 'pending', created_at: savedAt };
+            db.prepare(`INSERT INTO pending_items(id,hospital_id,name,name_key,nr,mrp,source_vendor,first_date,last_date,seen_count,status,created_at)
+              VALUES(?,?,?,?,?,?,?,?,?,1,'pending',?)`)
+              .run(pi.id, pi.hospital_id, pi.name, pi.name_key, pi.nr, pi.mrp, pi.source_vendor, pi.first_date, pi.last_date, pi.created_at);
+            pendingTouched.push(pi.id);
           }
         } else if (N(l.nr) > 0 && N(l.mrp) > 0) {
           const lineM = marginPct(l.nr, l.mrp);
@@ -707,7 +747,10 @@ app.put('/api/entries/:hid/:date', auth, (req, res) => {
         .run(n.id, n.type, n.hospital_id, n.date, n.msg, n.ts);
       return rowNotif(n);
     });
-    return { vendorsAdded, itemsAdded, notifications, hvTracked: drugs };
+    const pendingItems = pendingTouched.length
+      ? db.prepare(`SELECT * FROM pending_items WHERE id IN (${pendingTouched.map(() => '?').join(',')})`).all(...pendingTouched).map(rowPending)
+      : [];
+    return { vendorsAdded, itemsAdded, pendingItems, notifications, hvTracked: drugs };
   });
 
   const r = tx();
@@ -805,7 +848,7 @@ const CLEAR_TARGETS = {
   adjustments: { t: 'Stock adjustments', ranged: true, tables: ['stock_adjustments'] },
   snapshots:   { t: 'Imported stock reports', ranged: true, tables: ['expiry_snapshots'] },
   receivables: { t: 'Receivables', ranged: true, tables: ['receivables', 'receivable_actions'] },
-  items:       { t: 'Item Master', ranged: false, tables: ['items', 'price_log'] },
+  items:       { t: 'Item Master', ranged: false, tables: ['items', 'price_log', 'pending_items', 'item_aliases'] },
   vendors:     { t: 'Vendors', ranged: false, tables: ['vendors'] },
   periods:     { t: 'Weekly / monthly entered sections', ranged: false, tables: ['period_data'] }
 };
@@ -888,7 +931,7 @@ app.post('/api/clear', auth, requireRole('admin'), (req, res) => {
 /* Every table a hospital owns. Deleting the hospital takes all of it — this is
    the single most destructive thing in the app, so the list is explicit rather
    than inferred, and the impact is countable before anything happens. */
-const HOSPITAL_TABLES = ['entries', 'notifications', 'vendors', 'payments', 'items', 'price_log',
+const HOSPITAL_TABLES = ['entries', 'notifications', 'vendors', 'payments', 'items', 'price_log', 'pending_items', 'item_aliases',
   'stock_adjustments', 'receivables', 'receivable_actions', 'expiry_snapshots', 'period_data',
   'hv_tracked', 'report_prefs'];
 
@@ -1404,6 +1447,81 @@ app.delete('/api/offers/:id', auth, requireRole('admin'), (req, res) => {
   db.prepare('DELETE FROM margin_offer_actions WHERE offer_id=?').run(o.id);
   db.prepare('DELETE FROM margin_offers WHERE id=?').run(o.id);
   res.json({ ok: true, id: o.id });
+});
+
+const rowPending = (p) => ({ id: p.id, hid: p.hospital_id, name: p.name, key: p.name_key,
+  nr: N(p.nr), mrp: N(p.mrp), vendor: p.source_vendor || '', firstDate: p.first_date, lastDate: p.last_date,
+  seen: p.seen_count, status: p.status, matchedItemId: p.matched_item_id || null,
+  resolvedBy: p.resolved_by || '', resolvedAt: p.resolved_at || null });
+const rowAlias = (a) => ({ id: a.id, aliasKey: a.alias_key, itemId: a.item_id, by: a.created_by || '', at: a.created_at });
+
+/* ---------- pending items: the manager's gate onto the Item Master ----------
+   Approve = it really is a new item, put it on the master.
+   Match   = it is a misspelling of one we have — leave an alias so this exact
+             spelling resolves itself on every future purchase, and the ledger
+             (which derives) immediately re-counts the old lines under the real
+             item. Nothing saved is rewritten.
+   Dismiss = junk row; it reopens by itself if it is ever bought again. */
+app.post('/api/pending-items/:id/approve', auth, requireRole('admin'), (req, res) => {
+  const pi = db.prepare('SELECT * FROM pending_items WHERE id=?').get(req.params.id);
+  if (!pi) return res.status(404).json({ error: 'Not found' });
+  scopeCheck(req, pi.hospital_id);
+  if (pi.status !== 'pending') return res.status(400).json({ error: 'Already resolved — reload' });
+  const b = req.body || {};
+  const name = S(b.name, 150).trim() || pi.name;
+  const nr = b.nr !== undefined ? N(b.nr) : N(pi.nr);
+  const mrp = b.mrp !== undefined ? N(b.mrp) : N(pi.mrp);
+  if (nr <= 0 || mrp <= 0) return res.status(400).json({ error: 'The master needs a positive NR and MRP — fill them in before approving' });
+  if (nr > mrp) return res.status(400).json({ error: 'NR cannot exceed MRP' });
+  const key = nameKey(name);
+  if (db.prepare('SELECT 1 FROM items WHERE hospital_id=? AND name_key=?').get(pi.hospital_id, key))
+    return res.status(409).json({ error: 'That name is already on the master — use Match instead' });
+  const now = Date.now();
+  const it = { id: uid('it'), hospital_id: pi.hospital_id, name, name_key: key, pack: S(b.pack, 60),
+    nr, mrp, molecule: S(b.molecule, 150).trim(), source: 'purchase', updated_at: now };
+  const tx = db.transaction(() => {
+    db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,source,updated_at,molecule) VALUES(?,?,?,?,?,?,?,?,?,?)')
+      .run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.source, it.updated_at, it.molecule);
+    // approving under a corrected spelling: the PURCHASED spelling still needs to
+    // resolve, so it becomes an alias of the new item
+    if (key !== pi.name_key)
+      db.prepare('INSERT OR IGNORE INTO item_aliases(id,hospital_id,alias_key,item_id,created_by,created_at) VALUES(?,?,?,?,?,?)')
+        .run(uid('al'), pi.hospital_id, pi.name_key, it.id, req.user.name, now);
+    db.prepare("UPDATE pending_items SET status='approved', matched_item_id=?, resolved_by=?, resolved_at=? WHERE id=?")
+      .run(it.id, req.user.name, now, pi.id);
+  });
+  tx();
+  const aliases = db.prepare('SELECT * FROM item_aliases WHERE hospital_id=?').all(pi.hospital_id).map(rowAlias);
+  res.json({ item: rowItem(it), pending: rowPending(db.prepare('SELECT * FROM pending_items WHERE id=?').get(pi.id)), aliases });
+});
+
+app.post('/api/pending-items/:id/match', auth, requireRole('admin'), (req, res) => {
+  const pi = db.prepare('SELECT * FROM pending_items WHERE id=?').get(req.params.id);
+  if (!pi) return res.status(404).json({ error: 'Not found' });
+  scopeCheck(req, pi.hospital_id);
+  if (pi.status !== 'pending') return res.status(400).json({ error: 'Already resolved — reload' });
+  const it = db.prepare('SELECT * FROM items WHERE id=? AND hospital_id=?').get(S(req.body && req.body.itemId, 60), pi.hospital_id);
+  if (!it) return res.status(400).json({ error: 'Pick the master item this really is' });
+  const now = Date.now();
+  const tx = db.transaction(() => {
+    db.prepare('INSERT OR IGNORE INTO item_aliases(id,hospital_id,alias_key,item_id,created_by,created_at) VALUES(?,?,?,?,?,?)')
+      .run(uid('al'), pi.hospital_id, pi.name_key, it.id, req.user.name, now);
+    db.prepare("UPDATE pending_items SET status='matched', matched_item_id=?, resolved_by=?, resolved_at=? WHERE id=?")
+      .run(it.id, req.user.name, now, pi.id);
+  });
+  tx();
+  const aliases = db.prepare('SELECT * FROM item_aliases WHERE hospital_id=?').all(pi.hospital_id).map(rowAlias);
+  res.json({ pending: rowPending(db.prepare('SELECT * FROM pending_items WHERE id=?').get(pi.id)), aliases, item: rowItem(it) });
+});
+
+app.post('/api/pending-items/:id/dismiss', auth, requireRole('admin'), (req, res) => {
+  const pi = db.prepare('SELECT * FROM pending_items WHERE id=?').get(req.params.id);
+  if (!pi) return res.status(404).json({ error: 'Not found' });
+  scopeCheck(req, pi.hospital_id);
+  if (pi.status !== 'pending') return res.status(400).json({ error: 'Already resolved — reload' });
+  db.prepare("UPDATE pending_items SET status='dismissed', resolved_by=?, resolved_at=? WHERE id=?")
+    .run(req.user.name, Date.now(), pi.id);
+  res.json({ pending: rowPending(db.prepare('SELECT * FROM pending_items WHERE id=?').get(pi.id)) });
 });
 
 /* ---------- procurement price history ----------

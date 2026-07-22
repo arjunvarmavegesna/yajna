@@ -69,7 +69,7 @@ ok(typeof boot.aiEnabled === 'boolean', 'bootstrap reports aiEnabled flag');
 console.log('— invoice margin tally on entry save —');
 // master: Pantoprazole nr36/mrp58 → margin 37.9%. Invoice line at nr48/mrp58 → 17.2% → LOW → alert.
 // Ceftriaxone nr42/mrp66 → 36.4%. Invoice line nr42.5/mrp66 → 35.6% → within 2pp → no alert.
-// "Brand New Drug" unknown → auto-added to master.
+// "Brand New Drug" unknown → QUEUES as pending (Jul 22: no more auto-add — a typo would mint a phantom).
 const entry = {
   purchases: [{ vendor: 'Sun Pharma Distributors', items: 3, value: 5000 }],
   rtv: [], sales: { mrp: 9000, cogs: 6000, cash: 5000, credit: 4000, cancels: 0 },
@@ -82,7 +82,8 @@ const entry = {
 };
 r = await stf.req('PUT', `/entries/mithra/${T}`, { entry });
 ok(r.status === 200, 'entry with invoices saved');
-ok(r.data.itemsAdded.length === 1 && r.data.itemsAdded[0].name === 'Brand New Drug 10', 'unknown invoice item auto-added to master');
+ok(r.data.itemsAdded.length === 0, 'unknown invoice item is NOT auto-added any more');
+ok(r.data.pendingItems.length === 1 && r.data.pendingItems[0].name === 'Brand New Drug 10', 'it queues as pending for the manager instead', JSON.stringify(r.data.pendingItems));
 const marginNs = r.data.notifications.filter(n => n.type === 'margin');
 ok(marginNs.length === 1, 'exactly one margin alert (only the real mismatch)', r.data.notifications.map(n=>n.type));
 ok(marginNs[0].msg.includes('Pantoprazole') && marginNs[0].msg.includes('SP-991'), 'alert names the item and invoice', marginNs[0].msg);
@@ -93,7 +94,8 @@ ok(r.data.notifications.filter(n => n.type === 'margin').length === 0, 're-save 
 ok(r.data.itemsAdded.length === 0, 'item not duplicated on re-save');
 boot = (await stf.req('GET', '/bootstrap')).data;
 ok(boot.dailyData.mithra[T].invoices.length === 1 && boot.dailyData.mithra[T].invoices[0].lines.length === 3, 'invoices persist in the entry');
-ok(boot.items.mithra.some(i => i.name === 'Brand New Drug 10' && i.source === 'invoice'), 'auto-added item in bootstrap with invoice source');
+ok(!boot.items.mithra.some(i => i.name === 'Brand New Drug 10'), 'the unknown item is NOT on the master');
+ok(boot.pendingItems.mithra.some(p => p.name === 'Brand New Drug 10' && p.status === 'pending'), 'it sits in the pending queue in bootstrap');
 
 console.log('— AI endpoints guardrails —');
 const fd = new FormData();

@@ -111,6 +111,16 @@ body.nav-collapsed .sb-toggle svg{transform:rotate(180deg)}
 .nav-sub .nsx:hover{background:rgba(255,90,90,.28);color:#fff}
 .nav-sub .nsadd{color:rgba(255,255,255,.7);font-weight:600}
 body.nav-collapsed .nav-sub{display:none}
+.drawer-veil{position:fixed;inset:0;background:rgba(15,25,20,.35);z-index:80;opacity:0;transition:opacity .18s}
+.drawer-veil.on{opacity:1}
+.drawer{position:fixed;top:0;right:-480px;width:min(470px,94vw);height:100%;background:var(--card,#fff);z-index:81;box-shadow:-6px 0 28px rgba(0,0,0,.14);transition:right .22s ease;display:flex;flex-direction:column}
+.drawer.on{right:0}
+.drawer-head{display:flex;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid var(--border)}
+.drawer-head h3{margin:0;font-size:16px}
+.drawer-body{flex:1;overflow-y:auto;padding:14px 18px}
+.pend-card{border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:12px;background:#FDFDFB}
+.pend-card .sugg{display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--border);border-radius:8px;margin-top:6px;background:#fff}
+.pend-card .sugg:hover{border-color:var(--green)}
 .sb-user{padding:14px 16px;border-top:1px solid rgba(255,255,255,.12)}
 .sb-user .u{display:flex;align-items:center;gap:10px;margin-bottom:10px}
 .avatar{width:34px;height:34px;border-radius:50%;background:var(--green-light);color:var(--green-dark);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;flex:none}
@@ -549,7 +559,7 @@ const RTV_STATUS = ['Pending','Received','Disputed'];
 const BOUNCE_MOLECULES = {'Tab. Rifaximin 550':'Rifaximin','Inj. Pantoprazole 40':'Pantoprazole','Syp. Lactulose 200ml':'Lactulose','Tab. UDCA 300':'Ursodeoxycholic acid','Inj. Ceftriaxone 1g':'Ceftriaxone','Tab. Ecosprin AV 75':'Aspirin + Atorvastatin','Inj. Ondansetron 4mg':'Ondansetron','Cap. Pregabalin 75':'Pregabalin','Tab. Metformin 500':'Metformin','Inj. Tramadol 50':'Tramadol'};
 
 /* ---------------- db (populated from server in live mode, seeded in demo) ---------------- */
-const db = { hospitals:{}, dailyData:{}, vendors:{}, payments:{}, users:{}, userList:[], notifications:[], reportPrefs:{}, hvTracked:{}, items:{}, adjustments:{}, offers:{}, offerActions:{}, receivables:{}, recvActions:{}, snapshots:{}, periodData:{}, adjReasons:[], bounceReasons:[], bounceActions:[], cashVarThreshold:100, partyTypes:[], receiptModes:[], overrideValues:[], adjThreshold:5000, overrideMaxDays:45, overrideDefaultDays:15 };
+const db = { hospitals:{}, dailyData:{}, vendors:{}, payments:{}, users:{}, userList:[], notifications:[], reportPrefs:{}, hvTracked:{}, items:{}, adjustments:{}, pendingItems:{}, aliases:{}, offers:{}, offerActions:{}, receivables:{}, recvActions:{}, snapshots:{}, periodData:{}, adjReasons:[], bounceReasons:[], bounceActions:[], cashVarThreshold:100, partyTypes:[], receiptModes:[], overrideValues:[], adjThreshold:5000, overrideMaxDays:45, overrideDefaultDays:15 };
 
 /* weekly / monthly manual report-section data */
 function periodGet(hid, ptype, pkey){
@@ -616,7 +626,12 @@ function calcLine(l){
     badMargin: mrp > 0 && tqty > 0 && nr > mrp};   // paid more than MRP — purchase error
 }
 const r2 = n => (Math.round(num(n)*100)/100).toLocaleString('en-IN',{minimumFractionDigits:2, maximumFractionDigits:2});
-function findItem(hid, name){ const k=nameKey(name); return (db.items[hid]||[]).find(i=>i.key===k) || null; }
+/* An alias is a spelling the manager has already ruled on — "this IS that item".
+   findItem and the stock ledger both resolve through it, so a recurring Marg
+   typo tallies, stocks and reorders as the real item without asking twice. */
+function aliasOf(hid, key){ const a=(db.aliases[hid]||[]).find(x=>x.aliasKey===key); return a? (db.items[hid]||[]).find(i=>i.id===a.itemId)||null : null; }
+function resolveKey(hid, key){ const it = aliasOf(hid, key); return it? it.key : key; }
+function findItem(hid, name){ const k=nameKey(name); return (db.items[hid]||[]).find(i=>i.key===k) || aliasOf(hid, k) || null; }
 const MARGIN_TOL = 2; // percentage points, mirrors the server
 
 const ITEM_POOL = [
@@ -1096,6 +1111,7 @@ function applyBootstrap(b){
   db.items = b.items||{}; db.periodData = b.periodData||{};
   db.adjustments = b.adjustments||{}; db.adjReasons = b.adjReasons||[];
   db.offers = b.offers||{}; db.offerActions = b.offerActions||{};
+  db.pendingItems = b.pendingItems||{}; db.aliases = b.aliases||{};
   db.offerStates = b.offerStates||[]; db.offerActionTypes = b.offerActionTypes||[];
   db.bounceReasons = b.bounceReasons||[]; db.bounceActions = b.bounceActions||[]; db.cashVarThreshold = b.cashVarThreshold ?? 100;
   db.receivables = b.receivables||{}; db.recvActions = b.recvActions||{}; db.snapshots = b.snapshots||{};
@@ -1105,7 +1121,7 @@ function applyBootstrap(b){
   Object.keys(db.hospitals).forEach(h=>{
     db.vendors[h]=db.vendors[h]||[]; db.payments[h]=db.payments[h]||[];
     db.dailyData[h]=db.dailyData[h]||{}; db.hvTracked[h]=db.hvTracked[h]||[];
-    db.reportPrefs[h]=db.reportPrefs[h]||{}; db.items[h]=db.items[h]||[]; db.adjustments[h]=db.adjustments[h]||[]; db.offers[h]=db.offers[h]||[]; db.offerActions[h]=db.offerActions[h]||[]; db.receivables[h]=db.receivables[h]||[]; db.recvActions[h]=db.recvActions[h]||[]; db.snapshots[h]=db.snapshots[h]||[];
+    db.reportPrefs[h]=db.reportPrefs[h]||{}; db.items[h]=db.items[h]||[]; db.adjustments[h]=db.adjustments[h]||[]; db.offers[h]=db.offers[h]||[]; db.offerActions[h]=db.offerActions[h]||[]; db.pendingItems[h]=db.pendingItems[h]||[]; db.aliases[h]=db.aliases[h]||[]; db.receivables[h]=db.receivables[h]||[]; db.recvActions[h]=db.recvActions[h]||[]; db.snapshots[h]=db.snapshots[h]||[];
     db.periodData[h]=db.periodData[h]||{weekly:{},monthly:{}};
   });
 }
@@ -1391,7 +1407,9 @@ function ledgerSig(hid){
   // adjustments are hashed by CONTENT, not counted: swapping an expiry write-off
   // for a damage write-off leaves the count identical but changes every figure
   const adj = hashStr((db.adjustments[hid]||[]).map(a=> a.id+':'+a.qty+':'+a.reason+':'+a.date+':'+a.key).join(','));
-  return `${n}:${saved}:${(db.items[hid]||[]).length}:${iv}:${adj}:${stockDateOf(hid)}:${issueMethodOf(hid)}`;
+  // a new alias re-routes old purchase lines to the real item — the ledger must rebuild
+  const al = hashStr((db.aliases[hid]||[]).map(a=> a.aliasKey+'>'+a.itemId).join(','));
+  return `${n}:${saved}:${(db.items[hid]||[]).length}:${iv}:${adj}:${al}:${stockDateOf(hid)}:${issueMethodOf(hid)}`;
 }
 const monthEndOf = (ym)=>{ const [y,m] = ym.split('-').map(Number); return new Date(Date.UTC(y, m, 0)).toISOString().slice(0,10); };
 const ISSUE_ORDER_LABEL = {fefo:'FEFO — first expiry, first out', fifo:'FIFO — first in, first out'};
@@ -1542,7 +1560,7 @@ function stockLedger(hid){
   };
 
   events.forEach(ev=>{
-    const key = nameKey(ev.item);
+    const key = resolveKey(hid, nameKey(ev.item));
     if(ev.kind==='purchase'){
       const d = calcLine(ev.line);
       const bn = String(ev.line.batch||'').trim();
@@ -3116,6 +3134,11 @@ async function saveEntry(e){
     e.savedAt = r.savedAt;
     (r.vendorsAdded||[]).forEach(v=> db.vendors[hid].push(v));
     (r.itemsAdded||[]).forEach(it=> db.items[hid].push(it));
+    (r.pendingItems||[]).forEach(pi=>{
+      db.pendingItems[hid] = db.pendingItems[hid]||[];
+      const ix = db.pendingItems[hid].findIndex(x=>x.id===pi.id);
+      if(ix>=0) db.pendingItems[hid][ix] = pi; else db.pendingItems[hid].unshift(pi);
+    });
     db.hvTracked[hid] = r.hvTracked || db.hvTracked[hid];
     db.notifications = db.notifications.filter(n=> !(n.hid===hid && n.date===date && ['variance','unbilled','hv','margin','cashdrawer'].includes(n.type)));
     (r.notifications||[]).forEach(n=> db.notifications.unshift(n));
@@ -4023,6 +4046,7 @@ function renderItems(){
   const hid = state.hospital;
   const canEdit = state.user.role==='admin';
   const all = db.items[hid]||[];
+  const pendCount = (db.pendingItems[hid]||[]).filter(p=>p.status==='pending').length;
   const q = nameKey(state.itemQuery);
   const list = (q? all.filter(it=> it.key.includes(q)) : all).slice(0, 400);
   const avgM = all.length? all.reduce((a,it)=>a+marginPct(it.nr,it.mrp),0)/all.length : 0;
@@ -4032,6 +4056,7 @@ function renderItems(){
       <input class="in" id="itmSearch" placeholder="Search items…" value="${esc(state.itemQuery)}" style="width:220px">
       <span class="eyebrow">${all.length} items · avg margin ${pct(avgM)}</span>
       <span style="flex:1"></span>
+      ${canEdit && pendCount? `<button class="btn btn-sm" id="itmPending" style="border-color:var(--amber);color:var(--amber);font-weight:700">${pendCount} new from purchases</button>`:''}
       ${canEdit? `<button class="btn btn-sm" id="itmTplTop" title="The item-master sheet — product, pack size, net rate and MRP per single strip">${IC.dl} Template</button>
       <button class="btn btn-sm" id="itmImport">${IC.up} Import</button>
       <button class="btn btn-sm btn-primary" id="itmAdd">${IC.plus} Add item</button>`:''}
@@ -4061,7 +4086,167 @@ function renderItems(){
   const ia=$('#itmAdd'); if(ia) ia.onclick=()=> itemModal(null);
   const ii=$('#itmImport'); if(ii) ii.onclick=()=> itemImportModal(hid);
   const itt=$('#itmTplTop'); if(itt) itt.onclick=()=> downloadTemplate('items', 'Item Master');
+  const ipd=$('#itmPending'); if(ipd) ipd.onclick=()=> pendingDrawer(hid);
   $$('[data-iedit]').forEach(b=> b.onclick=()=> itemModal((db.items[hid]||[]).find(x=>x.id===b.dataset.iedit)));
+}
+
+/* ---------------- pending items: the gate onto the master ----------------
+   A purchased name the master does not know sits here until a manager rules on
+   it. The whole point is the MATCH path: "Rifaximn 550" is almost never a new
+   medicine — it is a typo of one we already have, and matching it leaves an
+   alias so that exact spelling never asks again. */
+
+/* similarity for the suggestions: shared tokens first, then plain edit distance
+   on the normalized names — cheap, deterministic, and good enough to put the
+   right item in the top three */
+function editDist(a, b){
+  const m = a.length, n = b.length;
+  if(Math.abs(m-n) > 6) return 99;
+  const d = Array.from({length:m+1}, (_,i)=> [i, ...Array(n).fill(0)]);
+  for(let j=0;j<=n;j++) d[0][j]=j;
+  for(let i=1;i<=m;i++) for(let j=1;j<=n;j++)
+    d[i][j] = Math.min(d[i-1][j]+1, d[i][j-1]+1, d[i-1][j-1] + (a[i-1]===b[j-1]?0:1));
+  return d[m][n];
+}
+function pendingSuggestions(hid, name){
+  const nk = nameKey(name).replace(/[^a-z0-9 ]/g,'');
+  const toks = new Set(nk.split(/\s+/).filter(Boolean));
+  return (db.items[hid]||[]).map(it=>{
+    const ik = it.key.replace(/[^a-z0-9 ]/g,'');
+    const itoks = ik.split(/\s+/).filter(Boolean);
+    const shared = itoks.filter(t=> toks.has(t)).length;
+    const dist = editDist(nk, ik);
+    return {it, score: shared*10 - dist};
+  }).filter(x=> x.score > -8)
+    .sort((a,z)=> z.score - a.score)
+    .slice(0,3).map(x=> x.it);
+}
+
+function closeDrawer(){ $$('.drawer-veil,.drawer').forEach(el=> el.remove()); }
+function pendingDrawer(hid){
+  closeDrawer();
+  document.body.insertAdjacentHTML('beforeend', `<div class="drawer-veil"></div><div class="drawer" id="pendDrawer"></div>`);
+  requestAnimationFrame(()=> $$('.drawer-veil,.drawer').forEach(el=> el.classList.add('on')));
+  document.querySelector('.drawer-veil').onclick = closeDrawer;
+  drawPending(hid);
+}
+function drawPending(hid){
+  const host = $('#pendDrawer'); if(!host) return;
+  const pend = (db.pendingItems[hid]||[]).filter(p=>p.status==='pending');
+  host.innerHTML = `
+    <div class="drawer-head"><h3>New items from purchases</h3><span class="chip chip-amber">${pend.length}</span>
+      <span style="flex:1"></span><button class="btn btn-sm" id="pendClose">✕</button></div>
+    <div class="drawer-body">
+      <p class="mini-note" style="margin-top:0">Bought on an invoice but not on the Item Master. Most of these are a spelling or case slip of an item you already have — <b>Match</b> it and that spelling resolves itself on every future purchase. Only genuinely new medicines get <b>Approve as new</b>.</p>
+      ${pend.map(p=>{
+        const m = p.mrp>0? marginPct(p.nr, p.mrp) : 0;
+        const suggs = pendingSuggestions(hid, p.name);
+        return `<div class="pend-card">
+          <div style="display:flex;align-items:baseline;gap:8px"><b>${esc(p.name)}</b>
+            <span class="eyebrow" style="font-weight:400">${esc(p.vendor||'—')} · seen ${p.seen}× · ${fmtDateShort(p.lastDate)}</span></div>
+          <div class="num" style="font-size:12.5px;color:var(--muted);margin:3px 0 4px">NR ${p.nr? r2(p.nr):'—'} · MRP ${p.mrp? r2(p.mrp):'—'}${p.mrp>0? ` · margin ${pct(m)}`:''}</div>
+          ${suggs.length? `<div class="eyebrow">Is it one of these?</div>
+            ${suggs.map(it=>`<div class="sugg"><span style="flex:1"><b>${esc(it.name)}</b> <span style="color:var(--faint);font-size:11.5px">${esc(it.pack||'')} · NR ${it.nr}</span></span>
+              <button class="btn btn-sm btn-primary" data-pmatch="${esc(p.id)}" data-pitem="${esc(it.id)}">Match</button></div>`).join('')}` : ''}
+          <div style="display:flex;gap:8px;margin-top:9px">
+            <button class="btn btn-sm" data-pother="${esc(p.id)}">Match another…</button>
+            <span style="flex:1"></span>
+            <button class="btn btn-sm" data-pdism="${esc(p.id)}" title="Junk row — it reopens by itself if bought again">Dismiss</button>
+            <button class="btn btn-sm btn-primary" data-pappr="${esc(p.id)}">Approve as new</button>
+          </div>
+        </div>`;
+      }).join('') || `<p class="mini-note">Nothing waiting — every purchased item is on the master.</p>`}
+    </div>`;
+  $('#pendClose').onclick = closeDrawer;
+  const findP = id=> (db.pendingItems[hid]||[]).find(x=>x.id===id);
+  $$('[data-pmatch]',host).forEach(b=> b.onclick = ()=> pendMatch(hid, findP(b.dataset.pmatch), b.dataset.pitem));
+  $$('[data-pother]',host).forEach(b=> b.onclick = ()=> pendMatchPicker(hid, findP(b.dataset.pother)));
+  $$('[data-pappr]',host).forEach(b=> b.onclick = ()=> pendApproveModal(hid, findP(b.dataset.pappr)));
+  $$('[data-pdism]',host).forEach(b=> b.onclick = async ()=>{
+    const p = findP(b.dataset.pdism);
+    if(state.demo){ p.status='dismissed'; drawPending(hid); renderItems(); return; }
+    try{ const r = await api('/pending-items/'+p.id+'/dismiss',{method:'POST'}); Object.assign(p, r.pending); drawPending(hid); renderItems(); }
+    catch(err){ toast(err.message,'red'); }
+  });
+}
+
+async function pendMatch(hid, p, itemId){
+  if(!p) return;
+  const it = (db.items[hid]||[]).find(x=>x.id===itemId);
+  if(!it) return;
+  if(!confirm(`"${p.name}" IS "${it.name}"?\n\nEvery purchase carrying that spelling — past and future — will count under ${it.name}. The ledger re-derives, so the old lines move over by themselves.`)) return;
+  if(state.demo){
+    p.status='matched'; p.matchedItemId=it.id;
+    db.aliases[hid].push({id:'al'+Date.now(), aliasKey:p.key, itemId:it.id, by:state.user.name, at:Date.now()});
+    toast(`Matched — "${p.name}" now resolves to ${it.name} (demo)`,'green');
+    drawPending(hid); renderItems(); return;
+  }
+  try{
+    const r = await api('/pending-items/'+p.id+'/match',{method:'POST', body:{itemId:it.id}});
+    Object.assign(p, r.pending);
+    db.aliases[hid] = r.aliases;
+    toast(`Matched — "${p.name}" resolves to ${it.name} from now on, and past lines re-count under it`,'green');
+    drawPending(hid); renderItems();
+  }catch(err){ toast(err.message,'red'); }
+}
+
+function pendMatchPicker(hid, p){
+  if(!p) return;
+  openModal(`
+    <div class="modal-head"><h3>Match "${esc(p.name)}" to…</h3><button class="modal-x">✕</button></div>
+    <div class="modal-body">
+      <datalist id="pmList">${(db.items[hid]||[]).slice(0,500).map(i=>`<option value="${esc(i.name)}">`).join('')}</datalist>
+      <div class="field"><label>The item this really is</label><input class="in" id="pmName" list="pmList" placeholder="Start typing…"></div>
+      <p class="mini-note">Matching leaves an alias: this exact spelling resolves to the chosen item on every purchase, past and future. Nothing saved is rewritten — the ledger re-derives.</p>
+    </div>
+    <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn btn-primary" id="pmGo">Match</button></div>`);
+  $('#pmGo').onclick = ()=>{
+    const it = (db.items[hid]||[]).find(x=> x.name.toLowerCase()===$('#pmName').value.trim().toLowerCase());
+    if(!it){ toast('Pick an item from the master','red'); return; }
+    closeModal(); pendMatch(hid, p, it.id);
+  };
+}
+
+function pendApproveModal(hid, p){
+  if(!p) return;
+  openModal(`
+    <div class="modal-head"><h3>Approve as a new item</h3><button class="modal-x">✕</button></div>
+    <div class="modal-body">
+      <div class="field"><label>Item name <span style="color:var(--faint);font-weight:400">— fix any spelling now; the purchased spelling still resolves here</span></label>
+        <input class="in" id="paName" value="${esc(p.name)}"></div>
+      <div class="grid2">
+        <div class="field"><label>Pack</label><input class="in" id="paPack" placeholder="10s / vial"></div>
+        <div class="field"><label>Molecule / salt</label><input class="in" id="paMol" placeholder="optional"></div>
+      </div>
+      <div class="grid2">
+        <div class="field"><label>Net rate ₹ / strip</label><input class="in num" type="number" min="0" step="0.01" id="paNr" value="${p.nr||''}"></div>
+        <div class="field"><label>MRP ₹ / strip</label><input class="in num" type="number" min="0" step="0.01" id="paMrp" value="${p.mrp||''}"></div>
+      </div>
+      <p class="mini-note">Rates prefilled from the invoice line that brought it in. From the next purchase every line tallies against these.</p>
+    </div>
+    <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn btn-primary" id="paGo">Add to Item Master</button></div>`);
+  $('#paGo').onclick = async ()=>{
+    const name = $('#paName').value.trim(), nr = num($('#paNr').value), mrp = num($('#paMrp').value);
+    if(!name){ toast('Item name is required','red'); return; }
+    if(nr<=0 || mrp<=0){ toast('The master needs a positive NR and MRP','red'); return; }
+    if(nr>mrp){ toast('NR cannot exceed MRP','red'); return; }
+    const body = {name, pack:$('#paPack').value.trim(), molecule:$('#paMol').value.trim(), nr, mrp};
+    if(state.demo){
+      const it = {id:'i'+Date.now(), name, key:nameKey(name), pack:body.pack, molecule:body.molecule, nr, mrp, source:'purchase', updatedAt:Date.now()};
+      db.items[hid].push(it);
+      if(it.key !== p.key) db.aliases[hid].push({id:'al'+Date.now(), aliasKey:p.key, itemId:it.id, by:state.user.name, at:Date.now()});
+      p.status='approved'; p.matchedItemId=it.id;
+      closeModal(); toast(name+' added to the master (demo)','green'); drawPending(hid); renderItems(); return;
+    }
+    try{
+      const r = await api('/pending-items/'+p.id+'/approve',{method:'POST', body});
+      db.items[hid].push(r.item);
+      db.aliases[hid] = r.aliases;
+      Object.assign(p, r.pending);
+      closeModal(); toast(r.item.name+' is on the Item Master — future purchases tally against it','green');
+      drawPending(hid); renderItems();
+    }catch(err){ toast(err.message,'red'); }
+  };
 }
 
 function itemModal(it){
