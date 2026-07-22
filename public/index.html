@@ -5326,14 +5326,14 @@ function invAsOfView(hid, canEdit){
   }
   let list = s.items;
   if(q) list = list.filter(i=> i.key.includes(q));
+  const KNOWN_INV_FILTERS = ['all','neg','out','moving','adj','expiring','suspect'];
+  if(!KNOWN_INV_FILTERS.includes(state.invFilter)) state.invFilter = 'all';
   const f = state.invFilter||'all';
   if(f==='neg') list = list.filter(i=> i.stock < 0);
   else if(f==='out') list = list.filter(i=> i.stock === 0);
   else if(f==='moving') list = list.filter(i=> i.purchased || i.sold || i.rtv);
   else if(f==='adj') list = list.filter(i=> i.adj);
   else if(f==='expiring') list = list.filter(i=> i.batches.some(b=> b.qty>0 && ['expired','b30','b90'].includes(expiryBucketOf(b, v.asOf))));
-  else if(f==='nonmoving'){ const nm = new Set(nonMoving(hid, v.asOf, 90).map(i=>i.key)); list = list.filter(i=> nm.has(i.key)); }
-  else if(f==='negmargin') list = list.filter(i=> i.negMargin);
   else if(f==='suspect') list = list.filter(i=> i.unitSuspect);
 
 
@@ -5370,7 +5370,7 @@ function invAsOfView(hid, canEdit){
     <div class="section-title"><h2>Items</h2><span>${tb? issueMethodLabel(hid)+' · click a row for its batches — the batch rows are where the real numbers live' : 'expiry not tracked · click a row for its purchase lots — each lot holds the net rate frozen from its own invoice line'}</span></div>
     <div class="entry-bar">
       <input class="in" id="invSearch" placeholder="Search items…" value="${esc(state.invQuery||'')}" style="width:220px">
-      <div class="seg">${[['all','All'],['moving','Moving'],['out','Out of stock'],['neg','Negative'],['adj','Adjusted'],...(tb?[['expiring','Expiring (0–90)']]:[]),['nonmoving','Non-moving (90d)'],['negmargin','Negative margin'],['suspect','Unit-suspect']].map(([k,t])=>
+      <div class="seg">${[['all','All'],['moving','Moving'],['out','Out of stock'],['neg','Negative'],['adj','Adjusted'],...(tb?[['expiring','Expiring (0–90)']]:[]),['suspect','Unit-suspect']].map(([k,t])=>
         `<button class="${f===k?'active':''}" data-invf="${k}">${t}</button>`).join('')}</div>
       <span style="flex:1"></span>
       <span class="eyebrow">${list.length} of ${s.items.length}</span>
