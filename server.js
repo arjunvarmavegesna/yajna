@@ -497,7 +497,9 @@ seed();
 /* ---------- app ---------- */
 const app = express();
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '400kb' }));
+// rawBody: the webhook signature is HMAC over the exact bytes received —
+// verifying a re-serialisation would break on any formatting difference
+app.use(express.json({ limit: '400kb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(cookieParser());
 
 /* login rate limit: 10 attempts / 15 min per IP */
@@ -1169,6 +1171,57 @@ async function sendWA(phone, text) {
     return { ok: false, status: r.status, error: (data && (data.error?.message || data.error || data.message)) || `send failed (${r.status})` };
   } catch (e) { return { ok: false, error: e.message || 'network error' }; }
 }
+
+/* ---------- inbound webhook from the ThinkAI console ----------
+   Same contract the mithra backend uses: HMAC-SHA256 over the RAW body with the
+   tenant's webhook secret, header x-thinkai-signature (hex or base64, optional
+   sha256= prefix). PUBLIC route — the signature IS the authentication, so it is
+   checked before anything is read, on the exact bytes received. */
+const timingSafeEq = (a, b) => {
+  const ab = Buffer.from(String(a)), bb = Buffer.from(String(b));
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+};
+const seenWebhookIds = new Map();   // TAI retries on slow acks — dedupe by message id
+
+app.post('/wa/webhook', (req, res) => {
+  const secret = process.env.TAI_WEBHOOK_SECRET || '';
+  const raw = req.rawBody || Buffer.from('');
+  const sig = String(req.headers['x-thinkai-signature'] || '').replace(/^sha256=/i, '');
+  const hex = crypto.createHmac('sha256', secret).update(raw).digest('hex');
+  const b64 = crypto.createHmac('sha256', secret).update(raw).digest('base64');
+  if (!secret || !sig || !(timingSafeEq(sig, hex) || timingSafeEq(sig, b64)))
+    return res.status(401).json({ error: 'invalid signature' });
+  res.json({ status: 'ok' });                       // ack fast so the console does not retry
+
+  const event = req.body || {};
+  try {
+    if (event.event !== 'incoming_message') return; // delivery/status receipts — nothing to act on
+    const data = event.data || {};
+    const text = String(data.replyId ?? data.text ?? '').trim();
+    const from = String(data.from || '').replace(/\D/g, '');
+    if (!from || !text) return;
+    const dk = `wh:${data.messageId || event.id || from + ':' + text}`;
+    if (seenWebhookIds.has(dk)) return;
+    seenWebhookIds.set(dk, Date.now());
+    if (seenWebhookIds.size > 200) { const cut = Date.now() - 60000; for (const [k, v] of seenWebhookIds) if (v < cut) seenWebhookIds.delete(k); }
+
+    /* A reply from a DOCTOR's number is worth surfacing: it lands as a console
+       alert on their hospital, and on the log of the offer that is with them —
+       so "I'll do it Monday" said in chat is not lost to one person's phone.
+       The approval itself still needs the signed link; a free-text "yes" is a
+       message, not a signature. */
+    const h = db.prepare('SELECT * FROM hospitals').all()
+      .find(x => String(x.doctor_phone || '').replace(/\D/g, '') === from || String(x.phone || '').replace(/\D/g, '') === from);
+    if (!h) { console.log(`[wa] inbound from unknown number ${from.slice(-4).padStart(from.length, '*')} — ignored`); return; }
+    const now = Date.now(), today = todayISO();
+    db.prepare('INSERT INTO notifications(id,type,hospital_id,date,msg,ts,read) VALUES(?,?,?,?,?,?,0)')
+      .run(uid('n'), 'doctor_reply', h.id, today, `${h.doctor || 'The doctor'} replied on WhatsApp: “${text.slice(0, 180)}”`, now);
+    const awaiting = db.prepare(
+      "SELECT * FROM margin_offers WHERE hospital_id=? AND status='proposed' AND approval_sent_at IS NOT NULL AND approved_at IS NULL ORDER BY approval_sent_at DESC LIMIT 1").get(h.id);
+    if (awaiting) pushOfferAction(awaiting, 'note', `WhatsApp reply from ${h.doctor || 'the doctor'}: ${text.slice(0, 300)}`, today, h.doctor || 'Doctor');
+    console.log(`[wa] reply from ${h.doctor || h.id} logged${awaiting ? ' onto offer ' + awaiting.id : ''}`);
+  } catch (err) { console.error('[wa] webhook handling error:', err.message); }
+});
 
 /* ---------- doctor approval over WhatsApp ----------
    The doctor is not a console user and should not need to become one to say yes

@@ -13,6 +13,7 @@ WORK="${WORK:-/tmp/yajna-tests}"
 export SEED_ADMIN_PW="${SEED_ADMIN_PW:-Test@Admin#1}"
 export SEED_MANAGER_PW="${SEED_MANAGER_PW:-Test@Manager#1}"
 export SEED_USER_PW="${SEED_USER_PW:-Test@User#1}"
+export TAI_WEBHOOK_SECRET="${TAI_WEBHOOK_SECRET:-test-webhook-secret}"
 
 mkdir -p "$WORK/data" "$WORK/public"
 cp "$ROOT/server.js" "$WORK/server.js"
