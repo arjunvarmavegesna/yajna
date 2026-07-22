@@ -450,6 +450,9 @@ const $ = (s,r)=> (r||document).querySelector(s);
 const $$ = (s,r)=> Array.from((r||document).querySelectorAll(s));
 const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtN = n => Math.round(n||0).toLocaleString('en-IN');
+/* quantities can be PART STRIPS (15 tablets of a 10s = 1.5) — fmtQ keeps up to
+   2 decimals where fmtN would round 1.5 up to 2 and misreport the shelf */
+const fmtQ = n => { const v = Math.round((Number(n)||0)*100)/100; return v.toLocaleString('en-IN', {maximumFractionDigits:2}); };
 const fmtRs = n => 'Rs. ' + fmtN(n);
 const pct = n => (Math.round((n||0)*10)/10).toFixed(1) + '%';
 const iso = d => { const x = new Date(d); return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0'); };
@@ -2114,11 +2117,14 @@ function tabPurchase(e, locked){
   <div class="subhead"><h4>RTV — Return to Vendor</h4><div class="rule"></div></div>
   <p class="mini-note" style="margin:-4px 0 10px">Stock returned to vendor (expiry / damage). Separate from the bounce register — bounces are lost sales, recorded in the Audit tab.</p>
   <div class="tbl-scroll"><table class="row-tbl">
-    <thead><tr><th style="width:24%">Drug</th><th style="width:22%">Vendor</th><th style="width:10%">Qty</th><th style="width:13%">Value (Rs.)</th><th style="width:15%">Reason</th><th style="width:15%">Credit note</th><th></th></tr></thead>
+    <thead><tr><th style="width:24%">Drug</th><th style="width:20%">Vendor</th><th style="width:14%" title="STRIPS returned — type a loose-tablet count in the small box and it converts using the item's pack">Qty (strips)</th><th style="width:11%">Value (Rs.)</th><th style="width:15%">Reason</th><th style="width:15%">Credit note</th><th></th></tr></thead>
     <tbody>${e.rtv.map((r0,i)=>`<tr>
       <td><input class="in" data-r="${i}:drug" value="${esc(r0.drug)}" ${dis(locked)}></td>
       <td style="position:relative"><input class="in" data-r="${i}:vendor" value="${esc(r0.vendor)}" ${dis(locked)} autocomplete="off"></td>
-      <td><input class="in num" type="number" min="0" data-r="${i}:qty" value="${esc(r0.qty)}" ${dis(locked)} title="Units returned — reduces inventory"></td>
+      <td><div style="display:flex;gap:4px;align-items:center">
+        <input class="in num" type="number" min="0" step="any" data-r="${i}:qty" value="${esc(r0.qty)}" ${dis(locked)} title="Strips returned — reduces inventory" style="min-width:0">
+        ${locked?'':`<input class="in num in-sm" type="number" min="0" data-rtabs="${i}" placeholder="tabs" title="Loose tablets — converted to strips by the item's pack size" style="width:52px;flex:none">`}
+      </div><div class="ivnote num" data-rhint="${i}" style="margin-top:2px"></div></td>
       <td><input class="in num" type="number" min="0" data-r="${i}:value" value="${esc(r0.value)}" ${dis(locked)}></td>
       <td><select class="in" data-r="${i}:reason" ${dis(locked)}>${RTV_REASONS.map(x=>`<option ${x===r0.reason?'selected':''}>${x}</option>`).join('')}</select></td>
       <td><select class="in" data-r="${i}:status" ${dis(locked)}>${RTV_STATUS.map(x=>`<option ${x===r0.status?'selected':''}>${x}</option>`).join('')}</select></td>
@@ -2543,6 +2549,27 @@ function wireEntryTab(e, locked){
     inp.oninput = set; inp.onchange = set;
     if(f==='vendor') attachSuggest(inp, set);
   });
+  /* the tablets box: qty ÷ pack, live, and the STRIP figure is what is saved.
+     No pack on the item → nothing to divide by, the box says so and stays out
+     of the way (1 unit = 1 strip for vials and bottles). */
+  $$('[data-rtabs]',body).forEach(tb=>{
+    const i = +tb.dataset.rtabs;
+    const hint = body.querySelector(`[data-rhint="${i}"]`);
+    const qtyInp = body.querySelector(`[data-r="${i}:qty"]`);
+    tb.oninput = ()=>{
+      const tabs = num(tb.value);
+      const u = packUnits((findItem(state.hospital, e.rtv[i].drug)||{}).pack);
+      if(!u){
+        if(hint) hint.textContent = tb.value? 'no strip size on this item — enter strips directly' : '';
+        return;
+      }
+      if(!tb.value){ if(hint) hint.textContent=''; return; }
+      const strips = Math.round(tabs/u*10000)/10000;
+      qtyInp.value = strips;
+      e.rtv[i].qty = strips; markDirty();
+      if(hint) hint.textContent = `${fmtQ(tabs)} tablets = ${fmtQ(strips)} strips (${u}s)`;
+    };
+  });
   $$('[data-rdel]',body).forEach(b=> b.onclick=()=>{ e.rtv.splice(+b.dataset.rdel,1); renderEntryTab(e,locked); });
   const ar=$('#addRtv'); if(ar) ar.onclick=()=>{ e.rtv.push({drug:'',vendor:'',qty:'',value:'',reason:'Expiry',status:'Pending'}); renderEntryTab(e,locked); };
   // sales
@@ -2677,6 +2704,10 @@ function expiryUploadModal(hid, after, defDate){
   if(!state.aiEnabled){ toast('AI reading not configured yet — add ANTHROPIC_API_KEY on the server','amber'); return; }
   if(state.user.role!=='admin'){ toast('Only a manager or admin can import stock data','red'); return; }
   let parsed = null;
+  // pharmacy-software batch reports count loose tablets like the rest of Marg —
+  // the snapshot must land in STRIPS or shelf-vs-books compares apples to pills
+  let units = fileUnits(hid, 'freeform');
+  const viewRows = ()=> units==='tablets'? tabletsToStrips(parsed.rows, hid, 'name') : {rows: parsed.rows.map(r=>({...r, srcQty:num(r.qty), packU:null})), unknown:[]};
   const snaps = snapshotsFor(hid);
   openModal(`
     <div class="modal-head"><h3>Upload batch &amp; expiry report</h3><button class="modal-x">✕</button></div>
@@ -2709,8 +2740,14 @@ function expiryUploadModal(hid, after, defDate){
       parsed = await apiUpload(`/parse/expiry?hid=${encodeURIComponent(hid)}`, f);
       parsed.fileName = f.name;
       if(parsed.asOf) $('#exDate').value = parsed.asOf;
+      renderExPrev();
+    }catch(err){ $('#exPrev').innerHTML = `<p style="color:var(--red);font-size:13px">${esc(err.message)}</p>`; }
+    btn.disabled=false; btn.textContent='Read report';
+  };
+  const renderExPrev = ()=>{
       const noExp = parsed.rows.length - parsed.withExpiry;
-      const sample = parsed.rows.filter(r=>r.expiry).slice(0,6);
+      const cv = viewRows();
+      const sample = cv.rows.filter(r=>r.expiry).slice(0,6);
       $('#exPrev').innerHTML = `
         <div class="grid2" style="margin-bottom:8px">
           <div class="kpi"><div class="l">Batch rows read</div><div class="v num" style="font-size:17px">${parsed.rows.length}</div></div>
@@ -2718,18 +2755,21 @@ function expiryUploadModal(hid, after, defDate){
         </div>
         <p class="mini-note">${esc(parsed.note||'')}${parsed.asOf? ` · report dated ${fmtDate(parsed.asOf)}`:' · no date printed on the report — set it above'}</p>
         ${sample.length? `<table class="tbl"><thead><tr><th>Item</th><th>Batch</th><th>Expiry</th><th class="r">Qty</th></tr></thead>
-          <tbody>${sample.map(r=>`<tr><td>${esc(r.name)}</td><td class="num">${esc(r.batch||'—')}</td><td class="num">${esc(r.expiry)}</td><td class="r num">${fmtN(r.qty)}</td></tr>`).join('')}</tbody></table>
-          <p class="mini-note">First ${sample.length} of ${parsed.rows.length} — check these read correctly before saving.</p>`:''}`;
+          <tbody>${sample.map(r=>`<tr><td>${esc(r.name)}</td><td class="num">${esc(r.batch||'—')}</td><td class="num">${esc(r.expiry)}</td><td class="r num">${unitCell(r, units)}</td></tr>`).join('')}</tbody></table>
+          <p class="mini-note">First ${sample.length} of ${parsed.rows.length} — check these read correctly before saving.</p>`:''}
+        ${unitsSeg('exu', units)}
+        ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}`;
+      $$('[data-exu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.exu; setFileUnits(hid, 'freeform', units); renderExPrev(); });
       $('#exApply').disabled = !parsed.rows.length;
       if(!parsed.withExpiry) $('#exPrev').insertAdjacentHTML('beforeend','<p style="color:var(--red);font-size:13px">No expiry dates were found in this file — check it is the batch-wise report, not the plain stock summary.</p>');
-    }catch(err){ $('#exPrev').innerHTML = `<p style="color:var(--red);font-size:13px">${esc(err.message)}</p>`; }
-    btn.disabled=false; btn.textContent='Read report';
   };
   $('#exApply').onclick = async ()=>{
     if(!parsed) return;
     const btn=$('#exApply'); btn.disabled=true;
     try{
-      const r = await api('/snapshots', {method:'POST', body:{hid, asOf:$('#exDate').value, rows:parsed.rows, fileName:parsed.fileName}});
+      // strip the preview annotations — the snapshot stores clean strip rows
+      const rows = viewRows().rows.map(({srcQty, packU, ...rest})=> rest);
+      const r = await api('/snapshots', {method:'POST', body:{hid, asOf:$('#exDate').value, rows, fileName:parsed.fileName}});
       db.snapshots[hid] = (db.snapshots[hid]||[]).filter(x=>x.asOf!==r.snapshot.asOf).concat([r.snapshot]);
       closeModal();
       toast(`${r.snapshot.rows.length} batch rows saved as on ${fmtDate(r.snapshot.asOf)}`,'green');
@@ -2768,14 +2808,35 @@ function tabletsToStrips(rows, hid, nameField){
   rows.forEach(r=>{
     const name = r[nameField];
     const u = packUnits(r.pack) || packUnits((findItem(hid, name)||{}).pack);
-    if(!u){ unknown.push(name); out.push({...r}); return; }
-    out.push({...r, qty: num(r.qty)/u, nr: num(r.nr)*u, mrp: num(r.mrp)*u});
+    // srcQty/packU are annotations for the preview ("15 → 1.5 strips (10s)") —
+    // the ledger only ever reads qty/nr/mrp
+    if(!u){ unknown.push(name); out.push({...r, srcQty: num(r.qty), packU: null}); return; }
+    out.push({...r, qty: num(r.qty)/u, nr: num(r.nr)*u, mrp: num(r.mrp)*u, srcQty: num(r.qty), packU: u});
   });
   return {rows: out, unknown};
 }
+/* The remembered choice is PER HOSPITAL and PER FILE SHAPE. A Marg export
+   counts loose tablets, so free-form files default to 'tablets'; our own
+   template explicitly asks for strips, so template files default to 'strips'.
+   Defaulting everything to one or the other would corrupt the opposite kind
+   the day someone forgets the toggle. */
 const UNITS_KEY = 'yps_file_units';
-function fileUnits(){ try{ return localStorage.getItem(UNITS_KEY)==='tablets'? 'tablets':'strips'; }catch(e){ return 'strips'; } }
-function setFileUnits(u){ try{ localStorage.setItem(UNITS_KEY, u); }catch(e){} }
+function fileUnits(hid, src){
+  const kind = src==='template'? 'template' : 'freeform';
+  try{
+    const v = localStorage.getItem(`${UNITS_KEY}:${hid}:${kind}`);
+    if(v==='strips' || v==='tablets') return v;
+  }catch(e){}
+  return kind==='template'? 'strips' : 'tablets';
+}
+function setFileUnits(hid, src, u){
+  const kind = src==='template'? 'template' : 'freeform';
+  try{ localStorage.setItem(`${UNITS_KEY}:${hid}:${kind}`, u); }catch(e){}
+}
+/* how a quantity cell displays while the file is being previewed */
+const unitCell = (r, units)=> units==='tablets' && r.packU
+  ? `${fmtQ(r.srcQty)} → <b>${fmtQ(r.qty)}</b> strips <span style="color:var(--faint)">(${r.packU}s)</span>`
+  : `${fmtQ(r.qty)}${units==='tablets'? ' <span style="color:var(--faint)" title="No strip size on this item — 1 unit = 1 strip">as-is</span>':''}`;
 function unitsSeg(id, mode){
   return `<div class="entry-bar" style="margin:10px 0 4px">
     <span class="eyebrow">This file counts</span>
@@ -2790,7 +2851,7 @@ function unitsSeg(id, mode){
 function gpUploadModal(e, locked){
   if(state.demo){ toast('Report reading works in live mode only','amber'); return; }
   let parsed = null;
-  let units = fileUnits();
+  let units = 'strips';   // resolved per file once it is read — the source decides the default
   // the rows AS THE LEDGER WILL SEE THEM — converted when the file counts tablets
   const viewItems = ()=>{
     const items = (parsed && parsed.items)||[];
@@ -2831,14 +2892,14 @@ function gpUploadModal(e, locked){
           <tbody>${priced.slice(0,8).map(r=>{
             const mp = num(r.mrp)>0? (num(r.mrp)-num(r.nr))/num(r.mrp)*100 : 0;
             const st = lineStatus(state.hospital, {item:r.item, pqty:1, oqty:0, rate:num(r.nr), disc:0, gst:0, mrp:num(r.mrp)});
-            return `<tr><td>${esc(r.item)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${fmtN(r.qty)}</td><td class="r num">${r2(r.nr)}</td><td class="r num">${r2(r.mrp)}</td><td class="r num" style="font-weight:700;color:${marginCol(st.status)}">${pct(mp)}</td><td>${marginChip(st.status)}</td></tr>`;
+            return `<tr><td>${esc(r.item)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${unitCell(r, units)}</td><td class="r num">${r2(r.nr)}</td><td class="r num">${r2(r.mrp)}</td><td class="r num" style="font-weight:700;color:${marginCol(st.status)}">${pct(mp)}</td><td>${marginChip(st.status)}</td></tr>`;
           }).join('')}</tbody></table>
           <p class="mini-note">${priced.length>8? `First 8 of ${priced.length} priced rows. `:''}Margin % is <b>(MRP − net rate) ÷ MRP</b> — a ratio, so the strip size never enters it. It only needs both rates on the same basis, and they are: both per strip.</p>`
           : (items.length? '<p class="mini-note">These rows carry no cost price, so only the day\'s totals can be filled — not the per-item margin.</p>':'')}
         ${off.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${off.length} item${off.length===1?'':'s'} priced away from the Item Master: ${off.slice(0,4).map(r=>esc(r.item)).join(', ')}${off.length>4?` and ${off.length-4} more`:''}. Saving the day alerts the admin.</p>`:''}
         ${items.length? unitsSeg('gpu', units) : ''}
         ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by (${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}) — their counts are kept as-is. Add the pack on the Item Master and re-read.</p>`:''}`;
-      $$('[data-gpu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.gpu; setFileUnits(units); renderPrev(); });
+      $$('[data-gpu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.gpu; setFileUnits(state.hospital, parsed.source, units); renderPrev(); });
       $('#gpApply').disabled = !(parsed.salesMrp>0);
       if(!(parsed.salesMrp>0)) $('#gpPrev').insertAdjacentHTML('beforeend','<p style="color:var(--red);font-size:13px">No sales value could be worked out from this file.</p>');
   };
@@ -2848,6 +2909,7 @@ function gpUploadModal(e, locked){
     const btn=$('#gpParse'); btn.disabled=true; btn.textContent='Reading…';
     try{
       parsed = await apiUpload(`/parse/gpreport?hid=${encodeURIComponent(state.hospital)}`, f);
+      units = fileUnits(state.hospital, parsed.source);
       renderPrev();
     }catch(err){ $('#gpPrev').innerHTML = `<p style="color:var(--red);font-size:13px">${esc(err.message)}</p>`; }
     btn.disabled=false; btn.textContent='Read report';
@@ -5174,7 +5236,7 @@ function invReorderView(hid, canEdit){
         return `<tr>
           <td><b>${esc(r.name)}</b></td>
           <td style="color:var(--muted)">${esc(r.pack||'—')}</td>
-          <td class="r num" style="color:${r.onHand<0?'var(--red)':'var(--ink)'}">${r.onHand}</td>
+          <td class="r num" style="color:${r.onHand<0?'var(--red)':'var(--ink)'}">${fmtQ(r.onHand)}</td>
           <td class="r num">${r.rate>0? r.rate.toFixed(r.rate<1?2:1) : '—'}</td>
           <td class="r num" style="color:${urgency};font-weight:600">${r.daysLeft==null? 'not moving' : r.daysLeft>999? '999+' : Math.floor(r.daysLeft)+'d'}</td>
           <td class="r num">${r.need||'—'}</td>
@@ -5248,6 +5310,20 @@ function invAsOfView(hid, canEdit){
   const tb = hasExpiryOn(hid, v.asOf);
   const eb = expiryBuckets(hid, v.asOf);
   const q = nameKey(state.invQuery||'');
+  /* Unit-suspect (read-only, never auto-corrected): an item probably entered in
+     TABLETS looks like this — its Sold or Opening divides cleanly by its pack
+     size, AND its stock value dwarfs its peers by roughly that factor. Either
+     signal alone is everywhere (round numbers are normal); together they mark
+     the rows worth a human look. */
+  {
+    const vals = s.items.filter(i=> i.stock>0 && i.valueNr>0).map(i=> i.valueNr).sort((a,b)=>a-b);
+    const median = vals.length? vals[Math.floor(vals.length/2)] : 0;
+    s.items.forEach(i=>{
+      const u = packUnits(i.pack);
+      const clean = v=> u>=10 && v >= u && Math.abs(v/u - Math.round(v/u)) < 1e-9;
+      i.unitSuspect = !!u && (clean(i.sold) || clean(i.opening)) && median>0 && i.valueNr > 4*median;
+    });
+  }
   let list = s.items;
   if(q) list = list.filter(i=> i.key.includes(q));
   const f = state.invFilter||'all';
@@ -5258,6 +5334,8 @@ function invAsOfView(hid, canEdit){
   else if(f==='expiring') list = list.filter(i=> i.batches.some(b=> b.qty>0 && ['expired','b30','b90'].includes(expiryBucketOf(b, v.asOf))));
   else if(f==='nonmoving'){ const nm = new Set(nonMoving(hid, v.asOf, 90).map(i=>i.key)); list = list.filter(i=> nm.has(i.key)); }
   else if(f==='negmargin') list = list.filter(i=> i.negMargin);
+  else if(f==='suspect') list = list.filter(i=> i.unitSuspect);
+
 
 
   $('#invBody').innerHTML = `
@@ -5292,7 +5370,7 @@ function invAsOfView(hid, canEdit){
     <div class="section-title"><h2>Items</h2><span>${tb? issueMethodLabel(hid)+' · click a row for its batches — the batch rows are where the real numbers live' : 'expiry not tracked · click a row for its purchase lots — each lot holds the net rate frozen from its own invoice line'}</span></div>
     <div class="entry-bar">
       <input class="in" id="invSearch" placeholder="Search items…" value="${esc(state.invQuery||'')}" style="width:220px">
-      <div class="seg">${[['all','All'],['moving','Moving'],['out','Out of stock'],['neg','Negative'],['adj','Adjusted'],...(tb?[['expiring','Expiring (0–90)']]:[]),['nonmoving','Non-moving (90d)'],['negmargin','Negative margin']].map(([k,t])=>
+      <div class="seg">${[['all','All'],['moving','Moving'],['out','Out of stock'],['neg','Negative'],['adj','Adjusted'],...(tb?[['expiring','Expiring (0–90)']]:[]),['nonmoving','Non-moving (90d)'],['negmargin','Negative margin'],['suspect','Unit-suspect']].map(([k,t])=>
         `<button class="${f===k?'active':''}" data-invf="${k}">${t}</button>`).join('')}</div>
       <span style="flex:1"></span>
       <span class="eyebrow">${list.length} of ${s.items.length}</span>
@@ -5309,16 +5387,16 @@ function invAsOfView(hid, canEdit){
         const open = state.invOpen===i.key;
         const nx = i.nearestExp? (monthEndOf(i.nearestExp) < v.asOf? 'var(--red)' : 'var(--ink)') : 'var(--faint)';
         return `<tr>
-          <td><b>${esc(i.name)}</b>${i.onMaster?'':' <span class="chip chip-gray" style="font-size:10px" title="Seen in sales/purchases but not on the Item Master">off master</span>'}${i.negMargin?' <span class="chip chip-red" style="font-size:10px">below cost</span>':''}</td>
-          <td style="color:var(--muted)">${esc(i.pack||'—')}</td>
+          <td><b>${esc(i.name)}</b>${i.onMaster?'':' <span class="chip chip-gray" style="font-size:10px" title="Seen in sales/purchases but not on the Item Master">off master</span>'}${i.negMargin?' <span class="chip chip-red" style="font-size:10px">below cost</span>':''}${i.unitSuspect?` <span class="chip chip-amber" style="font-size:10px" title="Sold or Opening divides cleanly by the pack (${esc(i.pack)}) AND the value dwarfs peers — this may have been entered in tablets. Review the source day; nothing is auto-corrected.">units?</span>`:''}</td>
+          <td style="color:var(--muted);font-weight:600">${esc(i.pack||'—')}</td>
           <td class="r num">${i.nrStrip? r2(i.nrStrip):'—'}${i.mixedRate? ' <span style="color:var(--faint);font-size:10px" title="Lots of this item cost different amounts — this is the weighted average">avg</span>':''}</td>
           <td class="r num" style="color:var(--muted)">${i.mrpStrip? r2(i.mrpStrip):'—'}</td>
-          <td class="r num" style="color:var(--faint)">${fmtN(i.opening)}</td>
-          <td class="r num" style="color:var(--green)">${i.purchased? '+'+fmtN(i.purchased):'—'}</td>
-          <td class="r num" style="color:var(--muted)">${i.sold? '−'+fmtN(i.sold):'—'}</td>
-          <td class="r num" style="color:var(--muted)">${i.rtv? '−'+fmtN(i.rtv):'—'}</td>
-          <td class="r num" style="color:${i.adj<0?'var(--red)':i.adj>0?'var(--green)':'var(--muted)'}">${i.adj? (i.adj>0?'+':'−')+fmtN(Math.abs(i.adj)):'—'}</td>
-          <td class="r num" style="color:${col};font-weight:700">${fmtN(i.stock)}${i.stock<0?' ⚠':''}</td>
+          <td class="r num" style="color:var(--faint)" title="= ${fmtQ(i.opening)} strips${packUnits(i.pack)? ` (pack ${packUnits(i.pack)}s = ${fmtQ(i.opening*packUnits(i.pack))} tablets)`:''}">${fmtQ(i.opening)}</td>
+          <td class="r num" style="color:var(--green)" title="= ${fmtQ(i.purchased)} strips${packUnits(i.pack)? ` (pack ${packUnits(i.pack)}s)`:''}">${i.purchased? '+'+fmtQ(i.purchased):'—'}</td>
+          <td class="r num" style="color:var(--muted)" title="= ${fmtQ(i.sold)} strips${packUnits(i.pack)? ` (pack ${packUnits(i.pack)}s = ${fmtQ(i.sold*packUnits(i.pack))} tablets)`:''}">${i.sold? '−'+fmtQ(i.sold):'—'}</td>
+          <td class="r num" style="color:var(--muted)" title="= ${fmtQ(i.rtv)} strips${packUnits(i.pack)? ` (pack ${packUnits(i.pack)}s)`:''}">${i.rtv? '−'+fmtQ(i.rtv):'—'}</td>
+          <td class="r num" style="color:${i.adj<0?'var(--red)':i.adj>0?'var(--green)':'var(--muted)'}">${i.adj? (i.adj>0?'+':'−')+fmtQ(Math.abs(i.adj)):'—'}</td>
+          <td class="r num" style="color:${col};font-weight:700" title="= ${fmtQ(i.stock)} strips${packUnits(i.pack)? ` (pack ${packUnits(i.pack)}s = ${fmtQ(i.stock*packUnits(i.pack))} tablets)`:''}">${fmtQ(i.stock)}${i.stock<0?' ⚠':''}</td>
           <td class="r num">${fmtRs(i.valueNr)}</td>
           <td class="r num" style="color:var(--muted)">${fmtRs(i.valueMrp)}</td>
           <td class="r num" style="color:${i.potentialRs>0?'var(--green)':'var(--muted)'}">${i.stock>0? fmtRs(i.potentialRs):'—'}</td>
@@ -5525,17 +5603,21 @@ function adjustModal(hid, key){
     <div class="modal-head"><h3>Adjust stock — ${esc(inv.name)}</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
       <div class="grid2" style="margin-bottom:14px">
-        <div class="kpi"><div class="l">In stock now</div><div class="v num" style="font-size:17px;color:${cur<0?'var(--red)':'var(--ink)'}">${fmtN(cur)}</div><div class="d">${esc(inv.pack||'')}</div></div>
-        <div class="kpi"><div class="l">After adjustment</div><div class="v num" style="font-size:17px;color:var(--green)" id="adjAfter">${fmtN(cur)}</div><div class="d" id="adjDelta">no change</div></div>
+        <div class="kpi"><div class="l">In stock now</div><div class="v num" style="font-size:17px;color:${cur<0?'var(--red)':'var(--ink)'}">${fmtQ(cur)}</div><div class="d">${esc(inv.pack||'')} · strips</div></div>
+        <div class="kpi"><div class="l">After adjustment</div><div class="v num" style="font-size:17px;color:var(--green)" id="adjAfter">${fmtQ(cur)}</div><div class="d" id="adjDelta">no change</div></div>
       </div>
       <div class="seg" style="margin-bottom:12px">
         <button class="active" data-adjm="count">I counted the stock</button>
         <button data-adjm="delta">Add / remove units</button>
       </div>
-      <div class="field" id="adjCountWrap"><label>Counted quantity</label>
-        <input class="in num" type="number" step="1" id="adjCount" value="${fmtN(cur)}"></div>
-      <div class="field" id="adjDeltaWrap" style="display:none"><label>Units — use a minus for stock leaving (e.g. −5)</label>
-        <input class="in num" type="number" step="1" id="adjQty" placeholder="-5"></div>
+      <div class="field" id="adjCountWrap"><label>Counted quantity (strips)</label>
+        <input class="in num" type="number" step="any" id="adjCount" value="${Math.round(cur*100)/100}"></div>
+      <div class="field" id="adjDeltaWrap" style="display:none"><label>Strips — use a minus for stock leaving (e.g. −5)</label>
+        <input class="in num" type="number" step="any" id="adjQty" placeholder="-5"></div>
+      ${packUnits(inv.pack)? `<div class="field"><label>Or in loose tablets <span style="color:var(--faint);font-weight:400">— ÷${packUnits(inv.pack)} (${esc(inv.pack)}), the strip figure is what is recorded</span></label>
+        <input class="in num" type="number" step="any" id="adjTabs" placeholder="e.g. 20 tablets = ${r2(20/packUnits(inv.pack))} strips">
+        <p class="ivnote num" id="adjTabsHint"></p></div>`
+      : `<p class="mini-note">This item has no strip size (${esc(inv.pack||'no pack')}) — quantities here are whole units, 1 unit = 1 strip.</p>`}
       <div class="grid2">
         <div class="field"><label>Reason</label><select class="in" id="adjReason">${adjReasons().map(x=>`<option>${esc(x)}</option>`).join('')}</select></div>
         <div class="field"><label>Date</label><input class="in" type="date" id="adjDate" value="${todayISO()}" max="${todayISO()}" ${h.stockDate?`min="${h.stockDate}"`:''}></div>
@@ -5547,11 +5629,21 @@ function adjustModal(hid, key){
 
   let mode = 'count';
   const delta = ()=> mode==='count' ? num($('#adjCount').value) - cur : num($('#adjQty').value);
+  const at = $('#adjTabs');
+  if(at) at.oninput = ()=>{
+    const u = packUnits(inv.pack);
+    if(!u || !at.value){ const hh=$('#adjTabsHint'); if(hh) hh.textContent=''; return; }
+    const strips = Math.round(num(at.value)/u*10000)/10000;
+    // feeds whichever mode is active: a counted total, or a signed delta
+    if(mode==='count') $('#adjCount').value = strips; else $('#adjQty').value = strips;
+    $('#adjTabsHint').textContent = `${fmtQ(num(at.value))} tablets = ${fmtQ(strips)} strips (${u}s)`;
+    refresh();
+  };
   const refresh = ()=>{
     const d = delta();
-    $('#adjAfter').textContent = fmtN(cur + d);
+    $('#adjAfter').textContent = fmtQ(cur + d);
     $('#adjAfter').style.color = (cur+d) < 0 ? 'var(--red)' : 'var(--green)';
-    $('#adjDelta').textContent = d===0? 'no change' : (d>0? '+'+fmtN(d)+' units' : fmtN(d)+' units') + (inv.nr? ' · '+fmtRs(Math.abs(d*inv.nr))+(d<0?' written off':' added'):'');
+    $('#adjDelta').textContent = d===0? 'no change' : (d>0? '+'+fmtQ(d)+' strips' : fmtQ(d)+' strips') + (inv.nr? ' · '+fmtRs(Math.abs(d*inv.nr))+(d<0?' written off':' added'):'');
   };
   $$('[data-adjm]').forEach(b=> b.onclick=()=>{
     mode = b.dataset.adjm;
@@ -5625,8 +5717,8 @@ function ledgerModal(hid, key){
 function openingStockModal(hid){
   const h = db.hospitals[hid]||{};
   let parsed = null;
-  let rawRows = null, lastNote = '';
-  let units = fileUnits();
+  let rawRows = null, lastNote = '', lastSrc = 'template';
+  let units = fileUnits(hid, 'template');
   openModal(`
     <div class="modal-head"><h3>Opening stock — ${esc(h.name||'')}</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
@@ -5644,8 +5736,9 @@ function openingStockModal(hid){
 
   const ot=$('#osTpl'); if(ot) ot.onclick = ()=> downloadTemplate('opening', 'Opening stock');
 
-  const preview = (rows0, note)=>{
+  const preview = (rows0, note, src)=>{
     rawRows = rows0; lastNote = note||'';
+    if(src!==undefined){ lastSrc = src||'template'; units = fileUnits(hid, lastSrc); }
     const cv = units==='tablets'? tabletsToStrips(rows0, hid, 'name') : {rows:rows0, unknown:[]};
     const rows = cv.rows;
     parsed = rows;
@@ -5659,13 +5752,13 @@ function openingStockModal(hid){
       </div>
       <div class="tbl-scroll" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:7px"><table class="tbl">
         <thead><tr><th>Product</th><th>Pack</th><th class="r">Strips</th><th class="r">Net rate/strip</th><th class="r">MRP/strip</th><th></th></tr></thead>
-        <tbody>${rows.slice(0,200).map(r=>`<tr><td>${esc(r.name)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${fmtN(r.qty)}</td><td class="r num">${r.nr||'—'}</td><td class="r num">${r.mrp||'—'}</td>
+        <tbody>${rows.slice(0,200).map(r=>`<tr><td>${esc(r.name)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${unitCell(r, units)}</td><td class="r num">${r.nr? r2(r.nr):'—'}</td><td class="r num">${r.mrp? r2(r.mrp):'—'}</td>
           <td>${findItem(hid,r.name)? '<span class="chip chip-blue">On master</span>':'<span class="chip chip-green">New item</span>'}</td></tr>`).join('')}</tbody></table></div>
       <p class="mini-note">${rows.length} item${rows.length===1?'':'s'} · ${known} already on the master (opening qty updated) · ${rows.length-known} will be added.${note? ' '+esc(note):''}</p>
       ${unitsSeg('osu', units)}
       ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}` :
       '<p class="mini-note">No valid rows found.</p>';
-    $$('[data-osu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.osu; setFileUnits(units); preview(rawRows, lastNote); });
+    $$('[data-osu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.osu; setFileUnits(hid, lastSrc, units); preview(rawRows, lastNote); });
     $('#osGo').disabled = rows.length===0;
   };
   const parseText = txt => preview(txt.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).map(line=>{
@@ -5682,11 +5775,12 @@ function openingStockModal(hid){
       try{
         const r = await apiUpload(`/parse/stock?hid=${encodeURIComponent(hid)}`, f);
         if(r.stockDate) $('#osDate').value = r.stockDate;
-        preview(r.items, r.note);
+        preview(r.items, r.note, r.source);
       }catch(err){ $('#osPrev').innerHTML = `<p style="color:var(--red);font-size:13px">${esc(err.message)}</p>`; }
       btn.disabled=false; btn.textContent='Read / preview';
       return;
     }
+    // pasted rows follow OUR column order — that is the template contract, strips
     parseText($('#osPaste').value);
   };
   $('#osGo').onclick = async ()=>{
