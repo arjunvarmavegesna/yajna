@@ -1386,6 +1386,26 @@ async function sendWADocument(phone, buffer, filename, caption) {
   } catch (e) { return { ok: false, error: e.message || 'network error' }; }
 }
 
+/* a document-header template carrying OUR pdf — delivers with NO open window
+   and no reply from the doctor. The whole reason yajna_report_pdf exists. */
+async function sendWATemplateDoc(phone, templateName, languageCode, variables, pdfBuffer, filename) {
+  if (!waEnabled()) return { ok: false, error: 'WhatsApp sending is not configured (TAI_API_KEY)' };
+  const digits = String(phone).replace(/\D/g, '');
+  if (digits.length < 10) return { ok: false, error: 'Not a usable phone number' };
+  try {
+    const r = await fetch(`${WA_BASE}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.TAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: `+${digits}`, type: 'template', templateName, languageCode, variables,
+        headerDocumentBase64: pdfBuffer.toString('base64'), headerFilename: filename }),
+      signal: AbortSignal.timeout(30000)
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) return { ok: true, via: 'template_document' };
+    return { ok: false, status: r.status, error: (data && (data.error?.message || data.error || data.message)) || `template document send failed (${r.status})` };
+  } catch (e) { return { ok: false, error: e.message || 'network error' }; }
+}
+
 /* park a document for delivery the moment the doctor's window opens */
 function queueOutbox(hid, phone, buffer, filename, caption) {
   const id = uid('ob');
@@ -1697,7 +1717,17 @@ app.post('/api/wa/report', auth, requireRole('admin'), async (req, res) => {
     const sent = await sendWADocument(phone, pdf, fname, caption);
     if (sent.ok) return res.json({ sent: { ok: true, via: 'document' }, to: `+${phone}` });
 
-    /* window shut (or no conversation yet): park the PDF + nudge via template */
+    /* Window shut (or no conversation yet): the PDF still goes NOW — it rides a
+       document-header template, which Meta delivers without any open window.
+       Nobody has to reply to anything. */
+    if (process.env.TAI_REPORT_DOC_TEMPLATE) {
+      const tdoc = await sendWATemplateDoc(phone, process.env.TAI_REPORT_DOC_TEMPLATE,
+        process.env.TAI_TEMPLATE_LANG || 'en_US', [h.doctor || 'Doctor', label], pdf, fname);
+      if (tdoc.ok) return res.json({ sent: { ok: true, via: 'template_document' }, to: `+${phone}` });
+    }
+
+    /* Last ditch (doc template missing / still pending at Meta): park the PDF +
+       nudge — their reply delivers it via the webhook. */
     const outboxId = queueOutbox(h.id, phone, pdf, fname, caption);
     let nudge = { ok: false, error: 'TAI_REPORT_TEMPLATE not set' };
     if (process.env.TAI_REPORT_TEMPLATE) {
