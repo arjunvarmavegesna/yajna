@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "tests/runall.sh api ui items weekly period ia inventory clear manualinv linecalc adjust receivables engine stock expiry salestpl nav offers reorder units webhook purchasetpl pending openingdate"
+    "test": "tests/runall.sh api ui items weekly period ia inventory clear manualinv linecalc adjust receivables engine stock expiry salestpl nav offers reorder units webhook purchasetpl pending openingdate importreceipt"
   },
   "keywords": [],
   "author": "",

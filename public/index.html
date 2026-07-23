@@ -2805,7 +2805,8 @@ function expiryUploadModal(hid, after, defDate){
           <tbody>${sample.map(r=>`<tr><td>${esc(r.name)}</td><td class="num">${esc(r.batch||'—')}</td><td class="num">${esc(r.expiry)}</td><td class="r num">${unitCell(r, units)}</td></tr>`).join('')}</tbody></table>
           <p class="mini-note">First ${sample.length} of ${parsed.rows.length} — check these read correctly before saving.</p>`:''}
         ${unitsSeg('exu', units)}
-        ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}`;
+        ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}
+        ${renderImportReceipt(parsed, false)}`;
       $$('[data-exu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.exu; setFileUnits(hid, 'freeform', units); renderExPrev(); });
       $('#exApply').disabled = !parsed.rows.length;
       if(!parsed.withExpiry) $('#exPrev').insertAdjacentHTML('beforeend','<p style="color:var(--red);font-size:13px">No expiry dates were found in this file — check it is the batch-wise report, not the plain stock summary.</p>');
@@ -2816,8 +2817,9 @@ function expiryUploadModal(hid, after, defDate){
     try{
       // strip the preview annotations — the snapshot stores clean strip rows
       const rows = viewRows().rows.map(({srcQty, packU, ...rest})=> rest);
-      const r = await api('/snapshots', {method:'POST', body:{hid, asOf:$('#exDate').value, rows, fileName:parsed.fileName}});
+      const r = await api('/snapshots', {method:'POST', body:{hid, asOf:$('#exDate').value, rows, fileName:parsed.fileName, source:parsed.source}});
       db.snapshots[hid] = (db.snapshots[hid]||[]).filter(x=>x.asOf!==r.snapshot.asOf).concat([r.snapshot]);
+      saveImportReceipt(hid, 'expiry', {...parsed, imported:r.imported, skipped:r.skipped});
       closeModal();
       toast(`${r.snapshot.rows.length} batch rows saved as on ${fmtDate(r.snapshot.asOf)}`,'green');
       if(after) after();
@@ -2837,6 +2839,65 @@ async function downloadTemplate(kind, label){
     document.body.appendChild(a); a.click(); a.remove();
     toast(`${label} template downloaded — fill it and upload it back`,'green');
   }catch(err){ toast('Could not download the template','red'); }
+}
+
+/* ---------------- the standard import receipt ----------------
+   One shape, one renderer, used by every upload modal: how many rows the file
+   had, how many actually landed, and exactly which did not — with a reason
+   each, grouped by reason, never silently truncated. fileRows === imported +
+   skipped.length always; a mismatch means a bug here, not a data problem. */
+function renderImportReceipt(receipt, downloadable){
+  if(!receipt) return '';
+  if(downloadable===undefined) downloadable = true;
+  const fileRows = receipt.fileRows||0, imported = receipt.imported||0, skipped = receipt.skipped||[], ignored = receipt.ignored||0;
+  const notImported = skipped.length;
+  const mismatch = fileRows !== imported + notImported;
+  const groups = {};
+  skipped.forEach(s=> (groups[s.reason]=groups[s.reason]||[]).push(s));
+  const groupList = Object.entries(groups).sort((a,b)=>b[1].length-a[1].length);
+  return `
+    <div class="import-receipt" style="margin-top:8px">
+      <p class="mini-note" style="margin:0 0 6px"><b>${fileRows} row${fileRows===1?'':'s'} in file · ${imported} imported · ${notImported} not imported</b>${ignored? ` <span style="color:var(--muted)">(${ignored} of those ${ignored===1?'was':'were'} total/subtotal rows, not a data problem)</span>`:''}</p>
+      ${mismatch? `<p class="mini-note" style="color:var(--red)">⚠ ${fileRows} in file but ${imported} imported + ${notImported} not imported don't add up to it — that is a bug here, not a data problem in your file.</p>`:''}
+      ${notImported? `
+        ${groupList.length>1? `<p class="mini-note" style="margin:0 0 4px">${groupList.map(([reason,rows])=>`${rows.length}× ${esc(reason)}`).join(' · ')}</p>`:''}
+        <div class="tbl-scroll" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:7px">
+          <table class="tbl"><thead><tr><th>Row</th><th>Item</th><th>Reason</th></tr></thead>
+          <tbody>${skipped.map(s=>`<tr><td class="num" style="color:var(--faint)">${s.row??'—'}</td><td>${esc(s.name||'—')}</td><td style="color:var(--red);font-size:12.5px">${esc(s.reason)}</td></tr>`).join('')}</tbody></table>
+        </div>
+        ${downloadable? `<button class="btn btn-sm" id="impNotImportedBtn" style="margin-top:6px">${IC.dl} Download not-imported rows</button>`:''}
+      `:''}
+    </div>`;
+}
+/* call right after setting innerHTML to renderImportReceipt(receipt) — wires the
+   download button to rebuild an xlsx in the SAME template shape, pre-filled
+   with whatever was captured for each skipped row, plus the reason. Kinds with
+   no fixed template (invoice/expiry — both free-form/AI) pass downloadable:false
+   to renderImportReceipt above, so there is no button here to wire at all. */
+function wireImportReceipt(receipt, kind){
+  const btn = $('#impNotImportedBtn');
+  if(!btn || !receipt || !receipt.skipped || !receipt.skipped.length) return;
+  btn.onclick = async ()=>{
+    btn.disabled = true;
+    try{
+      const res = await fetch('/api/import-receipts/not-imported', {method:'POST', credentials:'same-origin',
+        headers:{'Content-Type':'application/json'}, body:JSON.stringify({kind, skipped: receipt.skipped})});
+      if(!res.ok){ toast('Could not build the file','red'); btn.disabled=false; return; }
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = `${kind}-not-imported-${todayISO()}.xlsx`;
+      document.body.appendChild(a); a.click(); a.remove();
+    }catch(e){ toast('Could not build the file','red'); }
+    btn.disabled = false;
+  };
+}
+/* Persisted so a drop is still auditable after the dialog closes — surfaced in
+   History. Called once the receipt is FINAL (after the save step, not right
+   after parsing), so it reflects what actually landed. Best-effort: the upload
+   already succeeded, so a failure here never blocks or re-alarms the user. */
+async function saveImportReceipt(hid, kind, receipt){
+  if(state.demo || !receipt) return;
+  try{ await api('/import-receipts', {method:'POST', body:{hid, kind, ...receipt}}); }catch(e){}
 }
 
 /* ---------- tablets → strips ----------
@@ -2965,7 +3026,8 @@ function purchaseUploadModal(e, locked){
       <p class="mini-note">${rows.length} line${rows.length===1?'':'s'} · ${fmtQ(totals.tq)} strips in · purchase value ${fmtRs(totals.amt)} — all under <b>${esc($('#puVendor').value.trim())}</b>.</p>
       ${unitsSeg('puu', units)}
       ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} item${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size on the Item Master to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}
-      ${(parsed.blocked||[]).length? `<p class="mini-note" style="color:var(--red)">✕ ${parsed.blocked.length} row${parsed.blocked.length===1?'':'s'} blocked:<br>${parsed.blocked.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name)}: ${esc(x.reason)}`).join('<br>')}${parsed.blocked.length>6?'<br>…':''}<br>Fill the pack on those rows and re-upload — the rows above import fine.</p>`:''}`;
+      ${renderImportReceipt(parsed)}`;
+    wireImportReceipt(parsed, 'purchase');
     $$('[data-puu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.puu; setFileUnits(state.hospital, 'template', units); renderPuPrev(); });
     $('#puGo').disabled = !rows.length;
   };
@@ -3001,6 +3063,7 @@ function purchaseUploadModal(e, locked){
     e.invoices.push(inv);                 // APPEND — a second file for the same vendor/day is a second invoice
     syncInvoicePurchase(e, inv);          // its derived purchase-summary row, like a manual invoice
     markDirty();
+    saveImportReceipt(state.hospital, 'purchase', parsed);
     closeModal();
     renderEntryTab(e, locked);
     await saveEntry(e);
@@ -3059,8 +3122,9 @@ function gpUploadModal(e, locked){
           : (items.length? '<p class="mini-note">These rows carry no cost price, so only the day\'s totals can be filled — not the per-item margin.</p>':'')}
         ${off.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${off.length} item${off.length===1?'':'s'} priced away from the Item Master: ${off.slice(0,4).map(r=>esc(r.item)).join(', ')}${off.length>4?` and ${off.length-4} more`:''}. Saving the day alerts the admin.</p>`:''}
         ${items.length? (parsed.tabletsCol? '<p class="mini-note">This sheet has its own tablets column — each row already says which unit it counts, so the file-level toggle is off.</p>' : unitsSeg('gpu', units)) : ''}
-        ${(parsed.rejected||[]).length? `<p class="mini-note" style="color:var(--red)">✕ ${parsed.rejected.length} row${parsed.rejected.length===1?'':'s'} rejected:<br>${parsed.rejected.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name)}: ${esc(x.reason)}`).join('<br>')}${parsed.rejected.length>6?'<br>…':''}</p>`:''}
-        ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by (${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}) — their counts are kept as-is. Add the pack on the Item Master and re-read.</p>`:''}`;
+        ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by (${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}) — their counts are kept as-is. Add the pack on the Item Master and re-read.</p>`:''}
+        ${renderImportReceipt(parsed)}`;
+      wireImportReceipt(parsed, 'sales');
       $$('[data-gpu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.gpu; setFileUnits(state.hospital, parsed.source, units); renderPrev(); });
       $('#gpApply').disabled = !(parsed.salesMrp>0);
       if(!(parsed.salesMrp>0)) $('#gpPrev').insertAdjacentHTML('beforeend','<p style="color:var(--red);font-size:13px">No sales value could be worked out from this file.</p>');
@@ -3087,6 +3151,7 @@ function gpUploadModal(e, locked){
       item:r.item, qty:num(r.qty), amount:num(r.amount),
       pack:r.pack||'', nr:num(r.nr), mrp:num(r.mrp), cost:num(r.cost)
     }));
+    saveImportReceipt(state.hospital, 'sales', parsed);
     closeModal();
     toast(`Sales & margin filled${parsed.items&&parsed.items.length? ` · ${parsed.items.length} item row${parsed.items.length===1?'':'s'} loaded`:''}`,'green');
     state.entryTab = 1;
@@ -3188,6 +3253,37 @@ async function saveEntry(e){
 }
 
 /* ---------------- history ---------------- */
+/* the four upload kinds with a fixed template shape — everything else
+   (invoice/expiry, both AI-only) never gets a "download not-imported" button */
+const IMPORT_TEMPLATE_KINDS = ['sales','opening','purchase','items'];
+async function loadImportReceipts(hid){
+  state.impReceipts = state.impReceipts||{};
+  if(state.demo){ state.impReceipts[hid] = []; return; }
+  try{ state.impReceipts[hid] = (await api(`/import-receipts?hid=${encodeURIComponent(hid)}`)).receipts; }
+  catch(e){ state.impReceipts[hid] = []; }
+}
+/* One row per upload, so a drop is still auditable after the dialog closed —
+   at most one detail row expanded at a time (state.histExpand), so the shared
+   receipt component's one download-button id is never duplicated in the DOM. */
+function renderReceiptsCard(receipts){
+  if(receipts===undefined) return '<p class="mini-note" style="padding:12px">Loading…</p>';
+  if(!receipts.length) return '<p class="mini-note" style="padding:12px;color:var(--faint)">No uploads recorded yet.</p>';
+  return `<div class="tbl-scroll"><table class="tbl">
+    <thead><tr><th>When</th><th>Kind</th><th>File</th><th class="r">In file</th><th class="r">Imported</th><th class="r">Not imported</th><th>By</th><th></th></tr></thead>
+    <tbody>${receipts.map((r,ix)=>{
+      const open = state.histExpand===ix;
+      return `<tr>
+        <td class="num" style="font-size:12px">${fmtDateShort(iso(new Date(r.at)))}</td>
+        <td style="text-transform:capitalize">${esc(r.kind)}</td>
+        <td style="color:var(--muted);font-size:12.5px">${esc(r.fileName||'—')}</td>
+        <td class="r num">${r.fileRows}</td>
+        <td class="r num">${r.imported}</td>
+        <td class="r num" style="color:${r.skipped.length?'var(--red)':'var(--faint)'}">${r.skipped.length}</td>
+        <td style="font-size:12px;color:var(--muted)">${esc(r.user||'—')}</td>
+        <td>${r.skipped.length? `<button class="btn btn-sm" data-recx="${ix}">${open?'Hide':'View'}</button>`:''}</td>
+      </tr>${open? `<tr><td colspan="8">${renderImportReceipt(r, IMPORT_TEMPLATE_KINDS.includes(r.kind))}</td></tr>`:''}`;
+    }).join('')}</tbody></table></div>`;
+}
 function renderHistory(){
   const hid = state.hospital;
   const today = todayISO();
@@ -3206,13 +3302,22 @@ function renderHistory(){
       <td>${e.audit.unbilled?'<span class="chip chip-red">Unbilled</span>':''} ${c.hvMismatch>0?'<span class="chip chip-red">HV</span>':''} ${c.bounceCount>0?`<span class="chip chip-amber">${c.bounceCount} bounce</span>`:''}</td>
       <td><button class="btn btn-sm" data-open="${d}">Open</button></td></tr>`;
   }).join('');
+  const receipts = (state.impReceipts||{})[hid];
+  if(receipts===undefined) loadImportReceipts(hid).then(()=>{ if(state.hospital===hid) renderHistory(); });
   $('#content').innerHTML = `
     <div class="entry-bar">${hospSelect('histHosp')}<span class="eyebrow" style="margin-left:6px">Last 30 days</span></div>
     <div class="card"><div class="tbl-scroll"><table class="tbl">
       <thead><tr><th>Date</th><th class="r">Sales (MRP)</th><th class="r">Margin</th><th class="r">Purchases</th><th class="r">Variance</th><th>Flags</th><th></th></tr></thead>
-      <tbody>${rows}</tbody></table></div></div>`;
-  const hh=$('#histHosp'); if(hh) hh.onchange = ev=>{ state.hospital=ev.target.value; renderHistory(); };
+      <tbody>${rows}</tbody></table></div></div>
+    <div class="subhead" style="margin-top:16px"><h4>Recent uploads</h4><div class="rule"></div></div>
+    <div class="card">${renderReceiptsCard(receipts)}</div>`;
+  const hh=$('#histHosp'); if(hh) hh.onchange = ev=>{ state.hospital=ev.target.value; state.histExpand=null; renderHistory(); };
   $$('[data-open]').forEach(b=> b.onclick=()=>{ state.date=b.dataset.open; state.entryTab=0; state.entryMode='daily'; goTab('entry'); });
+  $$('[data-recx]').forEach(b=> b.onclick=()=>{ const ix=+b.dataset.recx; state.histExpand = state.histExpand===ix? null : ix; renderHistory(); });
+  if(state.histExpand!=null && receipts && receipts[state.histExpand]){
+    const r = receipts[state.histExpand];
+    wireImportReceipt(r, IMPORT_TEMPLATE_KINDS.includes(r.kind)? r.kind : null);
+  }
 }
 
 /* ---------------- vendors ---------------- */
@@ -4938,8 +5043,9 @@ function itemImportModal(hid){
       <div class="field"><label>Or paste rows — <span class="num" style="font-size:12px">Product name, Net rate/strip, MRP/strip, Pack size, Molecule</span></label><textarea class="in" id="icsvPaste" rows="5" placeholder="Tab. Pantoprazole 40,38,58,10s,Pantoprazole 40mg"></textarea></div>
       <div id="icsvPreview"></div>
     </div>
-    <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn" id="icsvPrev">Preview</button><button class="btn btn-primary" id="icsvGo" disabled>Import</button></div>`);
+    <div class="modal-foot" id="icsvFoot"><button class="btn modal-x">Cancel</button><button class="btn" id="icsvPrev">Preview</button><button class="btn btn-primary" id="icsvGo" disabled>Import</button></div>`);
   let parsed = [];
+  let lastReceipt = null;   // the PARSE-stage receipt; imported/skipped get overwritten with the real save outcome
   // a row for an item we already hold is not always a no-op: if it carries a
   // molecule or pack size the master is missing, the import fills that blank
   // (never a differing one — that stays whatever the master already says)
@@ -4951,17 +5057,30 @@ function itemImportModal(hid){
   };
   const doParse = text=>{
     parsed = [];
+    const skipped = [];
+    let fileRows = 0;
     text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).forEach(line=>{
-      if(/item\s*name|product\s*name/i.test(line)) return;
+      if(/item\s*name|product\s*name/i.test(line)) return;   // header line — not a data row
+      fileRows++;
+      const row = fileRows;
       const parts = line.split(',').map(x=>x.trim());
-      if(parts.length>=3 && parts[0]){
-        const nr = num(parts[1]), mrp = num(parts[2]);
-        const bad = nr<=0 || mrp<=0 || nr>mrp;
-        const dup = !!findItem(hid, parts[0]);
-        parsed.push({name:parts[0], nr, mrp, pack:parts[3]||'', molecule:parts[4]||'', dup, bad});
-      }
+      if(!parts[0]){ skipped.push({row, name:'', reason:'no product name'}); return; }
+      if(parts.length<3){ skipped.push({row, name:parts[0], reason:'need at least name, net rate and MRP'}); return; }
+      const nr = num(parts[1]), mrp = num(parts[2]);
+      const bad = nr<=0 || mrp<=0 || nr>mrp;
+      const dup = !!findItem(hid, parts[0]);
+      parsed.push({row, name:parts[0], nr, mrp, pack:parts[3]||'', molecule:parts[4]||'', dup, bad});
     });
+    lastReceipt = {fileName:'', sheet:null, fileRows, parsed:parsed.length, imported:0, skipped, ignored:0, source:'paste'};
     showPreview();
+  };
+  // rows dropped at READ time (blank name, a total row) — shown before the user
+  // commits; the full standard receipt (with a real imported count) only makes
+  // sense AFTER the save, in showDone below
+  const readSkipNote = ()=>{
+    const s = (lastReceipt||{}).skipped||[];
+    if(!s.length) return '';
+    return `<p class="mini-note" style="color:var(--red)">✕ ${s.length} row${s.length===1?'':'s'} could not be read: ${s.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name||'(blank)')}: ${esc(x.reason)}`).join('; ')}${s.length>6?'…':''}</p>`;
   };
   /* the same preview whether the rows came from a pasted CSV or a read template */
   const showPreview = (note)=>{
@@ -4975,7 +5094,8 @@ function itemImportModal(hid){
         const fillLabel = fill? (fill.molFill && fill.packFill? 'Fills molecule + pack' : fill.molFill? 'Fills molecule' : 'Fills pack') : '';
         return `<tr><td>${esc(p.name)}</td><td style="color:var(--muted);font-size:12.5px">${esc(p.molecule||'—')}</td><td class="num" style="color:var(--muted)">${esc(p.pack||'—')}</td><td class="r num">${p.nr}</td><td class="r num">${p.mrp}</td><td class="r num">${pct(marginPct(p.nr,p.mrp))}</td><td>${p.bad?'<span class="chip chip-red">Bad price</span>': fill?`<span class="chip chip-blue">${fillLabel}</span>`: p.dup?'<span class="chip chip-gray">Duplicate</span>':'<span class="chip chip-green">New</span>'}</td></tr>`;
       }).join('')}</tbody></table></div>
-      <p class="mini-note">${note? esc(note)+' · ':''}${fresh.length} new item${fresh.length===1?'':'s'} will be imported${fills.length? ` · ${fills.length} existing item${fills.length===1?'':'s'} gain a molecule/pack (prices untouched)`:''} · ${parsed.length-fresh.length-fills.length} skipped${parsed.some(p=>p.bad)? ' (a net rate above the MRP is refused — that would sell at a loss)':''}</p>` : '<p class="mini-note">No valid rows found.</p>';
+      <p class="mini-note">${note? esc(note)+' · ':''}${fresh.length} new item${fresh.length===1?'':'s'} will be imported${fills.length? ` · ${fills.length} existing item${fills.length===1?'':'s'} gain a molecule/pack (prices untouched)`:''} · ${parsed.length-fresh.length-fills.length} skipped${parsed.some(p=>p.bad)? ' (a net rate above the MRP is refused — that would sell at a loss)':''}</p>
+      ${readSkipNote()}` : `<p class="mini-note">No valid rows found.</p>${readSkipNote()}`;
     $('#icsvGo').disabled = fresh.length===0 && fills.length===0;
   };
   const it=$('#itmTpl'); if(it) it.onclick = ()=> downloadTemplate('items', 'Item Master');
@@ -4988,8 +5108,9 @@ function itemImportModal(hid){
         const r = await apiUpload(`/parse/items?hid=${encodeURIComponent(hid)}`, f);
         parsed = r.rows.map(x=>{
           const bad = !(num(x.nr)>0) || !(num(x.mrp)>0) || num(x.nr)>num(x.mrp);
-          return {name:x.name, nr:num(x.nr), mrp:num(x.mrp), pack:x.pack||'', molecule:x.molecule||'', dup: !!findItem(hid,x.name), bad};
+          return {row:x.row, name:x.name, nr:num(x.nr), mrp:num(x.mrp), pack:x.pack||'', molecule:x.molecule||'', dup: !!findItem(hid,x.name), bad};
         });
+        lastReceipt = {fileName:f.name, sheet:r.sheet, fileRows:r.fileRows, parsed:r.parsed, imported:0, skipped:r.skipped||[], ignored:r.ignored||0, source:r.source||'template'};
         showPreview(r.note);
       }catch(err){ $('#icsvPreview').innerHTML = `<p style="color:var(--red);font-size:13px">${esc(err.message)}</p>`; }
       btn.disabled=false; btn.textContent='Preview';
@@ -4997,6 +5118,12 @@ function itemImportModal(hid){
     }
     if(f){ const rd=new FileReader(); rd.onload=()=>doParse(rd.result); rd.readAsText(f); }
     else doParse($('#icsvPaste').value);
+  };
+  const showDone = (receipt)=>{
+    $('#icsvPreview').insertAdjacentHTML('beforeend', renderImportReceipt(receipt));
+    wireImportReceipt(receipt, 'items');
+    $('#icsvFoot').innerHTML = `<span style="flex:1"></span><button class="btn btn-primary" id="icsvDone">Done</button>`;
+    $('#icsvDone').onclick = closeModal;
   };
   $('#icsvGo').onclick = async ()=>{
     const fresh = parsed.filter(p=>!p.dup && !p.bad);
@@ -5008,12 +5135,17 @@ function itemImportModal(hid){
     }
     const btn=$('#icsvGo'); btn.disabled=true;
     try{
-      const r = await api('/items/bulk',{method:'POST', body:{hid, items:fresh.concat(fills)}});
+      // the FULL parsed set, not a client pre-filter — the server is the one
+      // source of truth for what got created/filled/skipped and why
+      const r = await api('/items/bulk',{method:'POST', body:{hid, items:parsed,
+        fileName:(lastReceipt||{}).fileName, sheet:(lastReceipt||{}).sheet, fileRows:(lastReceipt||{}).fileRows, source:(lastReceipt||{}).source}});
       r.created.forEach(it=> db.items[hid].push(it));
       (r.filled||[]).forEach(f=>{ const it=(db.items[hid]||[]).find(x=>x.id===f.id); if(it) Object.assign(it, f); });
-      closeModal();
-      toast(`${r.created.length} item${r.created.length===1?'':'s'} imported${(r.filled||[]).length? ` · ${r.filled.length} filled in`:''}`,'green');
       renderItems();
+      const finalReceipt = {...(lastReceipt||{}), imported:r.imported, skipped:r.skipped, ignored:r.ignored};
+      saveImportReceipt(hid, 'items', finalReceipt);
+      toast(`${r.created.length} item${r.created.length===1?'':'s'} imported${(r.filled||[]).length? ` · ${r.filled.length} filled in`:''}`,'green');
+      showDone(finalReceipt);
     }catch(err){ btn.disabled=false; toast(err.message,'red'); }
   };
 }
@@ -6135,10 +6267,18 @@ function openingStockModal(hid){
         <textarea class="in" id="osPaste" rows="4" placeholder="Tab. Pantoprazole 40,120,38,58,10s"></textarea></div>
       <div id="osPrev"></div>
     </div>
-    <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn" id="osRead">Read / preview</button><button class="btn btn-primary" id="osGo" disabled>Save opening stock</button></div>`);
+    <div class="modal-foot" id="osFoot"><button class="btn modal-x">Cancel</button><button class="btn" id="osRead">Read / preview</button><button class="btn btn-primary" id="osGo" disabled>Save opening stock</button></div>`);
 
   const ot=$('#osTpl'); if(ot) ot.onclick = ()=> downloadTemplate('opening', 'Opening stock');
 
+  // rows dropped at READ time — shown before the user commits; the full
+  // standard receipt (with a real imported count) only makes sense AFTER the
+  // save, since /items/opening can still reject a row (e.g. nr above the MRP)
+  const readSkipNote = ()=>{
+    const s = (lastMeta.skipped)||[];
+    if(!s.length) return '';
+    return `<p class="mini-note" style="color:var(--red)">✕ ${s.length} row${s.length===1?'':'s'} could not be read: ${s.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name||'(blank)')}: ${esc(x.reason)}`).join('; ')}${s.length>6?'…':''}</p>`;
+  };
   const preview = (rows0, note, src, meta)=>{
     rawRows = rows0; lastNote = note||'';
     if(meta!==undefined) lastMeta = meta||{};
@@ -6165,17 +6305,27 @@ function openingStockModal(hid){
       <p class="mini-note">${rows.length} item${rows.length===1?'':'s'} · ${known} already on the master (opening qty updated) · ${rows.length-known} will be added.${note? ' '+esc(note):''}</p>
       ${lastMeta.tabletsCol? '<p class="mini-note">This sheet has its own tablets column — each row already says which unit it counts, so the file-level toggle is off.</p>' : unitsSeg('osu', units)}
       ${units==='tablets' && !lastMeta.tabletsCol && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}
-      ${(lastMeta.rejected||[]).length? `<p class="mini-note" style="color:var(--red)">✕ ${lastMeta.rejected.length} row${lastMeta.rejected.length===1?'':'s'} rejected:<br>${lastMeta.rejected.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name)}: ${esc(x.reason)}`).join('<br>')}${lastMeta.rejected.length>6?'<br>…':''}</p>`:''}` :
-      '<p class="mini-note">No valid rows found.</p>';
+      ${readSkipNote()}` :
+      '<p class="mini-note">No valid rows found.</p>'+readSkipNote();
     $$('[data-osu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.osu; setFileUnits(hid, lastSrc, units); preview(rawRows, lastNote); });
     $('#osGo').disabled = rows.length===0;
   };
-  const parseText = txt => preview(txt.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).map(line=>{
-      if(/item\s*name|^item,/i.test(line)) return null;
+  const parseText = txt => {
+    const rows = [], skipped = [];
+    let fileRows = 0;
+    txt.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).forEach(line=>{
+      if(/item\s*name|^item,/i.test(line)) return;   // header line — not a data row
+      fileRows++;
+      const row = fileRows;
       const p = line.split(',').map(x=>x.trim());
-      if(p.length<2 || !p[0]) return null;
-      return {name:p[0], qty:num(p[1]), nr:num(p[2]), mrp:num(p[3]), pack:p[4]||''};
-    }).filter(r=> r && r.qty>=0));
+      if(!p[0]){ skipped.push({row, name:'', reason:'no product name'}); return; }
+      if(p.length<2){ skipped.push({row, name:p[0], reason:'need at least name and opening qty'}); return; }
+      const qty = num(p[1]);
+      if(qty<0){ skipped.push({row, name:p[0], reason:'negative opening count'}); return; }
+      rows.push({name:p[0], qty, nr:num(p[2]), mrp:num(p[3]), pack:p[4]||''});
+    });
+    preview(rows, '', 'paste', {fileName:'', sheet:null, fileRows, parsed:rows.length, imported:0, skipped, ignored:0, source:'paste'});
+  };
 
   $('#osRead').onclick = async ()=>{
     const f = $('#osFile') && $('#osFile').files[0];
@@ -6184,7 +6334,8 @@ function openingStockModal(hid){
       try{
         const r = await apiUpload(`/parse/stock?hid=${encodeURIComponent(hid)}`, f);
         if(r.stockDate) $('#osDate').value = r.stockDate;
-        preview(r.items, r.note, r.source, {tabletsCol:r.tabletsCol, rejected:r.rejected});
+        preview(r.items, r.note, r.source, {fileName:f.name, sheet:r.sheet, fileRows:r.fileRows, parsed:r.parsed, imported:0,
+          skipped:r.skipped||[], ignored:r.ignored||0, source:r.source, tabletsCol:r.tabletsCol});
       }catch(err){ $('#osPrev').innerHTML = `<p style="color:var(--red);font-size:13px">${esc(err.message)}</p>`; }
       btn.disabled=false; btn.textContent='Read / preview';
       return;
@@ -6196,6 +6347,12 @@ function openingStockModal(hid){
   // user reads a file, then goes back and corrects the date before saving
   $('#osDate').onchange = ()=>{ if(parsed) preview(rawRows, lastNote); };
 
+  const showDone = (receipt)=>{
+    $('#osPrev').insertAdjacentHTML('beforeend', renderImportReceipt(receipt));
+    wireImportReceipt(receipt, 'opening');
+    $('#osFoot').innerHTML = `<span style="flex:1"></span><button class="btn btn-primary" id="osDone">Done</button>`;
+    $('#osDone').onclick = closeModal;
+  };
   $('#osGo').onclick = async ()=>{
     if(!parsed || !parsed.length) return;
     const stockDate = $('#osDate').value;
@@ -6222,13 +6379,16 @@ function openingStockModal(hid){
       closeModal(); toast(`Opening stock saved for ${parsed.length} item${parsed.length===1?'':'s'} (demo)`,'green'); renderInventory(); return;
     }
     try{
-      const r = await api('/items/opening',{method:'POST', body:{hid, stockDate, rows:parsed}});
+      const r = await api('/items/opening',{method:'POST', body:{hid, stockDate, rows:parsed,
+        fileName:lastMeta.fileName, source:lastMeta.source}});
       db.hospitals[hid] = r.hospital;
       r.created.forEach(it=> db.items[hid].push(it));
       r.updated.forEach(it=>{ const ix = db.items[hid].findIndex(x=>x.id===it.id); if(ix>=0) db.items[hid][ix]=it; });
-      closeModal();
-      toast(`Opening stock set as on ${fmtDateShort(r.stockDate)} — ${r.created.length} added, ${r.updated.length} updated`,'green');
       renderInventory();
+      const finalReceipt = {...lastMeta, imported:r.imported, skipped:r.skipped||[]};
+      saveImportReceipt(hid, 'opening', finalReceipt);
+      toast(`Opening stock set as on ${fmtDateShort(r.stockDate)} — ${r.created.length} added, ${r.updated.length} updated`,'green');
+      showDone(finalReceipt);
     }catch(err){ btn.disabled=false; toast(err.message,'red'); }
   };
 }

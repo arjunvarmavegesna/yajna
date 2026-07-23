@@ -173,6 +173,16 @@ CREATE TABLE IF NOT EXISTS price_log(
   old_nr REAL, old_mrp REAL, new_nr REAL, new_mrp REAL,
   note TEXT DEFAULT '', user_name TEXT DEFAULT '', ts INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_plog_item ON price_log(item_id);
+/* One row per upload, so a drop is still auditable after the dialog is closed.
+   skipped is the row-level detail (JSON [{row,name,reason}]); everything else
+   is the reconciliation counters — fileRows === imported + skipped.length. */
+CREATE TABLE IF NOT EXISTS import_receipts(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL, kind TEXT NOT NULL,
+  file_name TEXT DEFAULT '', sheet TEXT, file_rows INTEGER NOT NULL DEFAULT 0,
+  parsed INTEGER NOT NULL DEFAULT 0, imported INTEGER NOT NULL DEFAULT 0,
+  skipped TEXT NOT NULL DEFAULT '[]', ignored INTEGER NOT NULL DEFAULT 0,
+  source TEXT DEFAULT '', user_name TEXT DEFAULT '', created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_rcpt_h ON import_receipts(hospital_id, created_at);
 `);
 
 /* migrate: single hospital_id -> hospital_ids list + portal on/off flag */
@@ -975,7 +985,7 @@ app.post('/api/clear', auth, requireRole('admin'), (req, res) => {
    than inferred, and the impact is countable before anything happens. */
 const HOSPITAL_TABLES = ['entries', 'notifications', 'vendors', 'payments', 'items', 'price_log', 'pending_items', 'item_aliases', 'wa_outbox', 'approval_batches',
   'stock_adjustments', 'receivables', 'receivable_actions', 'expiry_snapshots', 'period_data',
-  'hv_tracked', 'report_prefs'];
+  'hv_tracked', 'report_prefs', 'import_receipts'];
 
 /* What would go, and who would be left without a hospital — answered BEFORE the
    delete, so the confirmation can show it rather than surprise anyone. */
@@ -2201,7 +2211,7 @@ app.get('/api/items/opening/movements-after', auth, requireRole('admin'), (req, 
 /* opening stock: the one-time count taken when the pharmacy starts with us.
    Upserts the master (name/pack/nr/mrp) and sets each item's opening quantity. */
 app.post('/api/items/opening', auth, requireRole('admin'), (req, res) => {
-  const { hid, stockDate, rows } = req.body || {};
+  const { hid, stockDate, rows, fileName, source } = req.body || {};
   const h = scopeCheck(req, S(hid, 60));
   if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows must be an array' });
   /* The count date decides which movements land on top of it — a wrong date
@@ -2214,53 +2224,58 @@ app.post('/api/items/opening', auth, requireRole('admin'), (req, res) => {
   const sd = stockDate;
   if (sd > todayISO()) return res.status(400).json({ error: 'Stock count date cannot be in the future' });
   const now = Date.now();
-  const created = [], updated = [];
+  const created = [], updated = [], skipped = [];
   const tx = db.transaction(() => {
     const find = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
     const ins = db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,opening_qty,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)');
     const upd = db.prepare('UPDATE items SET opening_qty=?, pack=?, nr=?, mrp=?, updated_at=? WHERE id=?');
-    for (const raw of rows.slice(0, 5000)) {
+    rows.slice(0, 5000).forEach((raw, ix) => {
+      const row = raw.row ?? (ix + 1);
       const name = S(raw.name, 150).trim();
-      if (!name) continue;
+      if (!name) { skipped.push({ row, name: '', reason: 'no product name' }); return; }
       const qty = N(raw.qty);
-      if (qty < 0) continue;
+      if (qty < 0) { skipped.push({ row, name, reason: 'negative opening count' }); return; }
       const key = nameKey(name);
       const ex = find.get(hid, key);
       if (ex) {
         // keep existing prices unless the file supplies better ones
         const nr = N(raw.nr) > 0 ? N(raw.nr) : ex.nr;
         const mrp = N(raw.mrp) > 0 ? N(raw.mrp) : ex.mrp;
-        if (nr > mrp && mrp > 0) continue;
+        if (nr > mrp && mrp > 0) { skipped.push({ row, name, reason: 'net rate would exceed the MRP — kept as it was' }); return; }
         upd.run(qty, S(raw.pack, 60) || ex.pack, nr, mrp, now, ex.id);
         updated.push(rowItem({ ...ex, opening_qty: qty, nr, mrp, pack: S(raw.pack, 60) || ex.pack, updated_at: now }));
       } else {
         const nr = N(raw.nr), mrp = N(raw.mrp);
-        if (nr > mrp && mrp > 0) continue;
+        if (nr > mrp && mrp > 0) { skipped.push({ row, name, reason: 'net rate above the MRP — that would sell at a loss' }); return; }
         const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack: S(raw.pack, 60), nr, mrp, opening_qty: qty, source: 'opening', updated_at: now };
         ins.run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.opening_qty, it.source, it.updated_at);
         created.push(rowItem(it));
       }
-    }
+    });
     db.prepare('UPDATE hospitals SET stock_date=? WHERE id=?').run(sd, hid);
   });
   tx();
-  res.json({ created, updated, stockDate: sd, hospital: rowHosp({ ...h, stock_date: sd }) });
+  res.json({ created, updated, skipped, stockDate: sd, hospital: rowHosp({ ...h, stock_date: sd }),
+    ...receiptFields({ fileName: S(fileName, 200), sheet: null, fileRows: rows.length,
+      parsed: rows.length, imported: created.length + updated.length, skipped, ignored: 0, source: S(source, 20) || 'template' }) });
 });
 
 app.post('/api/items/bulk', auth, requireRole('admin'), (req, res) => {
-  const { hid, items } = req.body || {};
+  const { hid, items, fileName, sheet, fileRows, source } = req.body || {};
   scopeCheck(req, S(hid, 60));
   if (!Array.isArray(items)) return res.status(400).json({ error: 'items must be an array' });
   const now = Date.now();
-  const created = [], filled = [];
+  const created = [], filled = [], skipped = [];
   const tx = db.transaction(() => {
     const find = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
     const ins = db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,source,updated_at,molecule) VALUES(?,?,?,?,?,?,?,?,?,?)');
     const fill = db.prepare('UPDATE items SET molecule=?, pack=?, updated_at=? WHERE id=?');
-    for (const raw of items.slice(0, 3000)) {
+    items.slice(0, 3000).forEach((raw, ix) => {
+      const row = raw.row ?? (ix + 1);
       const name = S(raw.name, 150).trim();
       const nr = N(raw.nr), mrp = N(raw.mrp);
-      if (!name || nr <= 0 || mrp <= 0 || nr > mrp) continue;
+      if (!name) { skipped.push({ row, name: '', reason: 'no product name' }); return; }
+      if (nr <= 0 || mrp <= 0 || nr > mrp) { skipped.push({ row, name, reason: 'net rate and MRP must be positive, and net rate cannot exceed MRP' }); return; }
       const key = nameKey(name), mol = S(raw.molecule, 150).trim(), pack = S(raw.pack, 60).trim();
       const ex = find.get(hid, key);
       if (ex) {
@@ -2273,16 +2288,20 @@ app.post('/api/items/bulk', auth, requireRole('admin'), (req, res) => {
           const newMol = molFill ? mol : ex.molecule, newPack = packFill ? pack : ex.pack;
           fill.run(newMol, newPack, now, ex.id);
           filled.push(rowItem({ ...ex, molecule: newMol, pack: newPack, updated_at: now }));
+        } else {
+          skipped.push({ row, name, reason: 'already on the master — nothing new to fill' });
         }
-        continue;
+        return;
       }
       const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack, nr, mrp, molecule: mol, source: 'import', updated_at: now };
       ins.run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.source, it.updated_at, it.molecule);
       created.push(rowItem(it));
-    }
+    });
   });
   tx();
-  res.json({ created, filled });
+  res.json({ created, filled, skipped,
+    ...receiptFields({ fileName: S(fileName, 200), sheet: sheet ? S(sheet, 80) : null, fileRows: N(fileRows) || items.length,
+      parsed: items.length, imported: created.length + filled.length, skipped, ignored: 0, source: S(source, 20) || 'template' }) });
 });
 
 /* XLSX of the item master — its Sheet 1 headers are the SAME ones
@@ -2316,6 +2335,87 @@ app.post('/api/items/export', auth, (req, res) => {
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="${b.hid}-item-master-${today}.xlsx"`);
+  res.send(buf);
+});
+
+const rowReceipt = (r) => ({ id: r.id, kind: r.kind, fileName: r.file_name || '', sheet: r.sheet,
+  fileRows: r.file_rows, parsed: r.parsed, imported: r.imported,
+  skipped: JSON.parse(r.skipped || '[]'), ignored: r.ignored, source: r.source || '',
+  user: r.user_name || '', at: r.created_at });
+
+/* One row per upload, written by the client once a receipt is FINAL — after the
+   save step, not right after parsing, so it reflects what actually landed, not
+   just what a file preview predicted. Kept even after the dialog closes: an
+   import that dropped rows stays auditable in History, not just in a toast. */
+app.post('/api/import-receipts', auth, requireRole('admin'), (req, res) => {
+  const b = req.body || {};
+  scopeCheck(req, S(b.hid, 60));
+  const rec = {
+    id: uid('rcpt'), hospital_id: b.hid, kind: S(b.kind, 30),
+    file_name: S(b.fileName, 200), sheet: b.sheet ? S(b.sheet, 80) : null,
+    file_rows: N(b.fileRows), parsed: N(b.parsed), imported: N(b.imported),
+    skipped: JSON.stringify((Array.isArray(b.skipped) ? b.skipped : []).slice(0, 2000)),
+    ignored: N(b.ignored), source: S(b.source, 20), user_name: req.user.name, created_at: Date.now()
+  };
+  db.prepare('INSERT INTO import_receipts(id,hospital_id,kind,file_name,sheet,file_rows,parsed,imported,skipped,ignored,source,user_name,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(rec.id, rec.hospital_id, rec.kind, rec.file_name, rec.sheet, rec.file_rows, rec.parsed, rec.imported, rec.skipped, rec.ignored, rec.source, rec.user_name, rec.created_at);
+  // keep the last 50 per hospital — plenty of headroom over the 20 the UI shows
+  db.prepare(`DELETE FROM import_receipts WHERE hospital_id=? AND id NOT IN
+    (SELECT id FROM import_receipts WHERE hospital_id=? ORDER BY created_at DESC LIMIT 50)`).run(b.hid, b.hid);
+  res.json({ receipt: rowReceipt(rec) });
+});
+
+app.get('/api/import-receipts', auth, requireRole('admin'), (req, res) => {
+  const hid = S(req.query.hid, 60);
+  scopeCheck(req, hid);
+  const rows = db.prepare('SELECT * FROM import_receipts WHERE hospital_id=? ORDER BY created_at DESC LIMIT 20').all(hid).map(rowReceipt);
+  res.json({ receipts: rows });
+});
+
+/* a not-imported row's ORIGINAL values, mapped back onto this template's own
+   column key — so "download not-imported rows" hands back a sheet the user
+   can fix in place and re-upload directly, not a bare list of names. Values
+   readTemplate never had a chance to capture (e.g. the tablets source on a
+   both-units-given reject) come back blank for the user to re-key. */
+function skipCellValue(kind, s, colKey) {
+  switch (colKey) {
+    case 'name': return s.name || '';
+    case 'pack': return s.pack || '';
+    case 'mol': return s.molecule || '';
+    case 'nr': return s.nr ?? '';
+    case 'mrp': return s.mrp ?? '';
+    case 'pqty': return s.pqty ?? '';
+    case 'oqty': return s.oqty ?? '';
+    case 'rate': return s.rate ?? '';
+    case 'disc': return s.disc ?? '';
+    case 'gst': return s.gst ?? '';
+    case 'qty': return (kind === 'sales' || kind === 'opening') ? (s.qty ?? '') : '';
+    case 'open': return s.qty ?? '';
+    default: return '';    // qtyTab/openTab: the tablets source isn't retained generically
+  }
+}
+/* Read-only: rebuilds a sheet in the SAME shape as the upload template, one row
+   per skipped item, pre-filled with whatever was captured plus a Reason column
+   — so fixing the flagged cell and re-uploading the SAME file format works. */
+app.post('/api/import-receipts/not-imported', auth, requireRole('admin'), (req, res) => {
+  const b = req.body || {};
+  const kind = S(b.kind, 30);
+  const T = TEMPLATES[kind];
+  if (!T) return res.status(400).json({ error: 'This upload has no fixed template shape to rebuild' });
+  const skipped = Array.isArray(b.skipped) ? b.skipped.slice(0, 5000) : [];
+  const hdr = templateHeaders(kind);
+  const data = skipped.map(s => {
+    const obj = {};
+    T.cols.forEach((c, i) => { obj[hdr[i]] = skipCellValue(kind, s, c); });
+    obj['Row in the original file'] = s.row ?? '';
+    obj.Reason = s.reason || '';
+    return obj;
+  });
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(data.length ? data : [{ Note: 'Nothing was skipped' }]), T.sheet);
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${kind}-not-imported-${todayISO()}.xlsx"`);
   res.send(buf);
 });
 
@@ -2715,18 +2815,25 @@ app.post('/api/parse/invoice', auth, upload.single('file'), async (req, res, nex
 
     // enrich lines with margin comparison against the item master
     const find = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
-    const lines = (data.lines || []).slice(0, 200).map(l => {
+    const rawLines = (data.lines || []).slice(0, 200).map((l, ix) => ({ row: ix + 1, item: S(l.item, 150), qty: N(l.qty), nr: N(l.nr), mrp: N(l.mrp), value: N(l.value) }));
+    const skipped = [];
+    const lines = rawLines.filter(l => {
+      if (!l.item) { skipped.push({ row: l.row, name: '', reason: 'no product name' }); return false; }
+      return true;
+    }).map(l => {
       const master = find.get(hid, nameKey(l.item));
       const given = marginPct(l.nr, l.mrp);
       const expected = master ? marginPct(master.nr, master.mrp) : null;
       return {
-        item: S(l.item, 150), qty: N(l.qty), nr: N(l.nr), mrp: N(l.mrp), value: N(l.value) || +(N(l.qty) * N(l.nr)).toFixed(2),
+        item: l.item, qty: l.qty, nr: l.nr, mrp: l.mrp, value: l.value || +(l.qty * l.nr).toFixed(2),
         givenMargin: +given.toFixed(1),
         expectedMargin: expected == null ? null : +expected.toFixed(1),
         status: master ? (Math.abs(given - expected) <= MARGIN_TOL ? 'match' : (given < expected ? 'low' : 'high')) : 'new'
       };
     });
-    res.json({ vendor: S(data.vendor, 120), invoiceNo: S(data.invoice_no, 60), date: S(data.date, 12), fileName, lines });
+    res.json({ vendor: S(data.vendor, 120), invoiceNo: S(data.invoice_no, 60), date: S(data.date, 12), fileName, lines,
+      ...receiptFields({ fileName: req.file.originalname, sheet: null, fileRows: rawLines.length,
+        parsed: lines.length, imported: lines.length, skipped, ignored: 0, source: 'ai' }) });
   } catch (err) { next(err); }
 });
 
@@ -2842,6 +2949,25 @@ function templateHeaders(kind) {
   const T = TEMPLATES[kind];
   return T.cols.map(c => (T.hdrs && T.hdrs[c]) || COL[c].hdr);
 }
+/* the STANDARD IMPORT RECEIPT — the one shape every /api/parse/* endpoint's
+   response carries, so a single client component can render (and a single
+   test suite can pin) all six. fileRows === imported + skipped.length always. */
+function receiptFields({ fileName, sheet, fileRows, parsed, imported, skipped, ignored, source }) {
+  return { fileName: fileName || '', sheet: sheet || null, fileRows: fileRows || 0,
+    parsed: parsed || 0, imported: imported || 0, skipped: skipped || [], ignored: ignored || 0, source };
+}
+/* the template-only endpoints (purchase, items) have no AI fallback — when
+   nothing in the file matches the template's headers, this is the whole
+   response: a receipt-shaped refusal naming exactly what was expected, rather
+   than a bare error the client has to special-case. */
+function noSheetMatchedReceipt(kind, fileName) {
+  const expected = templateHeaders(kind);
+  return {
+    error: `No sheet matched the template headers; expected: ${expected.join(', ')}`,
+    ...receiptFields({ fileName, sheet: null, fileRows: 0, parsed: 0, imported: 0, skipped: [], ignored: 0, source: 'template' }),
+    expected
+  };
+}
 function buildTemplate(kind) {
   const T = TEMPLATES[kind];
   let hdr = templateHeaders(kind);
@@ -2905,12 +3031,18 @@ app.get('/api/template/:kind', (req, res) => {
   res.send(buildTemplate(req.params.kind));
 });
 
-/* Read a filled template by matching headings. Returns null when the file is not
-   that shape, so the caller can fall back to the AI reader. */
+/* Read a filled template by matching headings. Every data row under the header
+   is accounted for exactly once: it lands in `rows` (parsed) or in `skipped`
+   (with a reason) — never dropped without a trace. `fileRows === rows.length +
+   skipped.length` always holds; total/subtotal rows are counted separately in
+   `ignored` since they are not a data problem, just noise to skip past.
+   `matched:false` means no sheet/header combination in the file fit this
+   template at all — the caller decides what to do (fall back to AI, or refuse
+   with the headers it expected, for the template-only endpoints). */
 function readTemplate(buf, kind) {
   const T = TEMPLATES[kind];
   let wb;
-  try { wb = XLSX.read(buf, { type: 'buffer' }); } catch (e) { return null; }
+  try { wb = XLSX.read(buf, { type: 'buffer' }); } catch (e) { return { matched: false, expected: templateHeaders(kind) }; }
   for (const sn of wb.SheetNames.slice(0, 5)) {
     const grid = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, blankrows: false });
     for (let h = 0; h < Math.min(grid.length, 15); h++) {
@@ -2927,19 +3059,31 @@ function readTemplate(buf, kind) {
       if (T.need.some(k => Array.isArray(k) ? k.every(x => col[x] === undefined) : col[k] === undefined)) continue;
       const qtyCol = col.qty !== undefined ? col.qty : col.open;
       const tabCol = kind === 'sales' ? col.qtyTab : kind === 'opening' ? col.openTab : undefined;
-      const out = [], rejected = [];
+      const out = [], skipped = [];
+      let ignored = 0;
       for (let r = h + 1; r < grid.length; r++) {
         const row = grid[r] || [];
+        const sheetRow = r + 1;
         const name = S(row[col.name], 150).trim();
-        if (!name || /^(total|grand total|sub ?total)/i.test(name)) continue;
+        /* whatever this template's columns hold for this row, captured ONCE up
+           front — so a rejected row can be handed back with its original
+           values pre-filled on the "download not-imported rows" sheet, not
+           just named and blamed */
+        const cells = kind === 'purchase'
+          ? { pack: S(row[col.pack ?? -1], 30).trim(), pqty: N(row[col.pqty]), oqty: N(row[col.oqty ?? -1]),
+              rate: N(row[col.rate ?? -1]), disc: N(row[col.disc ?? -1]), gst: N(row[col.gst ?? -1]), mrp: N(row[col.mrp ?? -1]) }
+          : { pack: S(row[col.pack ?? -1], 30).trim(), molecule: S(row[col.mol ?? -1], 150).trim(),
+              qty: qtyCol === undefined ? undefined : N(row[qtyCol]), nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) };
+        const skip = (reason) => skipped.push({ row: sheetRow, name, reason, ...cells });
+        if (!name) { skip('no product name'); continue; }
+        if (/^(total|grand total|sub ?total)/i.test(name)) { skip('skipped: total row'); ignored++; continue; }
         if (kind === 'purchase') {
           /* raw INPUTS only — cleanEntry + calcLine derive everything on save,
              so the sheet can never smuggle in a wrong net rate */
-          const l = { item: name, pack: S(row[col.pack ?? -1], 30).trim(), pqty: N(row[col.pqty]), oqty: N(row[col.oqty ?? -1]),
-            rate: N(row[col.rate ?? -1]), disc: N(row[col.disc ?? -1]), gst: N(row[col.gst ?? -1]), mrp: N(row[col.mrp ?? -1]) };
-          if (l.pqty < 0 || l.rate < 0 || l.mrp < 0) continue;              // legend rule: ≥ 0
+          const l = { row: sheetRow, item: name, ...cells };
+          if (l.pqty < 0 || l.rate < 0 || l.mrp < 0) { skip('negative value — must be 0 or more'); continue; }  // legend rule: ≥ 0
           l.disc = Math.min(100, Math.max(0, l.disc));                       // legend rule: 0–100
-          if (l.pqty + l.oqty <= 0) continue;                                // nothing moved
+          if (l.pqty + l.oqty <= 0) { skip('no quantity — nothing purchased'); continue; }
           out.push(l);
           continue;
         }
@@ -2953,25 +3097,27 @@ function readTemplate(buf, kind) {
         if (tabCol !== undefined) {
           const hasStrips = qtyCol !== undefined && S(row[qtyCol]).trim() !== '';
           const hasTabs = S(row[tabCol]).trim() !== '';
-          if (hasStrips && hasTabs) { rejected.push({ row: r + 1, name, reason: 'both units given — fill strips OR tablets, not both' }); continue; }
+          if (hasStrips && hasTabs) { skip('both units given — fill strips OR tablets, not both'); continue; }
           if (!hasStrips && hasTabs) {
             const u = packUnits(S(row[col.pack ?? -1]));
-            if (!u) { rejected.push({ row: r + 1, name, reason: 'pack size needed to convert tablets — a vial/btl has no strip size' }); continue; }
+            if (!u) { skip('pack size needed to convert tablets — a vial/btl has no strip size'); continue; }
             srcTabs = N(row[tabCol]);
             qty = srcTabs / u;
             unit = 'tablets';
           }
         }
-        const rec = { name, unit, srcTabs, molecule: S(row[col.mol ?? -1], 150).trim(), pack: S(row[col.pack ?? -1], 30).trim(), qty, nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) };
         // sales needs something sold; opening allows a zero count; the master has no qty at all
-        if (kind === 'sales' && qty <= 0) continue;
-        if (kind === 'opening' && qty < 0) continue;
-        out.push(rec);
+        if (kind === 'sales' && qty <= 0) { skip('no quantity sold'); continue; }
+        if (kind === 'opening' && qty < 0) { skip('negative opening count'); continue; }
+        out.push({ row: sheetRow, name, unit, srcTabs, molecule: S(row[col.mol ?? -1], 150).trim(), pack: S(row[col.pack ?? -1], 30).trim(), qty, nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) });
       }
-      if (out.length || rejected.length) return { rows: out, sheet: sn, rejected, tabletsCol: tabCol !== undefined };
+      const fileRows = out.length + skipped.length;
+      // if the header matched but nothing at all sits below it, keep scanning —
+      // a later header row further down the sheet may be the real one
+      if (fileRows) return { matched: true, rows: out, sheet: sn, fileRows, skipped, rejected: skipped, ignored, tabletsCol: tabCol !== undefined };
     }
   }
-  return null;
+  return { matched: false, expected: templateHeaders(kind) };
 }
 const readSalesTemplate = (buf) => readTemplate(buf, 'sales');
 
@@ -2989,27 +3135,32 @@ app.post('/api/parse/purchase', auth, requireRole('admin'), upload.single('file'
   const invoiceNo = S((req.body && req.body.invoiceNo) || req.query.invoiceNo, 60).trim();
   if (!req.file) return res.status(400).json({ error: 'Attach the filled purchase template' });
   const tpl = readTemplate(req.file.buffer, 'purchase');
-  if (!tpl) return res.status(400).json({ error: 'The columns could not be found. Download the Purchase upload template and keep its header row — Item, Purchase Qty (strips), Offer Qty, Rate ₹, Vendor Disc %, GST %, MRP ₹.' });
+  if (!tpl.matched) return res.status(400).json(noSheetMatchedReceipt('purchase', req.file.originalname));
   const date = /^\d{4}-\d{2}-\d{2}$/.test(S(req.query.date)) ? req.query.date : todayISO();
   /* NEW items (not on the master, no alias) MUST bring a pack — an item born
      without one can never convert tablets to strips. Those rows are BLOCKED with
-     the reason; known items with a blank pack import fine (theirs is on file). */
+     the reason; known items with a blank pack import fine (theirs is on file).
+     This is purchase's SAVE-STAGE rejection: the row parsed fine but will not
+     become an invoice line, so it joins the parse-stage skips in one list. */
   const findIt = db.prepare('SELECT 1 FROM items WHERE hospital_id=? AND name_key=?');
   const findAl = db.prepare('SELECT 1 FROM item_aliases WHERE hospital_id=? AND alias_key=?');
   const known = (nm) => !!(findIt.get(hid, nameKey(nm)) || findAl.get(hid, nameKey(nm)));
   const lines = [], blocked = [];
-  tpl.rows.slice(0, 500).forEach((l, ix) => {
+  tpl.rows.slice(0, 500).forEach((l) => {
     const isNew = !known(l.item);
-    if (isNew && !l.pack) { blocked.push({ row: ix + 1, name: l.item, reason: 'pack size needed — this line creates a NEW item' }); return; }
+    if (isNew && !l.pack) { blocked.push({ row: l.row, name: l.item, reason: 'pack size needed — this line creates a NEW item' }); return; }
     lines.push({ ...l, isNew });
   });
   const invoice = { id: uid('inv'), vendor, invoiceNo, date, fileName: req.file.originalname || '',
-    lines: lines.map(({ isNew, ...l }) => l) };
+    lines: lines.map(({ isNew, row, ...l }) => l) };
   // the preview shows what calcLine WILL derive — same math, so the numbers the
   // user approves are the numbers the day will carry
   const preview = lines.map(l => { const d = calcLine(l); return { ...l,
     tqty: d.tqty, nr: +d.nr.toFixed(2), pamt: +d.pamt.toFixed(2), marginPct: +d.marginPct.toFixed(2) }; });
+  const skipped = tpl.skipped.concat(blocked);
   res.json({ source: 'template', sheet: tpl.sheet, invoice, preview, blocked,
+    ...receiptFields({ fileName: req.file.originalname, sheet: tpl.sheet, fileRows: tpl.fileRows,
+      parsed: tpl.rows.length, imported: lines.length, skipped, ignored: tpl.ignored, source: 'template' }),
     note: `Read ${lines.length} line${lines.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}") — all for ${vendor}`
       + (blocked.length ? ` · ${blocked.length} row${blocked.length === 1 ? '' : 's'} blocked` : '') });
 });
@@ -3019,10 +3170,12 @@ app.post('/api/parse/items', auth, requireRole('admin'), upload.single('file'), 
   scopeCheck(req, hid);
   if (!req.file) return res.status(400).json({ error: 'Attach the filled item-master template' });
   const tpl = readTemplate(req.file.buffer, 'items');
-  if (!tpl) return res.status(400).json({ error: 'The columns could not be found. Download the Item Master template and keep its header row — Product name, Pack size, Net rate, MRP.' });
-  const rows = tpl.rows.map(r => ({ name: r.name, molecule: r.molecule || '', pack: r.pack, nr: r.nr, mrp: r.mrp }));
+  if (!tpl.matched) return res.status(400).json(noSheetMatchedReceipt('items', req.file.originalname));
+  const rows = tpl.rows.map(r => ({ row: r.row, name: r.name, molecule: r.molecule || '', pack: r.pack, nr: r.nr, mrp: r.mrp }));
   res.json({
     source: 'template', sheet: tpl.sheet, rows,
+    ...receiptFields({ fileName: req.file.originalname, sheet: tpl.sheet, fileRows: tpl.fileRows,
+      parsed: rows.length, imported: rows.length, skipped: tpl.skipped, ignored: tpl.ignored, source: 'template' }),
     note: `Read ${rows.length} row${rows.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}")`
   });
 });
@@ -3036,10 +3189,10 @@ app.post('/api/parse/gpreport', auth, upload.single('file'), async (req, res, ne
     /* Our own template first: the columns are known, so it is read by matching
        headings — no AI, nothing to misread, and it works with no API key. */
     const tpl = readSalesTemplate(req.file.buffer);
-    if (tpl) {
+    if (tpl.matched) {
       const items = tpl.rows.map(r => {
         const value = r.qty * r.mrp, cost = r.qty * r.nr;
-        return { item: r.name, pack: r.pack, qty: r.qty, nr: r.nr, mrp: r.mrp,
+        return { row: r.row, item: r.name, pack: r.pack, qty: r.qty, nr: r.nr, mrp: r.mrp,
           unit: r.unit || 'strips', srcTabs: r.srcTabs || 0,
           amount: +value.toFixed(2), cost: +cost.toFixed(2),
           // a ratio — the pack size never enters it, only the same unit on both sides
@@ -3054,6 +3207,8 @@ app.post('/api/parse/gpreport', auth, upload.single('file'), async (req, res, ne
         rejected: tpl.rejected || [], tabletsCol: !!tpl.tabletsCol,
         grossProfit: +(salesMrp - cogs).toFixed(2),
         marginPct: salesMrp > 0 ? (salesMrp - cogs) / salesMrp * 100 : 0,
+        ...receiptFields({ fileName: req.file.originalname, sheet: tpl.sheet, fileRows: tpl.fileRows,
+          parsed: items.length, imported: items.length, skipped: tpl.skipped, ignored: tpl.ignored, source: 'template' }),
         note: `Read ${items.length} row${items.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}")`
           + (noRate ? ` · ${noRate} row${noRate === 1 ? ' has' : 's have'} no cost price, so ${noRate === 1 ? 'it counts' : 'they count'} as zero cost` : ''),
         items
@@ -3081,13 +3236,23 @@ app.post('/api/parse/gpreport', auth, upload.single('file'), async (req, res, ne
     content.push({ type: 'text', text: "This is a daily Gross Profit / sales report exported from Marg ERP for a hospital pharmacy in India. Extract (1) the day's totals — sales at MRP, cost of goods sold (COGS), cash vs credit split if present, and gross profit — from the grand-total row, and (2) the item-wise sales rows (product name, quantity, sale amount) if the report lists individual products; return up to 150 items by sale amount, or an empty items array if the report has no item-wise rows. Amounts in rupees, plain numbers." });
     const data = await askClaude(content, GP_SCHEMA);
     const sm = N(data.sales_mrp), cg = N(data.cogs);
+    // the AI's own items array can carry rows with no name or no sale amount —
+    // give those a reason too, rather than filtering them out unaccounted for
+    const rawItems = (Array.isArray(data.items) ? data.items : []).slice(0, 300)
+      .map((r, ix) => ({ row: ix + 1, item: S(r.name, 150), qty: N(r.qty), amount: N(r.amount), pack: '', nr: 0, mrp: 0 }));
+    const aiSkipped = [];
+    const items = rawItems.filter(r => {
+      if (!r.item) { aiSkipped.push({ row: r.row, name: '', reason: 'no product name' }); return false; }
+      if (!(r.amount > 0)) { aiSkipped.push({ row: r.row, name: r.item, reason: 'no sale amount' }); return false; }
+      return true;
+    });
     res.json({
       source: 'ai',
       salesMrp: sm, cogs: cg, cash: N(data.cash_sales), credit: N(data.credit_sales),
       grossProfit: N(data.gross_profit), marginPct: sm > 0 ? (sm - cg) / sm * 100 : 0, note: S(data.note, 300),
-      items: (Array.isArray(data.items) ? data.items : []).slice(0, 300)
-        .map(r => ({ item: S(r.name, 150), qty: N(r.qty), amount: N(r.amount), pack: '', nr: 0, mrp: 0 }))
-        .filter(r => r.item && r.amount > 0)
+      ...receiptFields({ fileName: req.file.originalname, sheet: null, fileRows: rawItems.length,
+        parsed: items.length, imported: items.length, skipped: aiSkipped, ignored: 0, source: 'ai' }),
+      items
     });
   } catch (err) { next(err); }
 });
@@ -3111,10 +3276,20 @@ function normExpiry(v) {
   }
   return '';
 }
-const cleanSnapRows = (rows) => (Array.isArray(rows) ? rows : []).slice(0, 8000)
-  .map(r => ({ name: S(r.name, 150).trim(), batch: S(r.batch, 40).trim(), expiry: normExpiry(r.expiry),
-    qty: N(r.qty), nr: N(r.nr), mrp: N(r.mrp) }))
-  .filter(r => r.name);
+/* Used at BOTH the preview (/parse/expiry) and the actual save (/snapshots) —
+   the same blank-name drop happens in both places, so both get to report it
+   rather than one silently doing what the other explains. */
+function cleanSnapRows(rows) {
+  const raw = (Array.isArray(rows) ? rows : []).slice(0, 8000)
+    .map((r, ix) => ({ row: ix + 1, name: S(r.name, 150).trim(), batch: S(r.batch, 40).trim(), expiry: normExpiry(r.expiry),
+      qty: N(r.qty), nr: N(r.nr), mrp: N(r.mrp) }));
+  const skipped = [];
+  const out = raw.filter(r => {
+    if (!r.name) { skipped.push({ row: r.row, name: '', reason: 'no product name' }); return false; }
+    return true;
+  });
+  return { rows: out, skipped, fileRows: raw.length };
+}
 
 app.post('/api/parse/expiry', auth, requireRole('admin'), upload.single('file'), async (req, res, next) => {
   try {
@@ -3139,13 +3314,16 @@ app.post('/api/parse/expiry', auth, requireRole('admin'), upload.single('file'),
     }
     content.push({ type: 'text', text: "This is a BATCH-WISE stock / expiry report from an Indian hospital pharmacy (usually exported from Marg ERP). Extract one row per item AND batch: the product name as printed, the batch number, the expiry, the closing quantity of that batch, and the cost rate and MRP if printed. Expiry is usually MM/YY or MM/YYYY — convert it to YYYY-MM. Skip group headers and total rows. Quantities in saleable units, amounts in rupees." });
     const data = await askClaude(content, EXPIRY_SCHEMA);
-    const rows = cleanSnapRows(data.rows);
+    const clean = cleanSnapRows(data.rows);
+    const rows = clean.rows;
     res.json({
       asOf: /^\d{4}-\d{2}-\d{2}$/.test(S(data.as_of)) ? data.as_of : '',
       note: S(data.note, 300),
       rows,
       withExpiry: rows.filter(r => r.expiry).length,
-      withBatch: rows.filter(r => r.batch).length
+      withBatch: rows.filter(r => r.batch).length,
+      ...receiptFields({ fileName: req.file.originalname, sheet: null, fileRows: clean.fileRows,
+        parsed: rows.length, imported: rows.length, skipped: clean.skipped, ignored: 0, source: 'ai' })
     });
   } catch (err) { next(err); }
 });
@@ -3158,14 +3336,18 @@ app.post('/api/snapshots', auth, requireRole('admin'), (req, res) => {
   const asOf = S(b.asOf, 12);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(asOf)) return res.status(400).json({ error: 'Pick the date this report is as-of' });
   if (asOf > todayISO()) return res.status(400).json({ error: 'A stock report cannot be dated in the future' });
-  const rows = cleanSnapRows(b.rows);
-  if (!rows.length) return res.status(400).json({ error: 'No stock rows to save' });
+  const clean = cleanSnapRows(b.rows);
+  if (!clean.rows.length) return res.status(400).json({ error: 'No stock rows to save' });
+  // `row` is upload provenance only — the stored snapshot keeps the same shape it always has
+  const storedRows = clean.rows.map(({ row, ...r }) => r);
   const snap = { id: uid('snap'), hospital_id: b.hid, as_of: asOf, file_name: S(b.fileName, 200),
-    rows: JSON.stringify(rows), uploaded_by: req.user.name, uploaded_at: Date.now() };
+    rows: JSON.stringify(storedRows), uploaded_by: req.user.name, uploaded_at: Date.now() };
   db.prepare('DELETE FROM expiry_snapshots WHERE hospital_id=? AND as_of=?').run(b.hid, asOf);
   db.prepare('INSERT INTO expiry_snapshots(id,hospital_id,as_of,file_name,rows,uploaded_by,uploaded_at) VALUES(?,?,?,?,?,?,?)')
     .run(snap.id, snap.hospital_id, snap.as_of, snap.file_name, snap.rows, snap.uploaded_by, snap.uploaded_at);
-  res.json({ snapshot: rowSnap(snap) });
+  res.json({ snapshot: rowSnap(snap),
+    ...receiptFields({ fileName: b.fileName, sheet: null, fileRows: clean.fileRows,
+      parsed: clean.rows.length, imported: storedRows.length, skipped: clean.skipped, ignored: 0, source: S(b.source, 20) || 'ai' }) });
 });
 
 app.delete('/api/snapshots/:id', auth, requireRole('admin'), (req, res) => {
@@ -3184,11 +3366,13 @@ app.post('/api/parse/stock', auth, upload.single('file'), async (req, res, next)
 
     // our own opening-stock template reads by heading — no AI, nothing misread
     const tpl = readTemplate(req.file.buffer, 'opening');
-    if (tpl) {
-      const items = tpl.rows.map(r => ({ name: r.name, qty: r.qty, pack: r.pack, nr: r.nr, mrp: r.mrp, unit: r.unit || 'strips', srcTabs: r.srcTabs || 0 }));
+    if (tpl.matched) {
+      const items = tpl.rows.map(r => ({ row: r.row, name: r.name, qty: r.qty, pack: r.pack, nr: r.nr, mrp: r.mrp, unit: r.unit || 'strips', srcTabs: r.srcTabs || 0 }));
       const noRate = items.filter(r => !(r.nr > 0)).length;
       return res.json({
         source: 'template', stockDate: '', rejected: tpl.rejected || [], tabletsCol: !!tpl.tabletsCol,
+        ...receiptFields({ fileName: req.file.originalname, sheet: tpl.sheet, fileRows: tpl.fileRows,
+          parsed: items.length, imported: items.length, skipped: tpl.skipped, ignored: tpl.ignored, source: 'template' }),
         note: `Read ${items.length} row${items.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}")`
           + (noRate ? ` · ${noRate} without a net rate, so ${noRate === 1 ? 'it cannot' : 'they cannot'} be valued until the Item Master has one` : ''),
         items
@@ -3213,12 +3397,20 @@ app.post('/api/parse/stock', auth, upload.single('file'), async (req, res, next)
     }
     content.push({ type: 'text', text: "This is a pharmacy stock / inventory report from an Indian hospital pharmacy (often exported from Marg ERP). Extract every product line with its closing balance quantity, and the pack, purchase rate (inclusive of GST) and MRP where printed. Skip group headers and total rows. Quantities in saleable units, amounts in rupees, plain numbers." });
     const data = await askClaude(content, STOCK_SCHEMA);
+    const rawItems = (Array.isArray(data.items) ? data.items : []).slice(0, 5000)
+      .map((r, ix) => ({ row: ix + 1, name: S(r.name, 150), qty: N(r.qty), pack: S(r.pack, 60), nr: N(r.nr), mrp: N(r.mrp) }));
+    const aiSkipped = [];
+    const items = rawItems.filter(r => {
+      if (!r.name) { aiSkipped.push({ row: r.row, name: '', reason: 'no product name' }); return false; }
+      if (!(r.qty >= 0)) { aiSkipped.push({ row: r.row, name: r.name, reason: 'negative opening count' }); return false; }
+      return true;
+    });
     res.json({
       stockDate: /^\d{4}-\d{2}-\d{2}$/.test(S(data.stock_date)) ? data.stock_date : '',
       note: S(data.note, 300),
-      items: (Array.isArray(data.items) ? data.items : []).slice(0, 5000)
-        .map(r => ({ name: S(r.name, 150), qty: N(r.qty), pack: S(r.pack, 60), nr: N(r.nr), mrp: N(r.mrp) }))
-        .filter(r => r.name && r.qty >= 0)
+      ...receiptFields({ fileName: req.file.originalname, sheet: null, fileRows: rawItems.length,
+        parsed: items.length, imported: items.length, skipped: aiSkipped, ignored: 0, source: 'ai' }),
+      items
     });
   } catch (err) { next(err); }
 });
