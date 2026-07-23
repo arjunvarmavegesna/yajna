@@ -2930,6 +2930,104 @@ async function saveImportReceipt(hid, kind, receipt){
   try{ await api('/import-receipts', {method:'POST', body:{hid, kind, ...receipt}}); }catch(e){}
 }
 
+/* ---------------- chunked save, with a live-editable retry table ----------------
+   A large file saves in batches so the user sees real progress instead of a
+   frozen screen, and a row that fails is fixed IN PLACE — no download/fix-in-
+   Excel/reupload round trip for a handful of typos. Every original row is
+   accounted for in EXACTLY one bucket, always: imported (landed on the first
+   pass) + fixed (retried and now landed) + removed (the user deleted it) +
+   remaining (still failing) === the file's row count. If that stops adding
+   up, it is shown as a bug, not a data problem.
+   config:
+     batchSize        rows per server round trip (default 100)
+     saveBatch(rows)  async -> {created?,updated?,filled?, skipped:[{row,name,reason,...}]}
+                      — the SAME shape /items/bulk and /items/opening already
+                      return; a retry sends corrected plain row objects
+                      straight to this same function, never back through
+                      readTemplate (a fix is just a JS object, ready to save)
+     countImported(result) -> how many of THIS call's rows actually landed
+     applyResult(result)   -> fold created/updated/filled into local state
+     fields           [{key,label}] — the editable cells in the retry table
+     validate(row)    -> null | 'reason' — an OPTIMISTIC client-side check so
+                        a fixed row's error clears the moment it looks valid,
+                        before it is ever resent; the server stays the real
+                        authority regardless
+   Usage: const u = chunkedSaveUI(containerEl, kindConfig);
+          await u.run({fileRows, rows, preSkipped}); */
+function chunkedSaveUI(container, kind){
+  const state = { fileRows:0, imported:0, fixed:0, removed:0, failing:[] };
+  const notify = ()=>{ if(kind.onChange) kind.onChange({fileRows:state.fileRows, imported:state.imported, fixed:state.fixed, removed:state.removed, remaining:state.failing.length}); };
+  const render = ()=>{
+    const remaining = state.failing.length;
+    const total = state.imported + state.fixed + state.removed + remaining;
+    const mismatch = state.fileRows>0 && total!==state.fileRows;
+    notify();
+    container.innerHTML = `
+      <p class="mini-note" style="margin:0 0 6px"><b>${state.fileRows} row${state.fileRows===1?'':'s'} in file · ${state.imported} imported${state.fixed? ` · ${state.fixed} fixed and imported`:''}${state.removed? ` · ${state.removed} removed`:''} · ${remaining} remaining</b></p>
+      ${mismatch? `<p class="mini-note" style="color:var(--red)">⚠ ${state.fileRows} in file but the tally adds up to ${total} — that is a bug here, not a data problem.</p>`:''}
+      ${remaining? `
+        <div class="tbl-scroll" style="max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:7px">
+          <table class="tbl"><thead><tr><th>Row</th>${kind.fields.map(f=>`<th>${esc(f.label)}</th>`).join('')}<th>Reason</th><th></th></tr></thead>
+          <tbody>${state.failing.map((r,ix)=>`<tr data-fix-row="${ix}">
+            <td class="num" style="color:var(--faint)">${r.row??'—'}</td>
+            ${kind.fields.map(f=>`<td><input class="in" style="padding:4px 6px;font-size:12.5px;width:100%" data-fix-field="${esc(f.key)}" value="${esc(r[f.key]??'')}"></td>`).join('')}
+            <td class="fix-reason" style="color:var(--red);font-size:12px">${esc(r.reason)}</td>
+            <td><button class="row-del" data-fix-remove="${ix}" title="Remove this row">✕</button></td>
+          </tr>`).join('')}</tbody></table>
+        </div>
+        <button class="btn btn-primary btn-sm" id="fixRetryBtn" style="margin-top:8px">Retry ${remaining} row${remaining===1?'':'s'}</button>
+      `:''}`;
+    if(!remaining) return;
+    $$('[data-fix-field]', container).forEach(inp=> inp.oninput = ()=>{
+      const tr = inp.closest('[data-fix-row]'); const ix = +tr.dataset.fixRow;
+      const row = state.failing[ix]; row[inp.dataset.fixField] = inp.value;
+      const reason = kind.validate(row);
+      const cell = tr.querySelector('.fix-reason');
+      cell.textContent = reason || '✓ looks valid — click Retry';
+      cell.style.color = reason? 'var(--red)' : 'var(--green)';
+    });
+    $$('[data-fix-remove]', container).forEach(b=> b.onclick = ()=>{
+      state.removed++; state.failing.splice(+b.dataset.fixRemove, 1); render();
+    });
+    const retryBtn = container.querySelector('#fixRetryBtn');
+    if(retryBtn) retryBtn.onclick = async ()=>{
+      retryBtn.disabled = true; retryBtn.textContent = 'Retrying…';
+      const toRetry = state.failing.map(({reason, ...r})=> r);
+      try{
+        const result = await kind.saveBatch(toRetry);
+        kind.applyResult(result);
+        const stillFailing = result.skipped||[];
+        state.fixed += toRetry.length - stillFailing.length;
+        state.failing = stillFailing;
+      }catch(err){ toast(err.message,'red'); }
+      render();
+    };
+  };
+  return {
+    async run({fileRows, rows, preSkipped}){
+      state.fileRows = fileRows!=null? fileRows : rows.length;
+      state.imported = 0; state.fixed = 0; state.removed = 0;
+      state.failing = (preSkipped||[]).slice();   // rows that never even made it past reading the file
+      const n = kind.batchSize||100;
+      for(let i=0;i<rows.length;i+=n){
+        const batch = rows.slice(i, i+n);
+        container.innerHTML = `<p class="mini-note">Saving… ${Math.min(i+n,rows.length)} of ${rows.length} · ${state.imported} imported so far · ${state.failing.length} not imported so far</p>`;
+        try{
+          const result = await kind.saveBatch(batch);
+          kind.applyResult(result);
+          state.imported += kind.countImported(result);
+          state.failing.push(...(result.skipped||[]));
+        }catch(err){
+          // the whole batch failed at the network/server level — every row in
+          // it is unresolved, not silently dropped
+          batch.forEach(r=> state.failing.push({...r, reason: err.message||'save failed'}));
+        }
+      }
+      render();
+    }
+  };
+}
+
 /* ---------- tablets → strips ----------
    The ledger's unit is a STRIP, always. But the pharmacy software counts loose
    tablets — 15 tablets of a 10s pack is 1.5 strips, not 15. The conversion
@@ -5083,8 +5181,9 @@ function itemImportModal(hid){
       <div class="field"><label>Filled template (Excel) or a CSV</label><input class="in" type="file" id="icsvFile" accept=".xls,.xlsx,.csv,text/csv"></div>
       <div class="field"><label>Or paste rows — <span class="num" style="font-size:12px">Product name, Net rate/strip, MRP/strip, Pack size, Molecule</span></label><textarea class="in" id="icsvPaste" rows="5" placeholder="Tab. Pantoprazole 40,38,58,10s,Pantoprazole 40mg"></textarea></div>
       <div id="icsvPreview"></div>
+      <div id="icsvChunked" style="margin-top:8px"></div>
     </div>
-    <div class="modal-foot" id="icsvFoot"><button class="btn modal-x">Cancel</button><button class="btn" id="icsvPrev">Preview</button><button class="btn btn-primary" id="icsvGo" disabled>Import</button></div>`);
+    <div class="modal-foot" id="icsvFoot"><button class="btn modal-x">Cancel</button><button class="btn" id="icsvPrev">Preview</button><button class="btn btn-primary" id="icsvGo" disabled>Import</button></div>`, {lg:true});
   let parsed = [];
   let lastReceipt = null;   // the PARSE-stage receipt; imported/skipped get overwritten with the real save outcome
   // a row for an item we already hold is not always a no-op: if it carries a
@@ -5160,9 +5259,7 @@ function itemImportModal(hid){
     if(f){ const rd=new FileReader(); rd.onload=()=>doParse(rd.result); rd.readAsText(f); }
     else doParse($('#icsvPaste').value);
   };
-  const showDone = (receipt)=>{
-    $('#icsvPreview').insertAdjacentHTML('beforeend', renderImportReceipt(receipt));
-    wireImportReceipt(receipt, 'items');
+  const finish = ()=>{
     $('#icsvFoot').innerHTML = `<span style="flex:1"></span><button class="btn btn-primary" id="icsvDone">Done</button>`;
     $('#icsvDone').onclick = closeModal;
   };
@@ -5174,20 +5271,33 @@ function itemImportModal(hid){
       fills.forEach(p=>{ const it=findItem(hid,p.name); if(!it) return; const f=fillOf(p); if(f.molFill) it.molecule=p.molecule; if(f.packFill) it.pack=p.pack; });
       closeModal(); toast(`${fresh.length} item${fresh.length===1?'':'s'} imported (demo)`,'green'); renderItems(); return;
     }
-    const btn=$('#icsvGo'); btn.disabled=true;
-    try{
-      // the FULL parsed set, not a client pre-filter — the server is the one
-      // source of truth for what got created/filled/skipped and why
-      const r = await api('/items/bulk',{method:'POST', body:{hid, items:parsed,
-        fileName:(lastReceipt||{}).fileName, sheet:(lastReceipt||{}).sheet, fileRows:(lastReceipt||{}).fileRows, source:(lastReceipt||{}).source}});
-      r.created.forEach(it=> db.items[hid].push(it));
-      (r.filled||[]).forEach(f=>{ const it=(db.items[hid]||[]).find(x=>x.id===f.id); if(it) Object.assign(it, f); });
-      renderItems();
-      const finalReceipt = {...(lastReceipt||{}), imported:r.imported, skipped:r.skipped, ignored:r.ignored};
-      saveImportReceipt(hid, 'items', finalReceipt);
-      toast(`${r.created.length} item${r.created.length===1?'':'s'} imported${(r.filled||[]).length? ` · ${r.filled.length} filled in`:''}`,'green');
-      showDone(finalReceipt);
-    }catch(err){ btn.disabled=false; toast(err.message,'red'); }
+    $('#icsvGo').disabled = true;
+    // the FULL parsed set, not a client pre-filter — the server is the one
+    // source of truth for what got created/filled/skipped and why; large
+    // files go through in batches, with a live tally and an in-place fix for
+    // whatever doesn't land on the first pass
+    const uploader = chunkedSaveUI($('#icsvChunked'), {
+      fields: [{key:'name',label:'Product name'}, {key:'pack',label:'Pack'}, {key:'nr',label:'Net rate'}, {key:'mrp',label:'MRP'}, {key:'molecule',label:'Molecule'}],
+      validate: row=>{
+        if(!String(row.name||'').trim()) return 'no product name';
+        const nr = num(row.nr), mrp = num(row.mrp);
+        if(!(nr>0) || !(mrp>0)) return 'net rate and MRP must be positive';
+        if(nr>mrp) return 'net rate cannot exceed MRP';
+        return null;
+      },
+      saveBatch: rows=> api('/items/bulk',{method:'POST', body:{hid, items:rows,
+        fileName:(lastReceipt||{}).fileName, sheet:(lastReceipt||{}).sheet, source:(lastReceipt||{}).source}}),
+      countImported: r=> r.created.length + (r.filled||[]).length,
+      applyResult: r=>{
+        r.created.forEach(it=> db.items[hid].push(it));
+        (r.filled||[]).forEach(f=>{ const it=(db.items[hid]||[]).find(x=>x.id===f.id); if(it) Object.assign(it, f); });
+        renderItems();
+      },
+      onChange: tally=> saveImportReceipt(hid, 'items', {...(lastReceipt||{}), fileRows:tally.fileRows,
+        imported: tally.imported+tally.fixed, skipped: [], ignored:(lastReceipt||{}).ignored||0})
+    });
+    await uploader.run({fileRows: (lastReceipt||{}).fileRows ?? parsed.length, rows: parsed, preSkipped: (lastReceipt||{}).skipped||[]});
+    finish();
   };
 }
 
@@ -6307,6 +6417,7 @@ function openingStockModal(hid){
       <div class="field"><label>Or paste rows — <span class="num" style="font-size:12px">Product name, Opening strips, Net rate/strip, MRP/strip, Pack size</span></label>
         <textarea class="in" id="osPaste" rows="4" placeholder="Tab. Pantoprazole 40,120,38,58,10s"></textarea></div>
       <div id="osPrev"></div>
+      <div id="osChunked" style="margin-top:8px"></div>
     </div>
     <div class="modal-foot" id="osFoot"><button class="btn modal-x">Cancel</button><button class="btn" id="osRead">Read / preview</button><button class="btn btn-primary" id="osGo" disabled>Save opening stock</button></div>`, {lg:true});
 
@@ -6391,9 +6502,7 @@ function openingStockModal(hid){
   // user reads a file, then goes back and corrects the date before saving
   $('#osDate').onchange = ()=>{ if(parsed) preview(rawRows, lastNote); };
 
-  const showDone = (receipt)=>{
-    $('#osPrev').insertAdjacentHTML('beforeend', renderImportReceipt(receipt));
-    wireImportReceipt(receipt, 'opening');
+  const finish = ()=>{
     $('#osFoot').innerHTML = `<span style="flex:1"></span><button class="btn btn-primary" id="osDone">Done</button>`;
     $('#osDone').onclick = closeModal;
   };
@@ -6422,18 +6531,28 @@ function openingStockModal(hid){
       });
       closeModal(); toast(`Opening stock saved for ${parsed.length} item${parsed.length===1?'':'s'} (demo)`,'green'); renderInventory(); return;
     }
-    try{
-      const r = await api('/items/opening',{method:'POST', body:{hid, stockDate, rows:parsed,
-        fileName:lastMeta.fileName, source:lastMeta.source}});
-      db.hospitals[hid] = r.hospital;
-      r.created.forEach(it=> db.items[hid].push(it));
-      r.updated.forEach(it=>{ const ix = db.items[hid].findIndex(x=>x.id===it.id); if(ix>=0) db.items[hid][ix]=it; });
-      renderInventory();
-      const finalReceipt = {...lastMeta, imported:r.imported, skipped:r.skipped||[]};
-      saveImportReceipt(hid, 'opening', finalReceipt);
-      toast(`Opening stock set as on ${fmtDateShort(r.stockDate)} — ${r.created.length} added, ${r.updated.length} updated`,'green');
-      showDone(finalReceipt);
-    }catch(err){ btn.disabled=false; toast(err.message,'red'); }
+    // large counts go through in batches, with a live tally and an in-place
+    // fix for whatever doesn't land on the first pass (e.g. a price conflict)
+    const uploader = chunkedSaveUI($('#osChunked'), {
+      fields: [{key:'name',label:'Product name'}, {key:'pack',label:'Pack'}, {key:'qty',label:'Opening qty'}, {key:'nr',label:'Net rate'}, {key:'mrp',label:'MRP'}],
+      validate: row=>{
+        if(!String(row.name||'').trim()) return 'no product name';
+        if(num(row.qty)<0) return 'negative opening count';
+        return null;
+      },
+      saveBatch: rows=> api('/items/opening',{method:'POST', body:{hid, stockDate, rows,
+        fileName:lastMeta.fileName, source:lastMeta.source}}).then(r=>{ db.hospitals[hid] = r.hospital; return r; }),
+      countImported: r=> r.created.length + r.updated.length,
+      applyResult: r=>{
+        r.created.forEach(it=> db.items[hid].push(it));
+        r.updated.forEach(it=>{ const ix = db.items[hid].findIndex(x=>x.id===it.id); if(ix>=0) db.items[hid][ix]=it; });
+        renderInventory();
+      },
+      onChange: tally=> saveImportReceipt(hid, 'opening', {...lastMeta, fileRows:tally.fileRows,
+        imported: tally.imported+tally.fixed, skipped: [], ignored:lastMeta.ignored||0})
+    });
+    await uploader.run({fileRows: lastMeta.fileRows ?? parsed.length, rows: parsed, preSkipped: lastMeta.skipped||[]});
+    finish();
   };
 }
 

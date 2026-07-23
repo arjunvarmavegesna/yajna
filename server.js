@@ -2232,22 +2232,24 @@ app.post('/api/items/opening', auth, requireRole('admin'), (req, res) => {
     rows.slice(0, 5000).forEach((raw, ix) => {
       const row = raw.row ?? (ix + 1);
       const name = S(raw.name, 150).trim();
-      if (!name) { skipped.push({ row, name: '', reason: 'no product name' }); return; }
-      const qty = N(raw.qty);
-      if (qty < 0) { skipped.push({ row, name, reason: 'negative opening count' }); return; }
+      // captured up front — so a skipped row carries back what was actually
+      // typed, not just a name and a reason, for the retry table to edit
+      const cells = { pack: S(raw.pack, 60), qty: N(raw.qty), nr: N(raw.nr), mrp: N(raw.mrp) };
+      const skip = (reason) => skipped.push({ row, name, reason, ...cells });
+      if (!name) { skip('no product name'); return; }
+      if (cells.qty < 0) { skip('negative opening count'); return; }
       const key = nameKey(name);
       const ex = find.get(hid, key);
       if (ex) {
         // keep existing prices unless the file supplies better ones
-        const nr = N(raw.nr) > 0 ? N(raw.nr) : ex.nr;
-        const mrp = N(raw.mrp) > 0 ? N(raw.mrp) : ex.mrp;
-        if (nr > mrp && mrp > 0) { skipped.push({ row, name, reason: 'net rate would exceed the MRP — kept as it was' }); return; }
-        upd.run(qty, S(raw.pack, 60) || ex.pack, nr, mrp, now, ex.id);
-        updated.push(rowItem({ ...ex, opening_qty: qty, nr, mrp, pack: S(raw.pack, 60) || ex.pack, updated_at: now }));
+        const nr = cells.nr > 0 ? cells.nr : ex.nr;
+        const mrp = cells.mrp > 0 ? cells.mrp : ex.mrp;
+        if (nr > mrp && mrp > 0) { skip('net rate would exceed the MRP — kept as it was'); return; }
+        upd.run(cells.qty, cells.pack || ex.pack, nr, mrp, now, ex.id);
+        updated.push(rowItem({ ...ex, opening_qty: cells.qty, nr, mrp, pack: cells.pack || ex.pack, updated_at: now }));
       } else {
-        const nr = N(raw.nr), mrp = N(raw.mrp);
-        if (nr > mrp && mrp > 0) { skipped.push({ row, name, reason: 'net rate above the MRP — that would sell at a loss' }); return; }
-        const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack: S(raw.pack, 60), nr, mrp, opening_qty: qty, source: 'opening', updated_at: now };
+        if (cells.nr > cells.mrp && cells.mrp > 0) { skip('net rate above the MRP — that would sell at a loss'); return; }
+        const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack: cells.pack, nr: cells.nr, mrp: cells.mrp, opening_qty: cells.qty, source: 'opening', updated_at: now };
         ins.run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.opening_qty, it.source, it.updated_at);
         created.push(rowItem(it));
       }
@@ -2273,10 +2275,13 @@ app.post('/api/items/bulk', auth, requireRole('admin'), (req, res) => {
     items.slice(0, 3000).forEach((raw, ix) => {
       const row = raw.row ?? (ix + 1);
       const name = S(raw.name, 150).trim();
-      const nr = N(raw.nr), mrp = N(raw.mrp);
-      if (!name) { skipped.push({ row, name: '', reason: 'no product name' }); return; }
-      if (nr <= 0 || mrp <= 0 || nr > mrp) { skipped.push({ row, name, reason: 'net rate and MRP must be positive, and net rate cannot exceed MRP' }); return; }
-      const key = nameKey(name), mol = S(raw.molecule, 150).trim(), pack = S(raw.pack, 60).trim();
+      // captured up front — so a skipped row carries back what was actually
+      // typed, not just a name and a reason, for the retry table to edit
+      const cells = { pack: S(raw.pack, 60).trim(), nr: N(raw.nr), mrp: N(raw.mrp), molecule: S(raw.molecule, 150).trim() };
+      const skip = (reason) => skipped.push({ row, name, reason, ...cells });
+      if (!name) { skip('no product name'); return; }
+      if (cells.nr <= 0 || cells.mrp <= 0 || cells.nr > cells.mrp) { skip('net rate and MRP must be positive, and net rate cannot exceed MRP'); return; }
+      const key = nameKey(name), mol = cells.molecule, pack = cells.pack;
       const ex = find.get(hid, key);
       if (ex) {
         // a re-import does not overwrite prices, but it MAY fill in a molecule
@@ -2289,11 +2294,11 @@ app.post('/api/items/bulk', auth, requireRole('admin'), (req, res) => {
           fill.run(newMol, newPack, now, ex.id);
           filled.push(rowItem({ ...ex, molecule: newMol, pack: newPack, updated_at: now }));
         } else {
-          skipped.push({ row, name, reason: 'already on the master — nothing new to fill' });
+          skip('already on the master — nothing new to fill');
         }
         return;
       }
-      const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack, nr, mrp, molecule: mol, source: 'import', updated_at: now };
+      const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack, nr: cells.nr, mrp: cells.mrp, molecule: mol, source: 'import', updated_at: now };
       ins.run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.source, it.updated_at, it.molecule);
       created.push(rowItem(it));
     });
