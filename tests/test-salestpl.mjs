@@ -55,11 +55,12 @@ ok(/spreadsheetml/.test(res.headers.get('content-type') || ''), 'with the right 
 const tplWb = XLSX.read(tplBuf, { type: 'buffer' });
 ok(tplWb.SheetNames.includes('Sales') && tplWb.SheetNames.includes('How to fill'), 'with a Sales sheet and instructions', tplWb.SheetNames.join(','));
 const tplHdr = XLSX.utils.sheet_to_json(tplWb.Sheets.Sales, { header: 1 })[0];
-ok(tplHdr.length === 7, 'seven columns — strips, tablets, and the read-only helper between them', tplHdr.join('|'));
-ok(/product/i.test(tplHdr[0]) && /pack/i.test(tplHdr[1]) && /qty.*strips/i.test(tplHdr[2]) && /qty.*tablets/i.test(tplHdr[3]) && /strips used/i.test(tplHdr[4]) && /net rate/i.test(tplHdr[5]) && /mrp/i.test(tplHdr[6]),
-   'product / pack / qty strips / qty tablets / » strips used / net rate / MRP', tplHdr.join(' | '));
-ok(/auto — do not fill/i.test(tplHdr[4]), 'the helper column says do not fill');
+ok(tplHdr.length === 13, 'thirteen columns — strips, loose tablets, and six read-only helpers (total strips + per-piece rates + margin figures)', tplHdr.join('|'));
+ok(/product/i.test(tplHdr[0]) && /pack/i.test(tplHdr[1]) && /qty.*strips/i.test(tplHdr[2]) && /qty.*tablets/i.test(tplHdr[3]) && /total strips/i.test(tplHdr[4]) && /net rate/i.test(tplHdr[5]) && /mrp/i.test(tplHdr[6]),
+   'product / pack / qty strips / qty tablets / » total strips / net rate / MRP', tplHdr.join(' | '));
+ok(/auto — do not fill/i.test(tplHdr[4]), 'the total-strips helper says do not fill');
 ok(/incl/i.test(tplHdr[5]), 'and the rate column says inclusive of GST', tplHdr[5]);
+ok(tplHdr.slice(7).some(h => /margin %/i.test(h)) && tplHdr.slice(7).some(h => /cost of goods sold/i.test(h)), 'and the per-tablet + margin helpers ride after MRP', tplHdr.slice(7).join(' | '));
 const notes = XLSX.utils.sheet_to_json(tplWb.Sheets['How to fill'], { header: 1 }).flat().join(' ');
 ok(/ratio/i.test(notes) && /pack size never changes it/i.test(notes), 'the notes explain that margin is a ratio the pack does not change');
 // the template it hands out must be readable by the reader it ships with
@@ -143,7 +144,7 @@ const openBuf = await tb('opening');
 const openHdr = XLSX.utils.sheet_to_json(XLSX.read(openBuf, { type: 'buffer' }).Sheets['Opening stock'], { header: 1 })[0];
 ok(/opening stock \(strips\)/i.test(openHdr[2]), 'the opening column says STRIPS', openHdr[2]);
 ok(/opening stock \(tablets\)/i.test(openHdr[3]), 'with a tablets column beside it', openHdr[3]);
-ok(/strips used/i.test(openHdr[4]), 'then the read-only helper', openHdr[4]);
+ok(/total strips/i.test(openHdr[4]), 'then the read-only helper', openHdr[4]);
 ok(/single strip/i.test(openHdr[5]) && /incl/i.test(openHdr[5]), 'the net rate says single strip, inclusive of GST', openHdr[5]);
 ok(/single strip/i.test(openHdr[6]), 'and so does the MRP', openHdr[6]);
 r = (await post('/parse/stock?hid=viraj', fillTpl(openBuf, [['Tab. Rifaximin 550', '10s', 120, '', '', 298, 412], ['Tab. Metformin 500', '15s', 300, '', '', 12, 21]]), 'o.xlsx')).data;
@@ -186,7 +187,7 @@ console.log('— per-row tablets: the other unit is derived, never stored —');
   ]), 'o2.xlsx')).data;
   ok(rr.source === 'template' && rr.items.length === 2, 'a mixed strips/tablets sheet reads', JSON.stringify(rr.rejected));
   const met = rr.items.find(x => /metformin/i.test(x.name));
-  ok(met.qty === 300 && met.unit === 'tablets' && met.srcTabs === 4500, '4500 tablets of a 15s = 300 strips, provenance kept', JSON.stringify(met));
+  ok(met.qty === 300 && met.unit === 'tablets' && met.srcLoose === 4500, '4500 tablets of a 15s = 300 strips, provenance kept', JSON.stringify(met));
   ok(rr.items.find(x => /rifaximin/i.test(x.name)).qty === 120, 'the strips row is untouched');
   ok(met.nr === 12 && met.mrp === 21, 'RATES ARE NOT SCALED — both rate columns are per single strip whichever unit counted the quantity', `${met.nr}/${met.mrp}`);
   ok(rr.tabletsCol === true, 'the response says the sheet has its own tablets column — the client kills the file-level toggle');
@@ -202,13 +203,16 @@ console.log('— per-row tablets: the other unit is derived, never stored —');
   const a3 = (await upload2(sBuf, [['Tab. Metformin 500', '15s', '', 75, '', 12, 21]])).data;
   ok(a3.items[0].qty === 5, '75 tablets of a 15s = 5 strips', a3.items[0].qty);
 
-  // both filled = ambiguous, rejected with the reason; the good row still lands
+  // both filled is now the PRIMARY intended input — strips + loose ADD UP,
+  // never rejected as ambiguous
   const a4 = (await upload2(sBuf, [
-    ['Tab. Rifaximin 550', '10s', 12, 120, '', 298, 412],
+    ['Tab. Rifaximin 550', '10s', 12, 3, '', 298, 412],
     ['Tab. Metformin 500', '15s', 5, '', '', 12, 21]
   ])).data;
-  ok(a4.items.length === 1 && /metformin/i.test(a4.items[0].item), 'the ambiguous row is dropped, the clean one imports', JSON.stringify(a4.items[0]));
-  ok(a4.rejected.length === 1 && /both units/i.test(a4.rejected[0].reason) && a4.rejected[0].row > 0, 'and the rejection names the row and the reason', JSON.stringify(a4.rejected));
+  ok(a4.items.length === 2, 'both rows import — filling both columns is summed, not rejected', JSON.stringify(a4.items.map(i => i.item)));
+  const rifMixed = a4.items.find(i => /rifaximin/i.test(i.item));
+  ok(rifMixed.qty === 12.3 && rifMixed.unit === 'mixed' && rifMixed.srcStrips === 12 && rifMixed.srcLoose === 3, '12 strips + 3 loose (10s) = 12.3 strips total', JSON.stringify(rifMixed));
+  ok((a4.cautions || []).length === 0, 'a small loose amount alongside strips raises no caution', JSON.stringify(a4.cautions));
 
   // tablets on a vial: nothing to divide by — rejected, never guessed
   const a5 = (await upload2(sBuf, [['Inj. Pantoprazole 40', 'vial', '', 30, '', 38, 58]])).data;
@@ -220,7 +224,7 @@ console.log('— per-row tablets: the other unit is derived, never stored —');
   ok(legacy.source === 'template' && legacy.items[0].qty === 12 && legacy.tabletsCol === false, 'a legacy five-column sheet still reads as today', JSON.stringify({ q: legacy.items[0]?.qty, t: legacy.tabletsCol }));
 
   // the helper header is claimed by NO column matcher — a sheet of only helper+name parses to nothing
-  const trap = (await upload([[ 'Product name', '» Strips used (auto — do not fill)', 'MRP — single strip' ],
+  const trap = (await upload([[ 'Product name', '» Total strips (auto — do not fill)', 'MRP — single strip' ],
     ['Tab. Rifaximin 550', 999, 412]])).data;
   ok(trap.source !== 'template' || !trap.items || !trap.items.length || !trap.items[0].qty, 'the helper column is invisible to the matchers — its numbers can never become quantities', trap.source);
 }

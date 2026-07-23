@@ -2375,8 +2375,8 @@ app.get('/api/import-receipts', auth, requireRole('admin'), (req, res) => {
 /* a not-imported row's ORIGINAL values, mapped back onto this template's own
    column key — so "download not-imported rows" hands back a sheet the user
    can fix in place and re-upload directly, not a bare list of names. Values
-   readTemplate never had a chance to capture (e.g. the tablets source on a
-   both-units-given reject) come back blank for the user to re-key. */
+   readTemplate never had a chance to capture come back blank for the user to
+   re-key. */
 function skipCellValue(kind, s, colKey) {
   switch (colKey) {
     case 'name': return s.name || '';
@@ -2391,7 +2391,9 @@ function skipCellValue(kind, s, colKey) {
     case 'gst': return s.gst ?? '';
     case 'qty': return (kind === 'sales' || kind === 'opening') ? (s.qty ?? '') : '';
     case 'open': return s.qty ?? '';
-    default: return '';    // qtyTab/openTab: the tablets source isn't retained generically
+    case 'qtyTab': return kind === 'sales' ? (s.loose ?? '') : '';
+    case 'openTab': return kind === 'opening' ? (s.loose ?? '') : '';
+    default: return '';
   }
 }
 /* Read-only: rebuilds a sheet in the SAME shape as the upload template, one row
@@ -2882,26 +2884,55 @@ const TEMPLATES = {
     file: 'yajna-sales-margin-template.xlsx', sheet: 'Sales',
     cols: ['name', 'pack', 'qty', 'qtyTab', 'nr', 'mrp'],
     need: ['name', ['qty', 'qtyTab'], 'mrp'],
-    helperAfter: 'qtyTab',
-    eg: [['Tab. Rifaximin 550', '10s', 12, '', 12, 298, 412], ['Tab. Metformin 500', '15s', '', 75, 5, 12, 21], ['Inj. Pantoprazole 40', 'vial', 8, '', 8, 38, 58]],
+    /* full strips AND loose tablets are ADDITIVE — both columns filled is the
+       normal way to count a part strip (2 strips + 5 loose of a 10s = 2.5),
+       not an either/or choice. Either column alone still works on its own. */
+    helpers: [
+      { after: 'qtyTab', hdr: '» Total strips (auto — do not fill)' },
+      { after: 'mrp', hdr: '» Rate per piece (auto, display only)' },
+      { after: 'mrp', hdr: '» MRP per piece (auto, display only)' },
+      { after: 'mrp', hdr: '» Sale value at MRP (auto)' },
+      { after: 'mrp', hdr: '» Cost of goods sold (auto)' },
+      { after: 'mrp', hdr: '» Margin ₹ (auto)' },
+      { after: 'mrp', hdr: '» Margin % (auto)' }
+    ],
+    eg: [
+      ['Tab. Rifaximin 550', '10s', 12, '', 12, 298, 412, 29.8, 41.2, 4944, 3576, 1368, 27.67],
+      ['Tab. Sample Combo 10', '10s', 2, 5, 2.5, 759.25, 999, 75.925, 99.9, 2497.5, 1898.125, 599.375, 24.0],
+      ['Tab. Metformin 500', '15s', '', 75, 5, 12, 21, 0.8, 1.4, 105, 60, 45, 42.86],
+      ['Inj. Pantoprazole 40', 'vial', 8, '', 8, 38, 58, '', '', 464, 304, 160, 34.48]
+    ],
     notes: [
-      ['Qty sold — strips OR tablets', 'Fill ONE of the two quantity columns per row. Strips as-is; tablets are divided by the pack size (75 tablets of a 15s = 5 strips). A row with BOTH filled is rejected — the app will not guess which you meant.'],
+      ['Qty sold — full strips AND/OR loose tablets', 'Fill full strips, loose tablets, or BOTH per row — they ADD UP (2 strips + 5 loose of a 10s = 2.5 strips). Loose tablets alone are divided by the pack size (75 tablets of a 15s = 5 strips). Loose tablets need a numeric pack — a vial has no strip size to divide by.'],
       ['Net rate — single strip', 'What ONE strip cost you, INCLUSIVE of GST. The same basis the purchase entry uses.'],
       ['MRP — single strip', 'The printed MRP of ONE strip.'],
-      ['What you get back', 'Sale value = Qty × MRP. Cost of goods sold = Qty × Net rate. Margin % = (MRP − Net rate) ÷ MRP.']
+      ['Rate / MRP per piece', 'The single-strip rate divided by the pack size — DISPLAY ONLY, so you can sanity-check a part-strip row. Never a second costing basis.'],
+      ['What you get back', 'Sale value = Total strips × MRP. Cost of goods sold = Total strips × Net rate. Margin % = (MRP − Net rate) ÷ MRP — a ratio, unchanged by part strips.']
     ]
   },
   opening: {
     file: 'yajna-opening-stock-template.xlsx', sheet: 'Opening stock',
     cols: ['name', 'pack', 'open', 'openTab', 'nr', 'mrp'],
     need: ['name', 'open'],
-    helperAfter: 'openTab',
-    eg: [['Tab. Rifaximin 550', '10s', 120, '', 120, 298, 412], ['Tab. Metformin 500', '15s', '', 4500, 300, 12, 21], ['Inj. Pantoprazole 40', 'vial', 45, '', 45, 38, 58]],
+    helpers: [
+      { after: 'openTab', hdr: '» Total strips (auto — do not fill)' },
+      { after: 'mrp', hdr: '» Rate per piece (auto, display only)' },
+      { after: 'mrp', hdr: '» MRP per piece (auto, display only)' },
+      { after: 'mrp', hdr: '» Value at cost (auto)' },
+      { after: 'mrp', hdr: '» Value at MRP (auto)' }
+    ],
+    eg: [
+      ['Tab. Rifaximin 550', '10s', 120, '', 120, 298, 412, 29.8, 41.2, 35760, 49440],
+      ['Tab. Sample Combo 10', '10s', 10, 3, 10.3, 759.25, 999, 75.925, 99.9, 7820.275, 10289.7],
+      ['Tab. Metformin 500', '15s', '', 4500, 300, 12, 21, 0.8, 1.4, 3600, 6300],
+      ['Inj. Pantoprazole 40', 'vial', 45, '', 45, 38, 58, '', '', 1710, 2610]
+    ],
     notes: [
-      ['Opening stock — strips OR tablets', 'Count the shelf in WHICHEVER unit is easier, one column per row. Strips as-is; tablets are divided by the pack size (4500 tablets of a 15s = 300 strips). A row with BOTH filled is rejected. Tablets need a numeric pack — a vial has no strip size to divide by.'],
+      ['Opening stock — full strips AND/OR loose tablets', 'Count the shelf however it sits: full strips, loose tablets, or BOTH per row — they ADD UP (10 strips + 3 loose of a 10s = 10.3). Loose tablets alone are divided by the pack size (4500 tablets of a 15s = 300 strips). Loose tablets need a numeric pack — a vial has no strip size to divide by.'],
       ['Net rate — single strip', 'What ONE strip cost, INCLUSIVE of GST. This is what the stock is VALUED at.'],
       ['MRP — single strip', 'The printed MRP of ONE strip.'],
-      ['What you get back', 'Stock value at net rate = Σ strips × net rate. Value at MRP = Σ strips × MRP. Potential margin, the item table and every downstream figure follow from these.'],
+      ['Rate / MRP per piece', 'The single-strip rate divided by the pack size — DISPLAY ONLY, so a part strip like 10.3 still checks out at a glance. Never a second costing basis.'],
+      ['What you get back', 'Stock value at net rate = Total strips × net rate. Value at MRP = Total strips × MRP. Potential margin, the item table and every downstream figure follow from these.'],
       ['Items already on the master', 'Their opening count is updated; the prices are only overwritten if you supply them.']
     ]
   },
@@ -2941,7 +2972,6 @@ const TEMPLATES = {
   }
 };
 
-const STRIPS_HELPER_HDR = '» Strips used (auto — do not fill)';
 /* the header row a template writes for its columns, in cols order — shared
    with the export routes so an exported sheet's headers can never drift from
    what the uploader actually matches against */
@@ -2951,10 +2981,13 @@ function templateHeaders(kind) {
 }
 /* the STANDARD IMPORT RECEIPT — the one shape every /api/parse/* endpoint's
    response carries, so a single client component can render (and a single
-   test suite can pin) all six. fileRows === imported + skipped.length always. */
-function receiptFields({ fileName, sheet, fileRows, parsed, imported, skipped, ignored, source }) {
+   test suite can pin) all six. fileRows === imported + skipped.length always.
+   `cautions` is separate from `skipped` on purpose — a caution ships WITH the
+   row it warns about (still imported, still counted), never against it. */
+function receiptFields({ fileName, sheet, fileRows, parsed, imported, skipped, ignored, source, cautions }) {
   return { fileName: fileName || '', sheet: sheet || null, fileRows: fileRows || 0,
-    parsed: parsed || 0, imported: imported || 0, skipped: skipped || [], ignored: ignored || 0, source };
+    parsed: parsed || 0, imported: imported || 0, skipped: skipped || [], ignored: ignored || 0, source,
+    cautions: cautions || [] };
 }
 /* the template-only endpoints (purchase, items) have no AI fallback — when
    nothing in the file matches the template's headers, this is the whole
@@ -2970,17 +3003,19 @@ function noSheetMatchedReceipt(kind, fileName) {
 }
 function buildTemplate(kind) {
   const T = TEMPLATES[kind];
-  let hdr = templateHeaders(kind);
-  let widthKeys = [...T.cols];
-  if (T.helperAfter) {
-    /* a read-only "what the app will count" column, inserted after the tablets
-       column. The parser IGNORES it (its header matches no COL pattern) and
-       recomputes — a sheet can never smuggle in its own conversion. The eg rows
-       for these templates already carry the helper value in position. */
-    const at = T.cols.indexOf(T.helperAfter) + 1;
-    hdr = [...hdr.slice(0, at), STRIPS_HELPER_HDR, ...hdr.slice(at)];
-    widthKeys = [...widthKeys.slice(0, at), '_helper', ...widthKeys.slice(at)];
-  }
+  const baseHdr = templateHeaders(kind);
+  let hdr = [], widthKeys = [];
+  /* read-only "what the app will compute" columns, each inserted right after
+     the real column it is named for — several may share the same anchor (e.g.
+     four columns all follow MRP), and they stay in the order given here. The
+     parser IGNORES every one of them (their headers are worded to match NO
+     COL pattern — asserted in tests) and recomputes server-side, so a sheet
+     can never smuggle in its own numbers. The eg rows below already carry
+     every helper value in position. */
+  T.cols.forEach((c, i) => {
+    hdr.push(baseHdr[i]); widthKeys.push(c);
+    (T.helpers || []).filter(h => h.after === c).forEach(h => { hdr.push(h.hdr); widthKeys.push('_helper'); });
+  });
   let ws;
   if (kind === 'purchase') {
     /* branding band + legend above the header. readTemplate scans the first 15
@@ -3059,7 +3094,7 @@ function readTemplate(buf, kind) {
       if (T.need.some(k => Array.isArray(k) ? k.every(x => col[x] === undefined) : col[k] === undefined)) continue;
       const qtyCol = col.qty !== undefined ? col.qty : col.open;
       const tabCol = kind === 'sales' ? col.qtyTab : kind === 'opening' ? col.openTab : undefined;
-      const out = [], skipped = [];
+      const out = [], skipped = [], cautions = [];
       let ignored = 0;
       for (let r = h + 1; r < grid.length; r++) {
         const row = grid[r] || [];
@@ -3073,7 +3108,9 @@ function readTemplate(buf, kind) {
           ? { pack: S(row[col.pack ?? -1], 30).trim(), pqty: N(row[col.pqty]), oqty: N(row[col.oqty ?? -1]),
               rate: N(row[col.rate ?? -1]), disc: N(row[col.disc ?? -1]), gst: N(row[col.gst ?? -1]), mrp: N(row[col.mrp ?? -1]) }
           : { pack: S(row[col.pack ?? -1], 30).trim(), molecule: S(row[col.mol ?? -1], 150).trim(),
-              qty: qtyCol === undefined ? undefined : N(row[qtyCol]), nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) };
+              qty: qtyCol === undefined ? undefined : N(row[qtyCol]),
+              loose: tabCol === undefined ? undefined : N(row[tabCol]),
+              nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) };
         const skip = (reason) => skipped.push({ row: sheetRow, name, reason, ...cells });
         if (!name) { skip('no product name'); continue; }
         if (/^(total|grand total|sub ?total)/i.test(name)) { skip('skipped: total row'); ignored++; continue; }
@@ -3087,34 +3124,41 @@ function readTemplate(buf, kind) {
           out.push(l);
           continue;
         }
-        /* ONE quantity per row, in either unit — the other is derived.
-           strips + tablets both filled = ambiguous, rejected, never guessed.
-           tablets without a numeric pack = nothing to divide by, rejected.
-           The "» Strips used" helper column is ignored entirely: its header
-           matches no COL pattern, and strips are recomputed HERE. */
-        let qty = qtyCol === undefined ? 0 : N(row[qtyCol]);
-        let unit = 'strips', srcTabs = 0;
+        /* FULL STRIPS + LOOSE TABLETS, together — 10 strips + 3 loose of a 10s
+           is 10.3 strips, not a choice between the two columns. Either alone
+           still works: a plain strip count, or a plain tablet count divided by
+           the pack (103 tablets of a 10s = 10.3, same number either way).
+           Loose tablets with no numeric pack = nothing to divide by, rejected.
+           The "» Total strips" helper column is ignored entirely: its header
+           matches no COL pattern, and the total is recomputed HERE. */
+        const srcStrips = qtyCol === undefined ? 0 : N(row[qtyCol]);
+        let qty = srcStrips, unit = 'strips', srcLoose = 0;
         if (tabCol !== undefined) {
-          const hasStrips = qtyCol !== undefined && S(row[qtyCol]).trim() !== '';
-          const hasTabs = S(row[tabCol]).trim() !== '';
-          if (hasStrips && hasTabs) { skip('both units given — fill strips OR tablets, not both'); continue; }
-          if (!hasStrips && hasTabs) {
+          const hasLoose = S(row[tabCol]).trim() !== '';
+          if (hasLoose) {
             const u = packUnits(S(row[col.pack ?? -1]));
-            if (!u) { skip('pack size needed to convert tablets — a vial/btl has no strip size'); continue; }
-            srcTabs = N(row[tabCol]);
-            qty = srcTabs / u;
-            unit = 'tablets';
+            if (!u) { skip('pack size needed to convert loose tablets — a vial has no strip size'); continue; }
+            srcLoose = N(row[tabCol]);
+            qty = srcStrips + srcLoose / u;
+            unit = srcStrips > 0 ? 'mixed' : 'tablets';
+            /* loose tablets AT LEAST a full strip, alongside a strip count already
+               filled in, is the signature of a total tablet count pasted into the
+               loose column by mistake — worth a caution, never a rejection: the
+               number as entered is still summed and imported. */
+            if (srcStrips > 0 && srcLoose >= u) {
+              cautions.push({ row: sheetRow, name, reason: `${srcLoose} loose tablets is a full strip or more (pack ${u}s) alongside ${srcStrips} strips already filled — check this isn't a total tablet count` });
+            }
           }
         }
         // sales needs something sold; opening allows a zero count; the master has no qty at all
         if (kind === 'sales' && qty <= 0) { skip('no quantity sold'); continue; }
         if (kind === 'opening' && qty < 0) { skip('negative opening count'); continue; }
-        out.push({ row: sheetRow, name, unit, srcTabs, molecule: S(row[col.mol ?? -1], 150).trim(), pack: S(row[col.pack ?? -1], 30).trim(), qty, nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) });
+        out.push({ row: sheetRow, name, unit, srcStrips, srcLoose, molecule: S(row[col.mol ?? -1], 150).trim(), pack: S(row[col.pack ?? -1], 30).trim(), qty, nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) });
       }
       const fileRows = out.length + skipped.length;
       // if the header matched but nothing at all sits below it, keep scanning —
       // a later header row further down the sheet may be the real one
-      if (fileRows) return { matched: true, rows: out, sheet: sn, fileRows, skipped, rejected: skipped, ignored, tabletsCol: tabCol !== undefined };
+      if (fileRows) return { matched: true, rows: out, sheet: sn, fileRows, skipped, rejected: skipped, ignored, cautions, tabletsCol: tabCol !== undefined };
     }
   }
   return { matched: false, expected: templateHeaders(kind) };
@@ -3193,7 +3237,7 @@ app.post('/api/parse/gpreport', auth, upload.single('file'), async (req, res, ne
       const items = tpl.rows.map(r => {
         const value = r.qty * r.mrp, cost = r.qty * r.nr;
         return { row: r.row, item: r.name, pack: r.pack, qty: r.qty, nr: r.nr, mrp: r.mrp,
-          unit: r.unit || 'strips', srcTabs: r.srcTabs || 0,
+          unit: r.unit || 'strips', srcStrips: r.srcStrips || 0, srcLoose: r.srcLoose || 0,
           amount: +value.toFixed(2), cost: +cost.toFixed(2),
           // a ratio — the pack size never enters it, only the same unit on both sides
           marginPct: r.mrp > 0 ? (r.mrp - r.nr) / r.mrp * 100 : 0 };
@@ -3208,7 +3252,7 @@ app.post('/api/parse/gpreport', auth, upload.single('file'), async (req, res, ne
         grossProfit: +(salesMrp - cogs).toFixed(2),
         marginPct: salesMrp > 0 ? (salesMrp - cogs) / salesMrp * 100 : 0,
         ...receiptFields({ fileName: req.file.originalname, sheet: tpl.sheet, fileRows: tpl.fileRows,
-          parsed: items.length, imported: items.length, skipped: tpl.skipped, ignored: tpl.ignored, source: 'template' }),
+          parsed: items.length, imported: items.length, skipped: tpl.skipped, ignored: tpl.ignored, source: 'template', cautions: tpl.cautions }),
         note: `Read ${items.length} row${items.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}")`
           + (noRate ? ` · ${noRate} row${noRate === 1 ? ' has' : 's have'} no cost price, so ${noRate === 1 ? 'it counts' : 'they count'} as zero cost` : ''),
         items
@@ -3367,12 +3411,12 @@ app.post('/api/parse/stock', auth, upload.single('file'), async (req, res, next)
     // our own opening-stock template reads by heading — no AI, nothing misread
     const tpl = readTemplate(req.file.buffer, 'opening');
     if (tpl.matched) {
-      const items = tpl.rows.map(r => ({ row: r.row, name: r.name, qty: r.qty, pack: r.pack, nr: r.nr, mrp: r.mrp, unit: r.unit || 'strips', srcTabs: r.srcTabs || 0 }));
+      const items = tpl.rows.map(r => ({ row: r.row, name: r.name, qty: r.qty, pack: r.pack, nr: r.nr, mrp: r.mrp, unit: r.unit || 'strips', srcStrips: r.srcStrips || 0, srcLoose: r.srcLoose || 0 }));
       const noRate = items.filter(r => !(r.nr > 0)).length;
       return res.json({
         source: 'template', stockDate: '', rejected: tpl.rejected || [], tabletsCol: !!tpl.tabletsCol,
         ...receiptFields({ fileName: req.file.originalname, sheet: tpl.sheet, fileRows: tpl.fileRows,
-          parsed: items.length, imported: items.length, skipped: tpl.skipped, ignored: tpl.ignored, source: 'template' }),
+          parsed: items.length, imported: items.length, skipped: tpl.skipped, ignored: tpl.ignored, source: 'template', cautions: tpl.cautions }),
         note: `Read ${items.length} row${items.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}")`
           + (noRate ? ` · ${noRate} without a net rate, so ${noRate === 1 ? 'it cannot' : 'they cannot'} be valued until the Item Master has one` : ''),
         items

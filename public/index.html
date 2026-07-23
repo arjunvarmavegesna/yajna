@@ -463,6 +463,21 @@ const fmtN = n => Math.round(n||0).toLocaleString('en-IN');
 /* quantities can be PART STRIPS (15 tablets of a 10s = 1.5) — fmtQ keeps up to
    2 decimals where fmtN would round 1.5 up to 2 and misreport the shelf */
 const fmtQ = n => { const v = Math.round((Number(n)||0)*100)/100; return v.toLocaleString('en-IN', {maximumFractionDigits:2}); };
+/* shows a fractional strip count the way the shelf looks — "10 + 3" (full
+   strips + loose tablets) rather than a bare "10.3" — whenever the item has a
+   known pack size. The exact figure stays in the surrounding tooltip; an
+   integer count, or an item with no strip size, is unaffected. packUnits is a
+   hoisted function declared further down — safe to reference here since this
+   only ever runs at render time, well after the whole script has loaded. */
+function fmtStrips(qty, pack){
+  const u = packUnits(pack);
+  const q = Number(qty)||0;
+  if(!u || q<0) return fmtQ(q);
+  const whole = Math.floor(q + 1e-9);
+  const loose = Math.round((q-whole)*u);
+  if(loose<=0 || loose>=u) return fmtQ(q);
+  return `${whole} + ${loose}`;
+}
 const fmtRs = n => 'Rs. ' + fmtN(n);
 const pct = n => (Math.round((n||0)*10)/10).toFixed(1) + '%';
 const iso = d => { const x = new Date(d); return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0'); };
@@ -2850,6 +2865,7 @@ function renderImportReceipt(receipt, downloadable){
   if(!receipt) return '';
   if(downloadable===undefined) downloadable = true;
   const fileRows = receipt.fileRows||0, imported = receipt.imported||0, skipped = receipt.skipped||[], ignored = receipt.ignored||0;
+  const cautions = receipt.cautions||[];
   const notImported = skipped.length;
   const mismatch = fileRows !== imported + notImported;
   const groups = {};
@@ -2859,6 +2875,7 @@ function renderImportReceipt(receipt, downloadable){
     <div class="import-receipt" style="margin-top:8px">
       <p class="mini-note" style="margin:0 0 6px"><b>${fileRows} row${fileRows===1?'':'s'} in file · ${imported} imported · ${notImported} not imported</b>${ignored? ` <span style="color:var(--muted)">(${ignored} of those ${ignored===1?'was':'were'} total/subtotal rows, not a data problem)</span>`:''}</p>
       ${mismatch? `<p class="mini-note" style="color:var(--red)">⚠ ${fileRows} in file but ${imported} imported + ${notImported} not imported don't add up to it — that is a bug here, not a data problem in your file.</p>`:''}
+      ${cautions.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cautions.length} row${cautions.length===1?'':'s'} imported as entered, but worth a second look:<br>${cautions.slice(0,6).map(c=>`row ${c.row} — ${esc(c.name)}: ${esc(c.reason)}`).join('<br>')}${cautions.length>6?'<br>…':''}</p>`:''}
       ${notImported? `
         ${groupList.length>1? `<p class="mini-note" style="margin:0 0 4px">${groupList.map(([reason,rows])=>`${rows.length}× ${esc(reason)}`).join(' · ')}</p>`:''}
         <div class="tbl-scroll" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:7px">
@@ -2945,6 +2962,15 @@ function setFileUnits(hid, src, u){
 const unitCell = (r, units)=> units==='tablets' && r.packU
   ? `${fmtQ(r.srcQty)} → <b>${fmtQ(r.qty)}</b> strips <span style="color:var(--faint)">(${r.packU}s)</span>`
   : `${fmtQ(r.qty)}${units==='tablets'? ' <span style="color:var(--faint)" title="No strip size on this item — 1 unit = 1 strip">as-is</span>':''}`;
+/* opening/sales rows straight from a per-row template (not the file-level
+   toggle above): full strips and loose tablets are shown as entered — "10 +
+   3 tabs" — with the resolved total in bold, so the preview reads like the
+   shelf, not a bare decimal. */
+const srcQtyCell = (r, units)=> r.unit==='mixed'
+  ? `${fmtQ(r.srcStrips)} + ${fmtQ(r.srcLoose)} tabs → <b>${fmtQ(r.qty)}</b>`
+  : r.unit==='tablets'
+  ? `${fmtQ(r.srcLoose)} tabs → <b>${fmtQ(r.qty)}</b>`
+  : unitCell(r, units);
 function unitsSeg(id, mode){
   return `<div class="entry-bar" style="margin:10px 0 4px">
     <span class="eyebrow">This file counts</span>
@@ -3116,7 +3142,7 @@ function gpUploadModal(e, locked){
           <tbody>${priced.slice(0,8).map(r=>{
             const mp = num(r.mrp)>0? (num(r.mrp)-num(r.nr))/num(r.mrp)*100 : 0;
             const st = lineStatus(state.hospital, {item:r.item, pqty:1, oqty:0, rate:num(r.nr), disc:0, gst:0, mrp:num(r.mrp)});
-            return `<tr><td>${esc(r.item)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${r.unit==='tablets'? `${fmtQ(r.srcTabs)} tabs → <b>${fmtQ(r.qty)}</b>` : unitCell(r, units)}</td><td class="r num">${r2(r.nr)}</td><td class="r num">${r2(r.mrp)}</td><td class="r num" style="font-weight:700;color:${marginCol(st.status)}">${pct(mp)}</td><td>${marginChip(st.status)}</td></tr>`;
+            return `<tr><td>${esc(r.item)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${srcQtyCell(r, units)}</td><td class="r num">${r2(r.nr)}</td><td class="r num">${r2(r.mrp)}</td><td class="r num" style="font-weight:700;color:${marginCol(st.status)}">${pct(mp)}</td><td>${marginChip(st.status)}</td></tr>`;
           }).join('')}</tbody></table>
           <p class="mini-note">${priced.length>8? `First 8 of ${priced.length} priced rows. `:''}Margin % is <b>(MRP − net rate) ÷ MRP</b> — a ratio, so the strip size never enters it. It only needs both rates on the same basis, and they are: both per strip.</p>`
           : (items.length? '<p class="mini-note">These rows carry no cost price, so only the day\'s totals can be filled — not the per-item margin.</p>':'')}
@@ -5846,7 +5872,7 @@ function invAsOfView(hid, canEdit){
      and it never writes. */
   const QV = qtyViewOf(hid);
   const UW = QV==='tablets'? 'tablet' : 'strip';
-  const qMain = (val, pack)=>{ const u = packUnits(pack); return QV==='tablets' && u? fmtQ(val*u) : fmtQ(val); };
+  const qMain = (val, pack)=>{ const u = packUnits(pack); return QV==='tablets' && u? fmtQ(val*u) : fmtStrips(val, pack); };
   const qSub = (val, pack)=>{
     const u = packUnits(pack);
     if(!u || QV==='strips') return '';
@@ -6137,8 +6163,8 @@ function adjustModal(hid, key){
     <div class="modal-head"><h3>Adjust stock — ${esc(inv.name)}</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
       <div class="grid2" style="margin-bottom:14px">
-        <div class="kpi"><div class="l">In stock now</div><div class="v num" style="font-size:17px;color:${cur<0?'var(--red)':'var(--ink)'}">${(qtyViewOf(hid)==='tablets' && packUnits(inv.pack))? fmtQ(cur*packUnits(inv.pack)) : fmtQ(cur)}</div><div class="d">${esc(inv.pack||'')} · ${(qtyViewOf(hid)==='tablets' && packUnits(inv.pack))? 'tablets — recorded as '+fmtQ(cur)+' strips' : 'strips'}</div></div>
-        <div class="kpi"><div class="l">After adjustment</div><div class="v num" style="font-size:17px;color:var(--green)" id="adjAfter">${fmtQ(cur)}</div><div class="d" id="adjDelta">no change</div></div>
+        <div class="kpi"><div class="l">In stock now</div><div class="v num" style="font-size:17px;color:${cur<0?'var(--red)':'var(--ink)'}">${(qtyViewOf(hid)==='tablets' && packUnits(inv.pack))? fmtQ(cur*packUnits(inv.pack)) : fmtStrips(cur, inv.pack)}</div><div class="d">${esc(inv.pack||'')} · ${(qtyViewOf(hid)==='tablets' && packUnits(inv.pack))? 'tablets — recorded as '+fmtQ(cur)+' strips' : 'strips'}</div></div>
+        <div class="kpi"><div class="l">After adjustment</div><div class="v num" style="font-size:17px;color:var(--green)" id="adjAfter">${fmtStrips(cur, inv.pack)}</div><div class="d" id="adjDelta">no change</div></div>
       </div>
       <div class="seg" style="margin-bottom:12px">
         <button class="active" data-adjm="count">I counted the stock</button>
@@ -6175,7 +6201,7 @@ function adjustModal(hid, key){
   };
   const refresh = ()=>{
     const d = delta();
-    $('#adjAfter').textContent = fmtQ(cur + d);
+    $('#adjAfter').textContent = fmtStrips(cur + d, inv.pack);
     $('#adjAfter').style.color = (cur+d) < 0 ? 'var(--red)' : 'var(--green)';
     $('#adjDelta').textContent = d===0? 'no change' : (d>0? '+'+fmtQ(d)+' strips' : fmtQ(d)+' strips') + (inv.nr? ' · '+fmtRs(Math.abs(d*inv.nr))+(d<0?' written off':' added'):'');
   };
@@ -6215,17 +6241,17 @@ function ledgerModal(hid, key){
     <div class="modal-head"><h3>${esc(inv?inv.name:key)} — stock ledger</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
       <div class="grid2" style="margin-bottom:12px">
-        <div class="kpi"><div class="l">Opening (${L.from==='0000-01-01'?'—':fmtDateShort(L.from)})</div><div class="v num" style="font-size:17px">${fmtN(L.opening)}</div></div>
-        <div class="kpi"><div class="l">In stock now</div><div class="v num" style="font-size:17px;color:${inv&&inv.stock<0?'var(--red)':'var(--green)'}">${fmtN(inv?inv.stock:0)}</div></div>
+        <div class="kpi"><div class="l">Opening (${L.from==='0000-01-01'?'—':fmtDateShort(L.from)})</div><div class="v num" style="font-size:17px">${fmtStrips(L.opening, inv&&inv.pack)}</div></div>
+        <div class="kpi"><div class="l">In stock now</div><div class="v num" style="font-size:17px;color:${inv&&inv.stock<0?'var(--red)':'var(--green)'}">${fmtStrips(inv?inv.stock:0, inv&&inv.pack)}</div></div>
       </div>
       <div class="tbl-scroll" style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:7px"><table class="tbl">
         <thead><tr><th>Date</th><th>Movement</th><th class="r">In</th><th class="r">Out</th><th class="r">Balance</th><th></th></tr></thead>
         <tbody>${L.rows.map(r=>`<tr${r.adjId?' style="background:#FBFAF4"':''}>
           <td class="num">${fmtDateShort(r.date)}</td>
           <td>${r.adjId? '<span class="chip chip-amber">Adjustment</span>' : r.type}${r.src? ' <span style="color:var(--faint);font-size:12px">'+esc(r.src)+'</span>':''}</td>
-          <td class="r num" style="color:var(--green)">${r.in? '+'+fmtN(r.in):''}</td>
-          <td class="r num" style="color:var(--red)">${r.out? '−'+fmtN(r.out):''}</td>
-          <td class="r num" style="font-weight:600;color:${r.bal<0?'var(--red)':'inherit'}">${fmtN(r.bal)}</td>
+          <td class="r num" style="color:var(--green)">${r.in? '+'+fmtStrips(r.in, inv&&inv.pack):''}</td>
+          <td class="r num" style="color:var(--red)">${r.out? '−'+fmtStrips(r.out, inv&&inv.pack):''}</td>
+          <td class="r num" style="font-weight:600;color:${r.bal<0?'var(--red)':'inherit'}">${fmtStrips(r.bal, inv&&inv.pack)}</td>
           <td>${(r.adjId && state.user.role==='admin')? `<button class="row-del" data-adjdel="${esc(r.adjId)}" title="Undo this adjustment">✕</button>`:''}</td></tr>`).join('')
           || '<tr><td colspan="6" style="color:var(--faint);padding:12px">No movements yet.</td></tr>'}
         </tbody></table></div>
@@ -6276,8 +6302,10 @@ function openingStockModal(hid){
   // save, since /items/opening can still reject a row (e.g. nr above the MRP)
   const readSkipNote = ()=>{
     const s = (lastMeta.skipped)||[];
-    if(!s.length) return '';
-    return `<p class="mini-note" style="color:var(--red)">✕ ${s.length} row${s.length===1?'':'s'} could not be read: ${s.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name||'(blank)')}: ${esc(x.reason)}`).join('; ')}${s.length>6?'…':''}</p>`;
+    const c = (lastMeta.cautions)||[];
+    if(!s.length && !c.length) return '';
+    return (s.length? `<p class="mini-note" style="color:var(--red)">✕ ${s.length} row${s.length===1?'':'s'} could not be read: ${s.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name||'(blank)')}: ${esc(x.reason)}`).join('; ')}${s.length>6?'…':''}</p>`:'')
+      + (c.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${c.length} row${c.length===1?'':'s'} worth a second look: ${c.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name)}: ${esc(x.reason)}`).join('; ')}${c.length>6?'…':''}</p>`:'');
   };
   const preview = (rows0, note, src, meta)=>{
     rawRows = rows0; lastNote = note||'';
@@ -6300,7 +6328,7 @@ function openingStockModal(hid){
       </div>
       <div class="tbl-scroll" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:7px"><table class="tbl">
         <thead><tr><th>Product</th><th>Pack</th><th class="r">Strips</th><th class="r">Net rate/strip</th><th class="r">MRP/strip</th><th></th></tr></thead>
-        <tbody>${rows.slice(0,200).map(r=>`<tr><td>${esc(r.name)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${r.unit==='tablets'? `${fmtQ(r.srcTabs)} tabs → <b>${fmtQ(r.qty)}</b> strips` : unitCell(r, units)}</td><td class="r num">${r.nr? r2(r.nr):'—'}</td><td class="r num">${r.mrp? r2(r.mrp):'—'}</td>
+        <tbody>${rows.slice(0,200).map(r=>`<tr><td>${esc(r.name)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${srcQtyCell(r, units)}</td><td class="r num">${r.nr? r2(r.nr):'—'}</td><td class="r num">${r.mrp? r2(r.mrp):'—'}</td>
           <td>${findItem(hid,r.name)? '<span class="chip chip-blue">On master</span>':'<span class="chip chip-green">New item</span>'}</td></tr>`).join('')}</tbody></table></div>
       <p class="mini-note">${rows.length} item${rows.length===1?'':'s'} · ${known} already on the master (opening qty updated) · ${rows.length-known} will be added.${note? ' '+esc(note):''}</p>
       ${lastMeta.tabletsCol? '<p class="mini-note">This sheet has its own tablets column — each row already says which unit it counts, so the file-level toggle is off.</p>' : unitsSeg('osu', units)}
@@ -6335,7 +6363,7 @@ function openingStockModal(hid){
         const r = await apiUpload(`/parse/stock?hid=${encodeURIComponent(hid)}`, f);
         if(r.stockDate) $('#osDate').value = r.stockDate;
         preview(r.items, r.note, r.source, {fileName:f.name, sheet:r.sheet, fileRows:r.fileRows, parsed:r.parsed, imported:0,
-          skipped:r.skipped||[], ignored:r.ignored||0, source:r.source, tabletsCol:r.tabletsCol});
+          skipped:r.skipped||[], ignored:r.ignored||0, cautions:r.cautions||[], source:r.source, tabletsCol:r.tabletsCol});
       }catch(err){ $('#osPrev').innerHTML = `<p style="color:var(--red);font-size:13px">${esc(err.message)}</p>`; }
       btn.disabled=false; btn.textContent='Read / preview';
       return;
