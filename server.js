@@ -1446,14 +1446,56 @@ function appCss() {
   } catch (e) { _appCss = ''; }
   return _appCss;
 }
+
+/* The console's typefaces (Archivo + IBM Plex Mono) load from Google Fonts via
+   <link> tags — which a bare setContent never sees, so the first PDFs rendered
+   in Times fallback. Download the woff2s ONCE, inline them as base64
+   @font-face, cache to disk: every later render is hermetic and instant. */
+const FONTS_CSS_URL = 'https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap';
+const FONTS_CACHE = path.join(__dirname, 'data', 'fonts.css');
+let _fontsCss = null;
+async function pdfFontsCss() {
+  if (_fontsCss !== null) return _fontsCss;
+  try { _fontsCss = fs.readFileSync(FONTS_CACHE, 'utf8'); return _fontsCss; } catch (e) {}
+  try {
+    // a modern UA is what makes Google serve woff2 instead of legacy ttf css
+    const css = await (await fetch(FONTS_CSS_URL, { headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36' }, signal: AbortSignal.timeout(15000) })).text();
+    const urls = [...new Set([...css.matchAll(/url\((https:[^)]+\.woff2)\)/g)].map(m => m[1]))];
+    let out = css;
+    for (const u of urls) {
+      const buf = Buffer.from(await (await fetch(u, { signal: AbortSignal.timeout(15000) })).arrayBuffer());
+      out = out.split(u).join(`data:font/woff2;base64,${buf.toString('base64')}`);
+    }
+    fs.writeFileSync(FONTS_CACHE, out);
+    _fontsCss = out;
+  } catch (e) {
+    console.error('[pdf] font embed failed, falling back to system fonts:', e.message);
+    _fontsCss = '';   // system stacks still carry the layout
+  }
+  return _fontsCss;
+}
+
 async function renderReportPdf(reportHtml) {
   const page = await (await getBrowser()).newPage();
   try {
-    await page.setContent(`<!doctype html><html><head><meta charset="utf-8"><style>${appCss()}
-      body{background:#fff;margin:0;padding:0}
-      .report-doc{box-shadow:none;margin:0;max-width:none}
-    </style></head><body class="printing">${reportHtml}</body></html>`, { waitUntil: 'load', timeout: 20000 });
-    return await page.pdf({ format: 'A4', printBackground: true, margin: { top: '10mm', bottom: '10mm', left: '8mm', right: '8mm' } });
+    /* NO body.printing here: those @media print rules hide-everything-then-show
+       the report with position:absolute — right for printing the live app page,
+       fatal for a standalone document (absolute content does not paginate).
+       This document IS only the report, so it just flows. */
+    await page.setContent(`<!doctype html><html><head><meta charset="utf-8"><style>${await pdfFontsCss()}</style><style>${appCss()}
+      *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+      html,body{background:#fff;margin:0;padding:0}
+      .report-doc{box-shadow:none;border:none;border-radius:0;margin:0;max-width:none}
+      .rp-inner{padding:4mm 3mm}
+      .rp-sec{break-inside:avoid}
+      .report-actions{display:none}
+      /* A4 content width trips the app's narrow-screen media query — on paper
+         the full grid fits, so pin the desktop layouts back */
+      .rp-kpis{grid-template-columns:repeat(4,1fr) !important}
+      .rp-meta{grid-template-columns:repeat(4,1fr) !important}
+    </style></head><body>${reportHtml}</body></html>`, { waitUntil: 'load', timeout: 20000 });
+    await page.evaluateHandle('document.fonts.ready').catch(() => {});
+    return await page.pdf({ format: 'A4', printBackground: true, margin: { top: '12mm', bottom: '12mm', left: '10mm', right: '10mm' } });
   } finally {
     await page.close().catch(() => {});
     touchBrowserIdle();
