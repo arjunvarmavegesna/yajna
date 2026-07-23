@@ -2310,8 +2310,12 @@ app.post('/api/parse/invoice', auth, upload.single('file'), async (req, res, nex
 const COL = {
   name: { hdr: 'Product name',                          match: [/^product/i, /^item/i, /^name/i, /^description/i, /^particular/i] },
   pack: { hdr: 'Pack size (10s / 15s)',                 match: [/^pack/i, /^strip *size/i, /^unit/i, /^conv/i] },
-  qty:  { hdr: 'Qty sold (strips)',                     match: [/^qty/i, /^quantity/i, /^sold/i, /^strips? *(sold|count)/i, /^nos/i] },
-  open: { hdr: 'Opening stock (strips)',                match: [/^opening/i, /^stock/i, /^balance/i, /^qty/i, /^quantity/i, /closing/i] },
+  /* the STRIP matchers must never swallow a "(tablets)" heading — the tablet
+     keys sit after them in cols order, so a claimed heading never reaches them */
+  qty:  { hdr: 'Qty sold (strips)',                     match: [/^(?!.*tablets?)qty/i, /^(?!.*tablets?)quantity/i, /^(?!.*tablets?)sold/i, /^strips? *(sold|count)/i, /^(?!.*tablets?)nos/i] },
+  open: { hdr: 'Opening stock (strips)',                match: [/^(?!.*tablets?)opening/i, /^(?!.*tablets?)stock/i, /^(?!.*tablets?)balance/i, /^(?!.*tablets?)qty/i, /^(?!.*tablets?)quantity/i, /^(?!.*tablets?)closing/i] },
+  qtyTab:  { hdr: 'Qty sold (tablets)',       match: [/^qty.*tab/i, /tablets?/i] },
+  openTab: { hdr: 'Opening stock (tablets)',  match: [/^opening.*tab/i, /tablets?/i] },
   nr:   { hdr: 'Net rate — single strip (incl. GST)',   match: [/net *rate/i, /^cost/i, /purchase *rate/i, /^p\.?rate/i, /^ptr/i, /^rate$/i] },
   mol:  { hdr: 'Molecule / salt', match: [/^molecule/i, /^salt/i, /^generic/i, /composition/i, /^content/i] },
   pqty: { hdr: 'Purchase Qty (strips)', match: [/purchase *qty/i, /^qty/i, /billed/i] },
@@ -2321,14 +2325,23 @@ const COL = {
   gst:  { hdr: 'GST %', match: [/^gst/i, /^tax/i] },
   mrp:  { hdr: 'MRP — single strip',                    match: [/^mrp/i, /^m\.r\.p/i, /retail/i, /^sale *rate/i] }
 };
+/* mirror of the client helper: the strip size out of the pack string; null for
+   vial / btl / amp — nothing to divide by */
+function packUnits(pack) {
+  const m = String(pack || '').match(/\d+/);
+  const u = m ? parseInt(m[0], 10) : 0;
+  return u >= 1 ? u : null;
+}
+
 const TEMPLATES = {
   sales: {
     file: 'yajna-sales-margin-template.xlsx', sheet: 'Sales',
-    cols: ['name', 'pack', 'qty', 'nr', 'mrp'],
-    need: ['name', 'qty', 'mrp'],
-    eg: [['Tab. Rifaximin 550', '10s', 12, 298, 412], ['Tab. Metformin 500', '15s', 5, 12, 21], ['Inj. Pantoprazole 40', 'vial', 8, 38, 58]],
+    cols: ['name', 'pack', 'qty', 'qtyTab', 'nr', 'mrp'],
+    need: ['name', ['qty', 'qtyTab'], 'mrp'],
+    helperAfter: 'qtyTab',
+    eg: [['Tab. Rifaximin 550', '10s', 12, '', 12, 298, 412], ['Tab. Metformin 500', '15s', '', 75, 5, 12, 21], ['Inj. Pantoprazole 40', 'vial', 8, '', 8, 38, 58]],
     notes: [
-      ['Qty sold (strips)', 'How many STRIPS were sold — never tablets. Part strips are fine: 2.5 is two and a half.'],
+      ['Qty sold — strips OR tablets', 'Fill ONE of the two quantity columns per row. Strips as-is; tablets are divided by the pack size (75 tablets of a 15s = 5 strips). A row with BOTH filled is rejected — the app will not guess which you meant.'],
       ['Net rate — single strip', 'What ONE strip cost you, INCLUSIVE of GST. The same basis the purchase entry uses.'],
       ['MRP — single strip', 'The printed MRP of ONE strip.'],
       ['What you get back', 'Sale value = Qty × MRP. Cost of goods sold = Qty × Net rate. Margin % = (MRP − Net rate) ÷ MRP.']
@@ -2336,11 +2349,12 @@ const TEMPLATES = {
   },
   opening: {
     file: 'yajna-opening-stock-template.xlsx', sheet: 'Opening stock',
-    cols: ['name', 'pack', 'open', 'nr', 'mrp'],
+    cols: ['name', 'pack', 'open', 'openTab', 'nr', 'mrp'],
     need: ['name', 'open'],
-    eg: [['Tab. Rifaximin 550', '10s', 120, 298, 412], ['Tab. Metformin 500', '15s', 300, 12, 21], ['Inj. Pantoprazole 40', 'vial', 45, 38, 58]],
+    helperAfter: 'openTab',
+    eg: [['Tab. Rifaximin 550', '10s', 120, '', 120, 298, 412], ['Tab. Metformin 500', '15s', '', 4500, 300, 12, 21], ['Inj. Pantoprazole 40', 'vial', 45, '', 45, 38, 58]],
     notes: [
-      ['Opening stock (strips)', 'The count of STRIPS on the shelf on the day you started — whatever the strip size. A 10s and a 15s are both just "1 strip" here.'],
+      ['Opening stock — strips OR tablets', 'Count the shelf in WHICHEVER unit is easier, one column per row. Strips as-is; tablets are divided by the pack size (4500 tablets of a 15s = 300 strips). A row with BOTH filled is rejected. Tablets need a numeric pack — a vial has no strip size to divide by.'],
       ['Net rate — single strip', 'What ONE strip cost, INCLUSIVE of GST. This is what the stock is VALUED at.'],
       ['MRP — single strip', 'The printed MRP of ONE strip.'],
       ['What you get back', 'Stock value at net rate = Σ strips × net rate. Value at MRP = Σ strips × MRP. Potential margin, the item table and every downstream figure follow from these.'],
@@ -2382,9 +2396,20 @@ const TEMPLATES = {
   }
 };
 
+const STRIPS_HELPER_HDR = '» Strips used (auto — do not fill)';
 function buildTemplate(kind) {
   const T = TEMPLATES[kind];
-  const hdr = T.cols.map(c => (T.hdrs && T.hdrs[c]) || COL[c].hdr);
+  let hdr = T.cols.map(c => (T.hdrs && T.hdrs[c]) || COL[c].hdr);
+  let widthKeys = [...T.cols];
+  if (T.helperAfter) {
+    /* a read-only "what the app will count" column, inserted after the tablets
+       column. The parser IGNORES it (its header matches no COL pattern) and
+       recomputes — a sheet can never smuggle in its own conversion. The eg rows
+       for these templates already carry the helper value in position. */
+    const at = T.cols.indexOf(T.helperAfter) + 1;
+    hdr = [...hdr.slice(0, at), STRIPS_HELPER_HDR, ...hdr.slice(at)];
+    widthKeys = [...widthKeys.slice(0, at), '_helper', ...widthKeys.slice(at)];
+  }
   let ws;
   if (kind === 'purchase') {
     /* branding band + legend above the header. readTemplate scans the first 15
@@ -2404,7 +2429,7 @@ function buildTemplate(kind) {
     ws['!cols'] = T.cols.map(c => ({ wch: c === 'name' ? 34 : c === 'rate' ? 30 : c === 'pqty' || c === 'oqty' ? 22 : 16 }));
   } else {
     ws = XLSX.utils.aoa_to_sheet([hdr, ...T.eg]);
-    ws['!cols'] = T.cols.map(c => ({ wch: c === 'name' ? 34 : c === 'nr' ? 32 : 20 }));
+    ws['!cols'] = widthKeys.map(c => ({ wch: c === 'name' ? 34 : c === 'nr' ? 32 : c === '_helper' ? 28 : 20 }));
   }
   const notes = XLSX.utils.aoa_to_sheet([
     ['How to fill this sheet'], [],
@@ -2453,9 +2478,11 @@ function readTemplate(buf, kind) {
         const ix = hdr.findIndex((c, n) => c && !taken.has(n) && COL[key].match.some(p => p.test(c)));
         if (ix >= 0) { col[key] = ix; taken.add(ix); }
       }
-      if (T.need.some(k => col[k] === undefined)) continue;
+      // a `need` entry may be an any-of list: sales accepts qty OR qtyTab
+      if (T.need.some(k => Array.isArray(k) ? k.every(x => col[x] === undefined) : col[k] === undefined)) continue;
       const qtyCol = col.qty !== undefined ? col.qty : col.open;
-      const out = [];
+      const tabCol = kind === 'sales' ? col.qtyTab : kind === 'opening' ? col.openTab : undefined;
+      const out = [], rejected = [];
       for (let r = h + 1; r < grid.length; r++) {
         const row = grid[r] || [];
         const name = S(row[col.name], 150).trim();
@@ -2471,14 +2498,32 @@ function readTemplate(buf, kind) {
           out.push(l);
           continue;
         }
-        const qty = qtyCol === undefined ? 0 : N(row[qtyCol]);
-        const rec = { name, molecule: S(row[col.mol ?? -1], 150).trim(), pack: S(row[col.pack ?? -1], 30).trim(), qty, nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) };
+        /* ONE quantity per row, in either unit — the other is derived.
+           strips + tablets both filled = ambiguous, rejected, never guessed.
+           tablets without a numeric pack = nothing to divide by, rejected.
+           The "» Strips used" helper column is ignored entirely: its header
+           matches no COL pattern, and strips are recomputed HERE. */
+        let qty = qtyCol === undefined ? 0 : N(row[qtyCol]);
+        let unit = 'strips', srcTabs = 0;
+        if (tabCol !== undefined) {
+          const hasStrips = qtyCol !== undefined && S(row[qtyCol]).trim() !== '';
+          const hasTabs = S(row[tabCol]).trim() !== '';
+          if (hasStrips && hasTabs) { rejected.push({ row: r + 1, name, reason: 'both units given — fill strips OR tablets, not both' }); continue; }
+          if (!hasStrips && hasTabs) {
+            const u = packUnits(S(row[col.pack ?? -1]));
+            if (!u) { rejected.push({ row: r + 1, name, reason: 'pack size needed to convert tablets — a vial/btl has no strip size' }); continue; }
+            srcTabs = N(row[tabCol]);
+            qty = srcTabs / u;
+            unit = 'tablets';
+          }
+        }
+        const rec = { name, unit, srcTabs, molecule: S(row[col.mol ?? -1], 150).trim(), pack: S(row[col.pack ?? -1], 30).trim(), qty, nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) };
         // sales needs something sold; opening allows a zero count; the master has no qty at all
         if (kind === 'sales' && qty <= 0) continue;
         if (kind === 'opening' && qty < 0) continue;
         out.push(rec);
       }
-      if (out.length) return { rows: out, sheet: sn };
+      if (out.length || rejected.length) return { rows: out, sheet: sn, rejected, tabletsCol: tabCol !== undefined };
     }
   }
   return null;
@@ -2537,6 +2582,7 @@ app.post('/api/parse/gpreport', auth, upload.single('file'), async (req, res, ne
       const items = tpl.rows.map(r => {
         const value = r.qty * r.mrp, cost = r.qty * r.nr;
         return { item: r.name, pack: r.pack, qty: r.qty, nr: r.nr, mrp: r.mrp,
+          unit: r.unit || 'strips', srcTabs: r.srcTabs || 0,
           amount: +value.toFixed(2), cost: +cost.toFixed(2),
           // a ratio — the pack size never enters it, only the same unit on both sides
           marginPct: r.mrp > 0 ? (r.mrp - r.nr) / r.mrp * 100 : 0 };
@@ -2547,6 +2593,7 @@ app.post('/api/parse/gpreport', auth, upload.single('file'), async (req, res, ne
       return res.json({
         source: 'template', sheet: tpl.sheet,
         salesMrp: +salesMrp.toFixed(2), cogs: +cogs.toFixed(2), cash: 0, credit: 0,
+        rejected: tpl.rejected || [], tabletsCol: !!tpl.tabletsCol,
         grossProfit: +(salesMrp - cogs).toFixed(2),
         marginPct: salesMrp > 0 ? (salesMrp - cogs) / salesMrp * 100 : 0,
         note: `Read ${items.length} row${items.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}")`
@@ -2680,10 +2727,10 @@ app.post('/api/parse/stock', auth, upload.single('file'), async (req, res, next)
     // our own opening-stock template reads by heading — no AI, nothing misread
     const tpl = readTemplate(req.file.buffer, 'opening');
     if (tpl) {
-      const items = tpl.rows.map(r => ({ name: r.name, qty: r.qty, pack: r.pack, nr: r.nr, mrp: r.mrp }));
+      const items = tpl.rows.map(r => ({ name: r.name, qty: r.qty, pack: r.pack, nr: r.nr, mrp: r.mrp, unit: r.unit || 'strips', srcTabs: r.srcTabs || 0 }));
       const noRate = items.filter(r => !(r.nr > 0)).length;
       return res.json({
-        source: 'template', stockDate: '',
+        source: 'template', stockDate: '', rejected: tpl.rejected || [], tabletsCol: !!tpl.tabletsCol,
         note: `Read ${items.length} row${items.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}")`
           + (noRate ? ` · ${noRate} without a net rate, so ${noRate === 1 ? 'it cannot' : 'they cannot'} be valued until the Item Master has one` : ''),
         items

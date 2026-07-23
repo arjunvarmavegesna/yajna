@@ -60,6 +60,17 @@ ok(Math.abs(stock - 8.5) < 0.001, 'stock = 10 opening − 1.5 strips sold = 8.5 
 const soldRow = w.eval(`stockAsOf('viraj', todayISO()).items.find(m=>m.key===nameKey('Tab. Unit Test')).sold`);
 ok(Math.abs(soldRow - 1.5) < 0.001, 'and the Sold column reads 1.5 strips', soldRow);
 
+console.log('— the Inventory table shows tablets without doubling the columns —');
+w.eval(`openHospital('viraj','inventory'); invState().mode='asof'; invState().qtyView='both'; renderInventory();`); await tick(400);
+ok([...doc.querySelectorAll('[data-invqv]')].map(b=>b.dataset.invqv).join() === 'strips,tablets,both', 'a Strips / Tablets / Both view seg', [...doc.querySelectorAll('[data-invqv]')].length);
+// stock is 8.5 strips of a 10s from the earlier world → 85 tabs on the subline
+ok(/85 tabs/.test(doc.querySelector('#invBody').textContent), 'Both: the grey subline carries the tablet equivalent (8.5 strips → 85 tabs)');
+doc.querySelector('[data-invqv="strips"]').click(); await tick(300);
+ok(!/tabs/.test(doc.querySelector('#invBody').textContent), 'Strips: the sublines disappear');
+doc.querySelector('[data-invqv="tablets"]').click(); await tick(300);
+ok(/8\.5 strips/.test(doc.querySelector('#invBody').textContent), 'Tablets: tabs lead and strips move to the subline — the ledger number is never hidden');
+w.eval(`invState().qtyView='both'`);
+
 console.log('— the default follows the FILE SHAPE, remembered per hospital —');
 ok(w.eval(`fileUnits('viraj','template')`) === 'strips', 'our template asks for strips, so template files default to strips');
 ok(w.eval(`fileUnits('viraj','ai')`) === 'tablets', 'a free-form Marg export counts loose — it defaults to TABLETS');
