@@ -183,6 +183,12 @@ CREATE TABLE IF NOT EXISTS import_receipts(
   skipped TEXT NOT NULL DEFAULT '[]', ignored INTEGER NOT NULL DEFAULT 0,
   source TEXT DEFAULT '', user_name TEXT DEFAULT '', created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_rcpt_h ON import_receipts(hospital_id, created_at);
+CREATE TABLE IF NOT EXISTS sales_removals(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL, date TEXT NOT NULL,
+  items_count INTEGER NOT NULL DEFAULT 0, strips_count REAL NOT NULL DEFAULT 0,
+  mrp_value REAL NOT NULL DEFAULT 0, cost_value REAL NOT NULL DEFAULT 0,
+  file_name TEXT DEFAULT '', removed_by TEXT DEFAULT '', removed_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_salesrm_hd ON sales_removals(hospital_id, date);
 `);
 
 /* migrate: single hospital_id -> hospital_ids list + portal on/off flag */
@@ -320,7 +326,8 @@ function cleanEntry(x) {
     // invId links a purchase-summary row to the invoice it was derived from
     purchases: arr(x.purchases, 100).map(p => ({ vendor: S(p.vendor, 120), items: prim(p.items), value: prim(p.value), invId: S(p.invId, 40) })),
     rtv: arr(x.rtv, 100).map(r => ({ drug: S(r.drug, 120), vendor: S(r.vendor, 120), qty: prim(r.qty), value: prim(r.value), reason: S(r.reason, 40), status: S(r.status, 40) })),
-    sales: { mrp: prim(sales.mrp), cogs: prim(sales.cogs), cash: prim(sales.cash), credit: prim(sales.credit), cancels: prim(sales.cancels) },
+    // fileName is provenance only ("N rows loaded from X") — never itself trusted for numbers
+    sales: { mrp: prim(sales.mrp), cogs: prim(sales.cogs), cash: prim(sales.cash), credit: prim(sales.credit), cancels: prim(sales.cancels), fileName: S(sales.fileName, 200) },
     /* Cash drawer. cash_sales is NOT stored here — it IS sales.cash. A second
        field beside a derivable one guarantees two conflicting numbers. */
     cash: {
@@ -809,6 +816,65 @@ app.put('/api/entries/:hid/:date', auth, (req, res) => {
   res.json({ savedAt, ...r });
 });
 
+/* Removing a day's sales must leave a trace. Margin is what a performance
+   engagement is settled on — if a correction changes it, the system has to be
+   able to show who removed what and when, not just assert it happened. */
+const rowSalesRemoval = (r) => ({ id: r.id, hid: r.hospital_id, date: r.date, itemsCount: r.items_count,
+  stripsCount: r.strips_count, mrpValue: r.mrp_value, costValue: r.cost_value, fileName: r.file_name,
+  removedBy: r.removed_by, removedAt: r.removed_at });
+
+app.post('/api/entries/:hid/:date/remove-sales', auth, (req, res) => {
+  const { hid, date } = req.params;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Bad date' });
+  scopeCheck(req, hid);
+  const row = db.prepare('SELECT data FROM entries WHERE hospital_id=? AND date=?').get(hid, date);
+  if (!row) return res.status(404).json({ error: 'No entry for this day' });
+  if (req.user.role !== 'admin' && date !== todayISO()) {
+    return res.status(403).json({ error: 'Saved entries for past dates are locked — ask the admin to edit' });
+  }
+  const entry = JSON.parse(row.data);
+  const itemsCount = (entry.itemSales || []).length;
+  const stripsCount = (entry.itemSales || []).reduce((a, r) => a + N(r.qty), 0);
+  const costValue = (entry.itemSales || []).reduce((a, r) => a + N(r.cost), 0);
+  const mrpValue = N(entry.sales.mrp);
+  if (!itemsCount && !mrpValue && !N(entry.sales.cogs)) {
+    return res.status(400).json({ error: "This day has no sales loaded — there's nothing to remove" });
+  }
+  const fileName = entry.sales.fileName || '';
+  entry.itemSales = [];
+  entry.sales.mrp = 0; entry.sales.cogs = 0; entry.sales.fileName = '';
+  const savedAt = Date.now();
+  const removal = {
+    id: uid('salrm'), hospital_id: hid, date, items_count: itemsCount, strips_count: stripsCount,
+    mrp_value: mrpValue, cost_value: costValue, file_name: fileName, removed_by: req.user.name, removed_at: savedAt
+  };
+  const tx = db.transaction(() => {
+    db.prepare('UPDATE entries SET data=?, saved_at=? WHERE hospital_id=? AND date=?').run(JSON.stringify(entry), savedAt, hid, date);
+    db.prepare(`INSERT INTO sales_removals(id,hospital_id,date,items_count,strips_count,mrp_value,cost_value,file_name,removed_by,removed_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`).run(removal.id, removal.hospital_id, removal.date, removal.items_count, removal.strips_count,
+      removal.mrp_value, removal.cost_value, removal.file_name, removal.removed_by, removal.removed_at);
+    // the day's own alerts (variance/HV/cashdrawer) can change once sales are gone
+    db.prepare("DELETE FROM notifications WHERE hospital_id=? AND date=? AND type IN ('variance','unbilled','hv','cashdrawer')").run(hid, date);
+    const alerts = entryAlerts(entry);
+    const notifications = alerts.map(a => {
+      const n = { id: uid('n'), type: a.type, hospital_id: hid, date, msg: a.msg, ts: savedAt, read: 0 };
+      db.prepare('INSERT INTO notifications(id,type,hospital_id,date,msg,ts,read) VALUES(?,?,?,?,?,?,0)').run(n.id, n.type, n.hospital_id, n.date, n.msg, n.ts);
+      return rowNotif(n);
+    });
+    return notifications;
+  });
+  const notifications = tx();
+  console.log(`[sales-removal] ${req.user.name} removed ${itemsCount} sales row(s) for ${hid} on ${date} (was: ${fileName || 'no file on record'})`);
+  res.json({ savedAt, removal: rowSalesRemoval(removal), notifications });
+});
+
+app.get('/api/sales-removals', auth, (req, res) => {
+  const hid = S(req.query.hid, 60);
+  scopeCheck(req, hid);
+  const rows = db.prepare('SELECT * FROM sales_removals WHERE hospital_id=? ORDER BY removed_at DESC LIMIT 50').all(hid).map(rowSalesRemoval);
+  res.json({ removals: rows });
+});
+
 /* ---------- payments ---------- */
 app.post('/api/payments', auth, requireRole('admin'), (req, res) => {
   const { hid, vendorId, amount, date, note } = req.body || {};
@@ -985,7 +1051,7 @@ app.post('/api/clear', auth, requireRole('admin'), (req, res) => {
    than inferred, and the impact is countable before anything happens. */
 const HOSPITAL_TABLES = ['entries', 'notifications', 'vendors', 'payments', 'items', 'price_log', 'pending_items', 'item_aliases', 'wa_outbox', 'approval_batches',
   'stock_adjustments', 'receivables', 'receivable_actions', 'expiry_snapshots', 'period_data',
-  'hv_tracked', 'report_prefs', 'import_receipts'];
+  'hv_tracked', 'report_prefs', 'import_receipts', 'sales_removals'];
 
 /* What would go, and who would be left without a hospital — answered BEFORE the
    delete, so the confirmation can show it rather than surprise anyone. */

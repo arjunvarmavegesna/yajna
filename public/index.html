@@ -809,7 +809,7 @@ function blankEntry(hid, date){
     purchases:[{vendor:'',items:'',value:''}],
     rtv:[],
     invoices:[],
-    sales:{mrp:'',cogs:'',cash:'',credit:'',cancels:''},
+    sales:{mrp:'',cogs:'',cash:'',credit:'',cancels:'',fileName:''},
     cash:{opening: prevCashClosing(hid,date) ?? '', receipts:'', payments:'', actual:'', reason:''},
     audit:{opening: prev!=null ? prev : '', actual:'', unbilled:false, bounces:[]},
     hv:(db.hvTracked[hid]||[]).map(d=>({drug:d, opening:prevHvClosing(hid,date,d), received:0, dispensed:0, closing:prevHvClosing(hid,date,d)})),
@@ -1473,6 +1473,7 @@ function getDraft(){
   const e = db.dailyData[hid][d];
   if(!e.invoices) e.invoices = [];
   if(!e.itemSales) e.itemSales = [];
+  if(e.sales.fileName===undefined) e.sales.fileName = '';
   // days saved before the drawer existed carry no cash block
   if(!e.cash) e.cash = {opening: e.savedAt? '' : (prevCashClosing(hid,d) ?? ''), receipts:'', payments:'', actual:'', reason:''};
   return e;
@@ -2508,12 +2509,15 @@ function invLineModal(e, i, j, locked){
 
 function tabSales(e, locked){
   const c = calcEntry(e);
+  // once item rows are loaded, MRP/COGS are DERIVED from them (see gpUploadModal)
+  // and shown read-only here — the two physically cannot disagree
+  const loaded = !!(e.itemSales && e.itemSales.length);
   return `
   <div class="subhead"><h4>Sales &amp; margin</h4><div class="rule"></div>${locked?'':`<button class="btn btn-sm" id="gpTplTop" title="The daily sales sheet — product, pack size, strips sold, and the net rate and MRP of one strip">${IC.dl} Template</button>
     <button class="btn btn-sm" id="gpBtn">${IC.up} Upload sales report</button>`}</div>
   <div class="grid2">
-    <div class="field"><label>Total sales at MRP (Rs.)</label><input class="in num" type="number" min="0" data-s="mrp" value="${esc(e.sales.mrp)}" ${dis(locked)}></div>
-    <div class="field"><label>Cost of goods sold — COGS (Rs.)</label><input class="in num" type="number" min="0" data-s="cogs" value="${esc(e.sales.cogs)}" ${dis(locked)}></div>
+    <div class="field"><label>Total sales at MRP (Rs.)</label><input class="in num" type="number" min="0" data-s="mrp" value="${esc(e.sales.mrp)}" ${dis(locked||loaded)} ${loaded?'title="Worked out from the loaded item rows — remove them to enter a total by hand"':''}></div>
+    <div class="field"><label>Cost of goods sold — COGS (Rs.)</label><input class="in num" type="number" min="0" data-s="cogs" value="${esc(e.sales.cogs)}" ${dis(locked||loaded)} ${loaded?'title="Worked out from the loaded item rows — remove them to enter a total by hand"':''}></div>
   </div>
   <div class="calc-box calc-green"><span class="l">Gross margin — (MRP − COGS) ÷ MRP</span><span class="v" id="calcMargin">${pct(c.margin)}</span></div>
   <div class="grid3" style="margin-top:16px">
@@ -2523,7 +2527,10 @@ function tabSales(e, locked){
   </div>
   <p class="mini-note">Stock reconciliation always uses purchase cost — never MRP.</p>
 
-  ${(e.itemSales&&e.itemSales.length)? `<p class="mini-note" style="color:var(--green-dark)">✓ ${e.itemSales.length} item-wise sale rows loaded from the GP report — powering the Top 15 selling items in Weekly/Monthly views.</p>`:''}`;
+  ${loaded? `<div class="lock-note" style="margin-top:10px">
+      <div><b>✓ ${e.itemSales.length} row${e.itemSales.length===1?'':'s'} loaded${e.sales.fileName? ` from ${esc(e.sales.fileName)}`:''}.</b> Total sales &amp; COGS above come straight from these rows. Powering the Top 15 selling items in Weekly/Monthly views.</div>
+      ${locked?'':`<button class="btn btn-sm btn-danger" id="gpRemoveBtn" style="margin-left:auto;flex:none">${IC.trash} Remove</button>`}
+    </div>`:''}`;
 }
 
 /* Receipts claimed against credit in the ledger, in cash, on this date. The
@@ -2829,6 +2836,44 @@ function wireEntryTab(e, locked){
   const pu=$('#purUpl'); if(pu) pu.onclick=()=> purchaseUploadModal(e, locked);
   const gp=$('#gpBtn'); if(gp) gp.onclick=()=> gpUploadModal(e, locked);
   const gpt=$('#gpTplTop'); if(gpt) gpt.onclick=()=> downloadTemplate('sales', 'Sales & margin');
+  const gpr=$('#gpRemoveBtn'); if(gpr) gpr.onclick=()=> removeSalesConfirmModal(e);
+}
+
+/* Removing a day's sales must show, before it happens, exactly what comes back
+   to the shelf — the same numbers the upload preview shows, run the other way —
+   and afterwards must leave a record: who removed it, when, and how much. That
+   trail is what lets a later margin question be answered with more than "trust me". */
+function removeSalesConfirmModal(e){
+  const hid = state.hospital, date = state.date;
+  const rows = e.itemSales||[];
+  const impact = rows.length? salesStockImpact(hid, rows) : null;
+  const fileLabel = e.sales.fileName? esc(e.sales.fileName) : 'this upload';
+  openModal(`
+    <div class="modal-head"><h3>Remove this day's sales?</h3><button class="modal-x">✕</button></div>
+    <div class="modal-body">
+      <p class="mini-note" style="margin-top:0">${rows.length} row${rows.length===1?'':'s'} loaded from <b>${fileLabel}</b> will be cleared, along with the Total sales (MRP) and COGS figures above. Stock corrects itself automatically — nothing else to do.</p>
+      ${impact? `<p class="mini-note"><b>This will return ${fmtQ(impact.reportStrips)} strips, worth ${fmtRs(impact.reportCogs)} at cost, across ${impact.reportItems} item${impact.reportItems===1?'':'s'}.</b></p>`:''}
+      <p class="mini-note" style="color:var(--amber)">⚠ This is recorded — who removed it, when, and how much — so this day's margin can always be explained later.</p>
+    </div>
+    <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn btn-danger" id="gpRemoveConfirm">Remove sales</button></div>`);
+  $('#gpRemoveConfirm').onclick = async ()=>{
+    const btn = $('#gpRemoveConfirm'); btn.disabled = true; btn.textContent = 'Removing…';
+    if(state.demo){
+      e.itemSales = []; e.sales.mrp = 0; e.sales.cogs = 0; e.sales.fileName = '';
+      closeModal(); toast('Sales removed for this day','green'); renderEntry();
+      return;
+    }
+    try{
+      const r = await api(`/entries/${hid}/${date}/remove-sales`, {method:'POST'});
+      e.itemSales = []; e.sales.mrp = 0; e.sales.cogs = 0; e.sales.fileName = '';
+      e.savedAt = r.savedAt;
+      db.notifications = db.notifications.filter(n=> !(n.hid===hid && n.date===date && ['variance','unbilled','hv','cashdrawer'].includes(n.type)));
+      (r.notifications||[]).forEach(n=> db.notifications.unshift(n));
+      closeModal();
+      toast(`Sales removed — ${r.removal.itemsCount} row${r.removal.itemsCount===1?'':'s'}, ${fmtRs(r.removal.costValue)} at cost`, 'green');
+      renderEntry();
+    }catch(err){ toast(err.message,'red'); btn.disabled=false; btn.textContent='Remove sales'; }
+  };
 }
 
 /* item auto-suggest from the item master */
@@ -3309,6 +3354,7 @@ function gpUploadModal(e, locked){
         <div><b>Use the Yajna template for the cleanest read.</b> It has the four columns the margin needs — product, qty in strips, cost price including GST, and MRP — and it is read by matching the column headings, so nothing is guessed. A Marg export in any other shape still works; it goes through the AI reader instead.</div>
         <button class="btn btn-sm" id="gpTpl" style="margin-left:auto;flex:none">${IC.dl} Download template</button>
       </div>
+      ${(e.itemSales&&e.itemSales.length)? `<p class="mini-note" style="color:var(--amber)">⚠ This day already has ${e.itemSales.length} row${e.itemSales.length===1?'':'s'} loaded${e.sales.fileName? ` from <b>${esc(e.sales.fileName)}</b>`:''}. Uploading here will <b>replace</b> them, not add to them.</p>`:''}
       <div class="field"><label>Report file (Excel / CSV / PDF / photo)</label><input class="in" type="file" id="gpFile" accept=".xls,.xlsx,.csv,.pdf,image/*"></div>
       <div id="gpPrev"><p class="mini-note">Sales at MRP, cost of goods sold and the margin are worked out from the rows and filled into this tab.</p></div>
     </div>
@@ -3366,18 +3412,28 @@ function gpUploadModal(e, locked){
   };
   $('#gpApply').onclick = ()=>{
     if(!parsed) return;
-    e.sales.mrp = parsed.salesMrp;
-    if(parsed.cogs>0) e.sales.cogs = parsed.cogs;
     if(parsed.cash>0) e.sales.cash = parsed.cash;
     if(parsed.credit>0) e.sales.credit = parsed.credit;
     // what lands on the entry is the STRIP view — the conversion, if any, is done
     const rows = viewItems().rows;
-    if(parsed.items && parsed.items.length) e.itemSales = rows.map(r=>({
-      item:r.item, qty:num(r.qty), amount:num(r.amount),
-      pack:r.pack||'', nr:num(r.nr), mrp:num(r.mrp), cost:num(r.cost)
-    }));
+    const hasItems = parsed.items && parsed.items.length;
+    if(hasItems){
+      // the totals are DERIVED from these same rows in the same assignment —
+      // rows and totals move together, or neither moves, so they physically cannot disagree
+      e.itemSales = rows.map(r=>({
+        item:r.item, qty:num(r.qty), amount:num(r.amount),
+        pack:r.pack||'', nr:num(r.nr), mrp:num(r.mrp), cost:num(r.cost)
+      }));
+      e.sales.mrp = Math.round(e.itemSales.reduce((a,r)=>a+num(r.amount),0)*100)/100;
+      e.sales.cogs = Math.round(e.itemSales.reduce((a,r)=>a+num(r.cost),0)*100)/100;
+    } else {
+      // no item-wise breakdown in this file — only the header totals can be filled
+      e.sales.mrp = parsed.salesMrp;
+      if(parsed.cogs>0) e.sales.cogs = parsed.cogs;
+    }
+    e.sales.fileName = parsed.fileName || '';
     saveImportReceipt(state.hospital, 'sales', parsed);
-    toast(`Sales & margin filled${parsed.items&&parsed.items.length? ` · ${parsed.items.length} item row${parsed.items.length===1?'':'s'} loaded`:''}`,'green');
+    toast(`Sales & margin filled${hasItems? ` · ${parsed.items.length} item row${parsed.items.length===1?'':'s'} loaded`:''}`,'green');
     const proceed = ()=>{ closeModal(); state.entryTab = 1; renderEntryTab(e, locked); };
     // confirm the SAME shelf-impact numbers as what actually got staged, one
     // more read before the day itself is saved
@@ -3514,6 +3570,29 @@ function renderReceiptsCard(receipts){
       </tr>${open? `<tr><td colspan="8">${renderImportReceipt(r, IMPORT_TEMPLATE_KINDS.includes(r.kind))}</td></tr>`:''}`;
     }).join('')}</tbody></table></div>`;
 }
+/* removing a day's sales is rare and consequential enough that its record
+   belongs on the same screen as everything else that touched a day's numbers */
+async function loadSalesRemovals(hid){
+  state.salesRemovals = state.salesRemovals||{};
+  if(state.demo){ state.salesRemovals[hid] = []; return; }
+  try{ state.salesRemovals[hid] = (await api(`/sales-removals?hid=${encodeURIComponent(hid)}`)).removals; }
+  catch(e){ state.salesRemovals[hid] = []; }
+}
+function renderSalesRemovalsCard(removals){
+  if(removals===undefined) return '<p class="mini-note" style="padding:12px">Loading…</p>';
+  if(!removals.length) return '<p class="mini-note" style="padding:12px;color:var(--faint)">No sales have been removed.</p>';
+  return `<div class="tbl-scroll"><table class="tbl">
+    <thead><tr><th>Removed</th><th>Day affected</th><th>File</th><th class="r">Items</th><th class="r">Strips</th><th class="r">At cost</th><th>By</th></tr></thead>
+    <tbody>${removals.map(r=>`<tr>
+      <td class="num" style="font-size:12px">${fmtDateShort(iso(new Date(r.removedAt)))}</td>
+      <td class="num" style="font-size:12px">${fmtDate(r.date)}</td>
+      <td style="color:var(--muted);font-size:12.5px">${esc(r.fileName||'—')}</td>
+      <td class="r num">${r.itemsCount}</td>
+      <td class="r num">${fmtQ(r.stripsCount)}</td>
+      <td class="r num">${fmtRs(r.costValue)}</td>
+      <td style="font-size:12px;color:var(--muted)">${esc(r.removedBy||'—')}</td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
 function renderHistory(){
   const hid = state.hospital;
   const today = todayISO();
@@ -3534,13 +3613,17 @@ function renderHistory(){
   }).join('');
   const receipts = (state.impReceipts||{})[hid];
   if(receipts===undefined) loadImportReceipts(hid).then(()=>{ if(state.hospital===hid) renderHistory(); });
+  const removals = (state.salesRemovals||{})[hid];
+  if(removals===undefined) loadSalesRemovals(hid).then(()=>{ if(state.hospital===hid) renderHistory(); });
   $('#content').innerHTML = `
     <div class="entry-bar">${hospSelect('histHosp')}<span class="eyebrow" style="margin-left:6px">Last 30 days</span></div>
     <div class="card"><div class="tbl-scroll"><table class="tbl">
       <thead><tr><th>Date</th><th class="r">Sales (MRP)</th><th class="r">Margin</th><th class="r">Purchases</th><th class="r">Variance</th><th>Flags</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table></div></div>
     <div class="subhead" style="margin-top:16px"><h4>Recent uploads</h4><div class="rule"></div></div>
-    <div class="card">${renderReceiptsCard(receipts)}</div>`;
+    <div class="card">${renderReceiptsCard(receipts)}</div>
+    <div class="subhead" style="margin-top:16px"><h4>Sales removals</h4><div class="rule"></div></div>
+    <div class="card">${renderSalesRemovalsCard(removals)}</div>`;
   const hh=$('#histHosp'); if(hh) hh.onchange = ev=>{ state.hospital=ev.target.value; state.histExpand=null; renderHistory(); };
   $$('[data-open]').forEach(b=> b.onclick=()=>{ state.date=b.dataset.open; state.entryTab=0; state.entryMode='daily'; goTab('entry'); });
   $$('[data-recx]').forEach(b=> b.onclick=()=>{ const ix=+b.dataset.recx; state.histExpand = state.histExpand===ix? null : ix; renderHistory(); });
