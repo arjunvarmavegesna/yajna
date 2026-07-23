@@ -4443,6 +4443,8 @@ function renderOffers(){
       ${OFF_FILTERS.map(f=>`<button class="btn btn-sm ${state.offFilter===f.id?'btn-primary':''}" data-offf="${f.id}">${f.t}${f.id==='due'&&due? ` (${due})`:''}</button>`).join('')}
       <input class="in" id="offSearch" placeholder="Item, molecule, vendor, negotiator…" value="${esc(state.offQuery||'')}" style="width:230px">
       <span style="flex:1"></span>
+      ${(()=>{ const openProposed = all.filter(o=> offEff(o)==='proposed' || offEff(o)==='awaiting').length;
+        return openProposed>1? `<button class="btn btn-sm" id="offBatch" title="One WhatsApp, one link — the doctor rules on every open offer in a single visit">${IC.wa} Send all to doctor (${openProposed})</button>` : ''; })()}
       <button class="btn btn-sm btn-primary" id="offAdd">${IC.plus} Record an offer</button>
     </div>
     <div class="card"><div class="tbl-scroll"><table class="tbl">
@@ -4472,6 +4474,31 @@ function renderOffers(){
   const so = $('#offSearch');
   so.oninput = ()=>{ state.offQuery = so.value; renderOffers(); const s2=$('#offSearch'); s2.focus(); s2.setSelectionRange(s2.value.length, s2.value.length); };
   $('#offAdd').onclick = ()=> offerModal();
+  const ob=$('#offBatch'); if(ob) ob.onclick = async ()=>{
+    if(state.demo){ toast('Batch approval works in live mode — it needs the server to sign the link','amber'); return; }
+    const h = db.hospitals[hid];
+    if(!(h.doctorPhone||h.phone)){ toast("No WhatsApp number for the doctor — add it under Edit hospital",'red'); return; }
+    ob.disabled = true;
+    try{
+      const r = await api('/offers/request-batch-approval',{method:'POST', body:{hid}});
+      (r.offers||[]).forEach(fo=>{ const o=(db.offers[hid]||[]).find(x=>x.id===fo.id); if(o) Object.assign(o, fo); });
+      if(r.sent && r.sent.ok) toast(`${r.count} offers sent to ${h.doctor||'the doctor'} as one approval — their reply covers the lot`,'green');
+      else{
+        openModal(`
+          <div class="modal-head"><h3>Send it from your WhatsApp</h3><button class="modal-x">✕</button></div>
+          <div class="modal-body">
+            <p class="mini-note" style="margin-top:0">${esc(r.sent && r.sent.error || 'Direct send unavailable')} — open WhatsApp with the batch message ready. The approval link inside works either way.</p>
+            <textarea class="in" rows="9" readonly>${esc(r.text)}</textarea>
+          </div>
+          <div class="modal-foot"><button class="btn" id="abCopy">Copy message</button><span style="flex:1"></span>
+            <button class="btn modal-x">Close</button>
+            ${r.waLink? `<button class="btn btn-primary" id="abWa">${IC.wa} Open WhatsApp</button>`:''}</div>`);
+        $('#abCopy').onclick = ()=> navigator.clipboard.writeText(r.text).then(()=>toast('Copied','green'));
+        const aw=$('#abWa'); if(aw) aw.onclick = ()=> window.open(r.waLink,'_blank');
+      }
+      renderOffers();
+    }catch(err){ toast(err.message,'red'); ob.disabled=false; }
+  };
   $$('[data-offopen]').forEach(b=> b.onclick = ()=> offerDetail(offersOf(hid).find(x=>x.id===b.dataset.offopen)));
 }
 

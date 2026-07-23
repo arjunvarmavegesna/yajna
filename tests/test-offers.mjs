@@ -125,6 +125,54 @@ r = await adm.req('POST', `/offers/${ex.id}/actions`, { type: 'reopened', note: 
 ok(r.status === 200 && r.data.offer.status === 'proposed', 'reopening puts it back in play');
 ok((await adm.req('DELETE', `/offers/${ex.id}`)).status === 200, 'an unapplied offer can be deleted');
 
+console.log('— batch approval: one link, many decisions —');
+{
+  const page2 = async (path) => { const r = await fetch(B.replace('/api','') + path); return { status: r.status, text: await r.text() }; };
+  const form2 = async (path, body) => {
+    const r = await fetch(B.replace('/api','') + path, { method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    return { status: r.status, text: await r.text() };
+  };
+  await adm.req('POST', '/items', { hid: 'viraj', name: 'Tab. Batch One', molecule: 'Batchamol 100mg', pack: '10s', nr: 100, mrp: 150 });
+  await adm.req('POST', '/items', { hid: 'viraj', name: 'Tab. Batch Two', molecule: 'Batchamol 200mg', pack: '15s', nr: 60, mrp: 90 });
+  await adm.req('POST', '/items', { hid: 'viraj', name: 'Tab. Batch Three', molecule: 'Batchamol 300mg', pack: '10s', nr: 40, mrp: 70 });
+  const b1 = (await adm.req('POST', '/offers', { hid: 'viraj', item: 'Tab. Batch One', newNr: 90, negotiatedBy: 'Bhagavan' })).data.offer;
+  const b2 = (await adm.req('POST', '/offers', { hid: 'viraj', item: 'Tab. Batch Two', newNr: 55, negotiatedBy: 'Bhagavan' })).data.offer;
+  const b3 = (await adm.req('POST', '/offers', { hid: 'viraj', item: 'Tab. Batch Three', newNr: 35, negotiatedBy: 'Bhagavan' })).data.offer;
+
+  ok((await stf.req('POST', '/offers/request-batch-approval', { hid: 'mithra' })).status === 403, 'a data-entry user cannot send a batch');
+  let r2 = await adm.req('POST', '/offers/request-batch-approval', { hid: 'viraj', offerIds: [b1.id, b2.id, b3.id] });
+  ok(r2.status === 200 && r2.data.count === 3, 'three open offers ride ONE batch', JSON.stringify(r2.data.sent ?? r2.data.error));
+  ok(/₹100 → ₹90/.test(r2.data.text) && /₹60 → ₹55/.test(r2.data.text) && /₹40 → ₹35/.test(r2.data.text), 'the message lists every change', r2.data.text.split('\n')[0]);
+  ok(r2.data.offers.every(o => o.status === 'proposed' && o.awaitingDoctor), 'sending decides nothing — all three stay proposed, with the doctor');
+  const btok = r2.data.url.split('/approve-batch/')[1];
+
+  let pg2 = await page2('/approve-batch/' + btok);
+  ok(pg2.status === 200 && /Batch One/.test(pg2.text) && /Batch Three/.test(pg2.text), 'the page lists all three items');
+  ok((pg2.text.match(/type="checkbox" name="ok_/g) || []).length === 3, 'each with its own tick');
+  ok(/I agree to the ticked revised purchase rates/.test(pg2.text), 'and the agreement checkbox gates the button');
+
+  ok(/tick/i.test((await form2('/approve-batch/' + btok, 'decision=approve')).text), 'Approve without the agreement tick bounces');
+  // approve TWO of the three: the doctor unticks Batch Two
+  const bodyStr = `decision=approve&agree=1&ok_${b1.id}=1&ok_${b3.id}=1&note=batch+ok`;
+  pg2 = await form2('/approve-batch/' + btok, bodyStr);
+  ok(/2 approved/.test(pg2.text) && /1 left undecided/.test(pg2.text), 'approving the ticked two reports exactly that', pg2.text.slice(0, 120));
+  const after = (await adm.req('GET', '/bootstrap')).data.offers.viraj;
+  ok(after.find(o => o.id === b1.id).status === 'accepted' && after.find(o => o.id === b3.id).status === 'accepted', 'the ticked two are Doctor approved');
+  ok(after.find(o => o.id === b1.id).approvedBy === 'Dr. Guna Ranjan', 'in the doctor\'s name');
+  ok(after.find(o => o.id === b2.id).status === 'proposed', 'the unticked one stays proposed — undecided, not declined');
+  ok((await page2('/approve-batch/' + btok)).status === 404, 'the batch link is single-use — dead after the decision');
+  ok((await adm.req('GET', '/bootstrap')).data.items.viraj.find(i => i.name === 'Tab. Batch One').nr === 100, 'and the master has NOT moved — the manager still applies');
+
+  // decline-all path needs a note
+  const r3 = await adm.req('POST', '/offers/request-batch-approval', { hid: 'viraj', offerIds: [b2.id] });
+  const btok2 = r3.data.url.split('/approve-batch/')[1];
+  ok(/needs a word on why/.test((await form2('/approve-batch/' + btok2, 'decision=decline')).text), 'declining a batch without a note is refused');
+  pg2 = await form2('/approve-batch/' + btok2, 'decision=decline&note=rates+not+final');
+  ok(/declined and recorded/i.test(pg2.text), 'decline-all records the lot with the reason');
+  ok((await adm.req('GET', '/bootstrap')).data.offers.viraj.find(o => o.id === b2.id).status === 'declined', 'and the offer reads declined');
+}
+
 console.log('— the vendor import is untouched by the molecule work —');
 r = await adm.req('POST', '/vendors/bulk', { hid: 'viraj', vendors: [{ name: 'Zydus Wellness', credit: 30 }] });
 ok(r.status === 200 && r.data.created.length === 1, 'vendors still import', JSON.stringify(r.data).slice(0, 120));

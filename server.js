@@ -116,6 +116,14 @@ CREATE INDEX IF NOT EXISTS idx_snap_h ON expiry_snapshots(hospital_id);
 /* Documents waiting for the doctor's 24h window to open. A closed window cannot
    block a report forever: the PDF parks here, the doctor gets a template nudge,
    and their reply — any reply — triggers delivery through the webhook. */
+/* One link, many price changes: a batch groups proposed offers so the doctor
+   rules on the whole day's negotiations in one visit instead of link-per-item. */
+CREATE TABLE IF NOT EXISTS approval_batches(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL,
+  hash TEXT, offer_ids TEXT NOT NULL,
+  sent_at INTEGER NOT NULL, expires INTEGER NOT NULL,
+  decided_at INTEGER, created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS wa_outbox(
   id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL,
   phone TEXT NOT NULL, filename TEXT NOT NULL, caption TEXT DEFAULT '',
@@ -965,7 +973,7 @@ app.post('/api/clear', auth, requireRole('admin'), (req, res) => {
 /* Every table a hospital owns. Deleting the hospital takes all of it — this is
    the single most destructive thing in the app, so the list is explicit rather
    than inferred, and the impact is countable before anything happens. */
-const HOSPITAL_TABLES = ['entries', 'notifications', 'vendors', 'payments', 'items', 'price_log', 'pending_items', 'item_aliases', 'wa_outbox',
+const HOSPITAL_TABLES = ['entries', 'notifications', 'vendors', 'payments', 'items', 'price_log', 'pending_items', 'item_aliases', 'wa_outbox', 'approval_batches',
   'stock_adjustments', 'receivables', 'receivable_actions', 'expiry_snapshots', 'period_data',
   'hv_tracked', 'report_prefs'];
 
@@ -1249,6 +1257,93 @@ async function sendWA(phone, text) {
   } catch (e) { return { ok: false, error: e.message || 'network error' }; }
 }
 
+/* ---------- the batch approval page ----------
+   Same contract as the single page — public, the signed token IS the credential,
+   single-use, no login. Each item carries its own tick so the doctor can approve
+   some and leave others; one submit records the lot. */
+function findApprovalBatch(token) {
+  if (!/^[A-Za-z0-9_-]{20,50}$/.test(token || '')) return null;
+  return db.prepare('SELECT * FROM approval_batches WHERE hash=?').get(hashToken(token)) || null;
+}
+function batchOffers(batch) {
+  const ids = JSON.parse(batch.offer_ids || '[]');
+  if (!ids.length) return [];
+  return db.prepare(`SELECT * FROM margin_offers WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+}
+const batchRowsHtml = (offers, withTicks) => `<table>${offers.map(o => `
+  <tr>${withTicks ? `<td style="width:26px"><input type="checkbox" name="ok_${esc(o.id)}" value="1" checked style="width:17px;height:17px"></td>` : ''}
+    <td>${esc(o.item_name)}${o.pack ? ' <span style="color:#9AA6A0">· ' + esc(o.pack) + '</span>' : ''}
+      <div style="color:#6B7A73;font-size:12px">${esc(o.vendor || '')}${o.negotiated_by ? ' · ' + esc(o.negotiated_by) : ''}</div></td>
+    <td style="white-space:nowrap">₹${N(o.old_nr) || '—'} → <b class="green">₹${N(o.new_nr)}</b></td></tr>`).join('')}</table>`;
+
+app.get('/approve-batch/:token', (req, res) => {
+  const batch = findApprovalBatch(req.params.token);
+  res.type('html');
+  if (!batch) return res.status(404).send(approvalPage('Link not valid', `<div class="sub">This approval link is not recognised — it may have been replaced by a newer one. Ask Yajna to resend it.</div>`));
+  const h = db.prepare('SELECT * FROM hospitals WHERE id=?').get(batch.hospital_id) || { name: '', doctor: 'Doctor' };
+  const offers = batchOffers(batch);
+  const open = offers.filter(o => o.status === 'proposed');
+  if ((batch.expires || 0) < Date.now()) return res.send(approvalPage('Link expired', `<div class="sub">This link has expired. Ask Yajna to resend the approvals.</div>`));
+  if (!open.length) return res.send(approvalPage(esc(h.name), `<div class="sub">Everything in this batch has already been decided — nothing further to do.</div>${batchRowsHtml(offers, false)}`));
+  return res.send(approvalPage(esc(h.name),
+    `<div class="sub">${esc(h.doctor || 'Doctor')} — Yajna is asking your approval for ${open.length} purchase-price change${open.length === 1 ? '' : 's'}. Untick anything you are not approving today.</div>
+     <form method="POST" action="/approve-batch/${esc(req.params.token)}">
+       ${batchRowsHtml(open, true)}
+       <textarea name="note" rows="2" placeholder="Note (optional — required if declining)"></textarea>
+       <label style="display:flex;gap:9px;align-items:flex-start;margin-top:13px;font-size:14px;cursor:pointer">
+         <input type="checkbox" name="agree" value="1" id="agr" style="margin-top:2px;width:17px;height:17px">
+         <span>I agree to the ticked revised purchase rates for ${esc(h.name)}.</span></label>
+       <div class="btns">
+         <button class="no" name="decision" value="decline">Decline all</button>
+         <button class="ok" name="decision" value="approve" id="apr" disabled style="opacity:.45">Approve ticked</button>
+       </div></form>
+     <script>document.getElementById('agr').onchange=function(){var b=document.getElementById('apr');b.disabled=!this.checked;b.style.opacity=this.checked?'1':'.45';};</script>`));
+});
+
+app.post('/approve-batch/:token', express.urlencoded({ extended: false }), (req, res) => {
+  const batch = findApprovalBatch(req.params.token);
+  res.type('html');
+  if (!batch) return res.status(404).send(approvalPage('Link not valid', `<div class="sub">This approval link is not recognised.</div>`));
+  const h = db.prepare('SELECT * FROM hospitals WHERE id=?').get(batch.hospital_id) || { name: '', doctor: 'Doctor' };
+  if ((batch.expires || 0) < Date.now()) return res.send(approvalPage('Link expired', `<div class="sub">This link has expired. Ask Yajna to resend the approvals.</div>`));
+  const offers = batchOffers(batch).filter(o => o.status === 'proposed');
+  if (!offers.length) return res.send(approvalPage(esc(h.name), `<div class="sub">Already decided — nothing further to do.</div>`));
+  const decision = String(req.body.decision || '');
+  const note = S(req.body.note, 300).trim();
+  const today = todayISO(), now = Date.now();
+  const who = h.doctor || 'Doctor';
+  const kill = () => db.prepare('UPDATE approval_batches SET hash=NULL, decided_at=? WHERE id=?').run(now, batch.id);
+
+  if (decision === 'approve') {
+    if (!req.body.agree) return res.send(approvalPage(esc(h.name), `<div class="sub">Tick "I agree to the ticked revised purchase rates" and press Approve again — the tick is your sign-off.</div>`));
+    const picked = offers.filter(o => req.body[`ok_${o.id}`]);
+    if (!picked.length) return res.send(approvalPage(esc(h.name), `<div class="sub">Nothing was ticked — tick the changes you approve, or use Decline all.</div>`));
+    const tx = db.transaction(() => {
+      for (const o of picked) {
+        db.prepare("UPDATE margin_offers SET status='accepted', approved_by=?, approved_at=?, approval_hash=NULL WHERE id=?").run(who, now, o.id);
+        pushOfferAction(o, 'accepted', `Approved by ${who} over WhatsApp (batch)${note ? ' — ' + note : ''}`, today, who);
+      }
+      kill();
+    });
+    tx();
+    const skipped = offers.length - picked.length;
+    return res.send(approvalPage(esc(h.name), `<div class="sub">Recorded, thank you — ${picked.length} change${picked.length === 1 ? '' : 's'} approved${skipped ? `, ${skipped} left undecided (Yajna can resend ${skipped === 1 ? 'it' : 'them'})` : ''}. Yajna will now add ${picked.length === 1 ? 'it' : 'them'} to the Item Master.</div><div class="btns"><div class="done">✓ ${picked.length} approved</div></div>`));
+  }
+  if (decision === 'decline') {
+    if (!note) return res.send(approvalPage(esc(h.name), `<div class="sub">A declined batch needs a word on why — go back and add a note.</div>`));
+    const tx = db.transaction(() => {
+      for (const o of offers) {
+        db.prepare("UPDATE margin_offers SET status='declined', approval_hash=NULL WHERE id=?").run(o.id);
+        pushOfferAction(o, 'declined', `Declined by ${who} over WhatsApp (batch) — ${note}`, today, who);
+      }
+      kill();
+    });
+    tx();
+    return res.send(approvalPage(esc(h.name), `<div class="sub">All ${offers.length} declined and recorded. Yajna will see your note.</div><div class="btns"><div class="done" style="background:#F7ECEA;color:#B3402E">Declined</div></div>`));
+  }
+  return res.status(400).send(approvalPage('Nothing chosen', `<div class="sub">Use the Approve or Decline button.</div>`));
+});
+
 /* ---------- inbound webhook from the ThinkAI console ----------
    Same contract the mithra backend uses: HMAC-SHA256 over the RAW body with the
    tenant's webhook secret, header x-thinkai-signature (hex or base64, optional
@@ -1488,6 +1583,54 @@ app.post('/api/offers/:id/request-approval', auth, requireRole('admin'), async (
     url, text, sent,
     waLink: phone ? `https://wa.me/${phone}?text=${encodeURIComponent(text)}` : null
   });
+});
+
+function batchApprovalText(offers, h, url) {
+  const lines = offers.map(o => `• ${o.item_name}${o.pack ? ' (' + o.pack + ')' : ''}: ₹${N(o.old_nr) || '—'} → ₹${N(o.new_nr)} per strip`);
+  return `*Price approvals — ${h.name}*\n\n${h.doctor || 'Doctor'}, Yajna Pharma Solutions requests your approval for ${offers.length} purchase price change${offers.length === 1 ? '' : 's'}:\n\n` +
+    lines.join('\n') + `\n\nReview and approve them here (link works once, for ${APPROVAL_DAYS} days):\n${url}\n\n— Yajna Pharma Solutions`;
+}
+
+/* Send EVERY open (proposed) offer to the doctor as ONE link. Individual links
+   keep working; a batch is just a wider door onto the same decisions. */
+app.post('/api/offers/request-batch-approval', auth, requireRole('admin'), async (req, res) => {
+  const b = req.body || {};
+  const h = scopeCheck(req, S(b.hid, 60));
+  const wanted = Array.isArray(b.offerIds) ? b.offerIds.map(x => S(x, 60)) : null;
+  const today = todayISO();
+  let offers = db.prepare("SELECT * FROM margin_offers WHERE hospital_id=? AND status='proposed'").all(h.id)
+    .filter(o => !applyOfferErr(o, today));
+  if (wanted) offers = offers.filter(o => wanted.includes(o.id));
+  if (!offers.length) return res.status(400).json({ error: 'No open offers to send — record them first' });
+
+  const token = crypto.randomBytes(24).toString('base64url');
+  const now = Date.now();
+  const batch = { id: uid('ab'), hospital_id: h.id, hash: hashToken(token),
+    offer_ids: JSON.stringify(offers.map(o => o.id)), sent_at: now, expires: now + APPROVAL_DAYS * 86400000, created_at: now };
+  db.prepare('INSERT INTO approval_batches(id,hospital_id,hash,offer_ids,sent_at,expires,created_at) VALUES(?,?,?,?,?,?,?)')
+    .run(batch.id, batch.hospital_id, batch.hash, batch.offer_ids, batch.sent_at, batch.expires, batch.created_at);
+  const upd = db.prepare('UPDATE margin_offers SET approval_sent_at=? WHERE id=?');
+  offers.forEach(o => { upd.run(now, o.id); pushOfferAction(o, 'note', `Sent to ${h.doctor || 'the doctor'} in a batch of ${offers.length}`, today, req.user.name); });
+
+  const base = process.env.APP_BASE_URL || 'https://yajna.thinkaisolotions.com';
+  const url = `${base}/approve-batch/${token}`;
+  const text = batchApprovalText(offers, h, url);
+  const phone = (h.doctor_phone || h.phone || '').replace(/\D/g, '');
+  let sent = { ok: false, error: 'No WhatsApp number for the doctor — add it under Edit hospital' };
+  if (phone) {
+    const tpl = process.env.TAI_BATCH_TEMPLATE;
+    if (tpl) sent = await sendWATemplate(phone, tpl, process.env.TAI_TEMPLATE_LANG || 'en_US',
+      [h.doctor || 'Doctor', String(offers.length), h.name, token]);
+    if (!sent.ok) {
+      const s2 = await sendWA(phone, text);
+      if (s2.ok || !process.env.TAI_BATCH_TEMPLATE) sent = s2;
+      else sent = { ok: false, error: `template: ${sent.error}; session: ${s2.error}` };
+    }
+  }
+  const fresh = db.prepare(`SELECT * FROM margin_offers WHERE id IN (${offers.map(() => '?').join(',')})`).all(...offers.map(o => o.id));
+  res.json({ batchId: batch.id, count: offers.length, url, text, sent,
+    offers: fresh.map(o => rowOffer(o, today)),
+    waLink: phone ? `https://wa.me/${phone}?text=${encodeURIComponent(text)}` : null });
 });
 
 const approvalPage = (title, body, buttons) => `<!doctype html><html><head>
