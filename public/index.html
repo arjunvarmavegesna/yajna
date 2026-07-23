@@ -667,17 +667,36 @@ const unmatchedRowStyle = (hid, name)=> findItem(hid, name)? '' : 'style="backgr
    month's audit. Rows are keyed by the RESOLVED item (aliases included) and
    summed first — two lines for the same item must draw on stock together,
    not be checked one at a time, or a cumulative shortfall would be missed.
-   `asOfDate` is the day BEFORE the entry being edited, so re-opening an
-   already-saved day's sales never counts what is already staged against
-   itself. Three mutually exclusive buckets, always summing to reportItems:
+
+   Checks against STOCK IN HAND RIGHT NOW (today's running balance) and
+   NOTHING ELSE — never the entry's own date, never "the day before". Stock
+   is a running total: every transaction keeps its own date for the history,
+   but whether today's upload looks sane is a question about today's balance,
+   not about what the ledger looked like on some particular past date. Asking
+   "as of yesterday" is exactly what broke this once already — an opening
+   count and its sales dated the SAME day both landed after that cutoff, so
+   the check found nothing and reported 43 correctly-stocked items as zero.
+   This is a deliberate, ACCEPTABLE leniency for back-dated entries (Monday's
+   sales entered on Thursday check against a balance that already reflects
+   three days of activity after Monday) — it fails in the safe direction, by
+   letting a questionable row through rather than blocking a valid one. The
+   rigorous, complete answer — did any product go negative on any date — is
+   the audit's job (the Inventory tab's Negative stock figure), re-derived
+   from the whole timeline; this check is a fast, permissive, point-of-entry
+   warning, not a gate.
+
+   Three mutually exclusive buckets, always summing to reportItems:
      clean     — matched, deducts without going negative (the boring majority)
      notFound  — no Item Master match at all — the sale records, but nothing
                  on any real shelf moves, because there is nothing to move
      negative  — matched, but stock would go below zero — a symptom (a missed
-                 purchase or a short opening count), not a stock level */
-function salesStockImpact(hid, rows, asOfDate){
-  const snap = stockAsOf(hid, asOfDate);
-  const stockByKey = {}; snap.items.forEach(i=> stockByKey[i.key] = i.stock);
+                 purchase or a short opening count), not a stock level
+   `noBaseline: true` instead of the three buckets when there is nothing to
+   check against yet (no opening count, nothing on the books at all) — ONE
+   fact stated once, not every row individually flagged as a false alarm. */
+function salesStockImpact(hid, rows){
+  const reportStrips = rows.reduce((a,r)=>a+num(r.qty),0);
+  const cogs = rows.reduce((a,r)=>a+num(r.cost),0);
   const byItem = new Map();
   rows.forEach(r=>{
     const it = findItem(hid, r.item);
@@ -685,6 +704,11 @@ function salesStockImpact(hid, rows, asOfDate){
     if(!byItem.has(bucketKey)) byItem.set(bucketKey, {name:r.item, qty:0, item:it});
     byItem.get(bucketKey).qty += num(r.qty);
   });
+  const snap = stockAsOf(hid, todayISO());
+  if(!snap.items.length){
+    return { noBaseline:true, reportItems:byItem.size, reportStrips, reportCogs:cogs };
+  }
+  const stockByKey = {}; snap.items.forEach(i=> stockByKey[i.key] = i.stock);
   const notFound=[], negative=[], clean=[];
   byItem.forEach(b=>{
     if(!b.item){ notFound.push(b.name); return; }
@@ -692,15 +716,20 @@ function salesStockImpact(hid, rows, asOfDate){
     if(cur - b.qty < -0.0000001){ negative.push({name:b.name, have:cur, selling:b.qty}); return; }
     clean.push(b.name);
   });
-  const cogs = rows.reduce((a,r)=>a+num(r.cost),0);
   return {
+    noBaseline:false,
     stockNowItems: snap.items.length, stockNowValue: snap.valueNr,
-    reportItems: byItem.size, reportStrips: rows.reduce((a,r)=>a+num(r.qty),0), reportCogs: cogs,
+    reportItems: byItem.size, reportStrips, reportCogs: cogs,
     stockAfterValue: snap.valueNr - cogs,
     notFound, negative, clean
   };
 }
 function renderStockImpact(impact){
+  if(impact.noBaseline){
+    return `
+      <div class="subhead" style="margin-top:10px"><h4>What this does to the shelf</h4><div class="rule"></div></div>
+      <p class="mini-note" style="color:var(--amber)">⚠ There's no stock position to check against yet — no opening count on record, or nothing is on the books. This report sells ${impact.reportItems} item${impact.reportItems===1?'':'s'} · ${fmtQ(impact.reportStrips)} strips · ${fmtRs(impact.reportCogs)} at cost; it will still be recorded, but nothing can be checked against inventory until an opening count exists.</p>`;
+  }
   const adjusted = impact.clean.length;
   return `
     <div class="subhead" style="margin-top:10px"><h4>What this does to the shelf</h4><div class="rule"></div></div>
@@ -3295,10 +3324,8 @@ function gpUploadModal(e, locked){
       // rows whose margin disagrees with the Item Master are the whole point of reading per item
       const off = priced.map(r=>({...r, st: lineStatus(state.hospital, {item:r.item, pqty:1, oqty:0, rate:num(r.nr), disc:0, gst:0, mrp:num(r.mrp)})}))
         .filter(r=> r.st.status==='low' || r.st.status==='high');
-      // stock as it stood BEFORE this file — the day before the one being
-      // entered, so re-opening an already-saved day never counts what is
-      // already staged against itself
-      const impact = items.length? salesStockImpact(state.hospital, items, addDays(state.date,-1)) : null;
+      // checks against stock IN HAND RIGHT NOW, never the entry's own date
+      const impact = items.length? salesStockImpact(state.hospital, items) : null;
       $('#gpPrev').innerHTML = `
         <div class="grid2" style="margin-bottom:8px">
           <div class="kpi"><div class="l">Sales (MRP)</div><div class="v num" style="font-size:17px">${fmtRs(parsed.salesMrp)}</div>${parsed.source==='template'? '<div class="d">Σ qty × MRP</div>':''}</div>
@@ -3354,7 +3381,7 @@ function gpUploadModal(e, locked){
     const proceed = ()=>{ closeModal(); state.entryTab = 1; renderEntryTab(e, locked); };
     // confirm the SAME shelf-impact numbers as what actually got staged, one
     // more read before the day itself is saved
-    const impact = rows.length? salesStockImpact(state.hospital, rows, addDays(state.date,-1)) : null;
+    const impact = rows.length? salesStockImpact(state.hospital, rows) : null;
     if(!impact){ proceed(); return; }
     $('#gpPrev').innerHTML = `<p class="mini-note" style="margin-top:0"><b>Staged — this is what will happen to the shelf once the day saves:</b></p>` + renderStockImpact(impact);
     $('.modal-foot').innerHTML = `<span style="flex:1"></span><button class="btn btn-primary" id="gpContinue">Continue to Data Entry</button>`;
