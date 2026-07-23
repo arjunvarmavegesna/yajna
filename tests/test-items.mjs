@@ -66,6 +66,61 @@ let boot = (await adm.req('GET', '/bootstrap')).data;
 ok(boot.items.mithra.length === 2, 'bootstrap carries item master');
 ok(typeof boot.aiEnabled === 'boolean', 'bootstrap reports aiEnabled flag');
 
+console.log('— item master export (round-trips through the SAME template the importer reads) —');
+// a third item with a BLANK pack — exactly the shape of one auto-created without one
+r = await mgr.req('POST', '/items', { hid: 'mithra', name: 'Tab. Blank Pack 20', nr: 15, mrp: 22 });
+ok(r.status === 200 && r.data.item.pack === '', 'seeded an item with no pack, on purpose', r.data.item.pack);
+const blankId = r.data.item.id;
+
+let xr = await fetch(B + '/items/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hid: 'mithra' }) });
+ok(xr.status === 401, 'export needs a session');
+const admCookie = await (async () => { const res = await fetch(B + '/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'bhagavan@yajnapharma.in', password: ADMIN_PW }) }); return res.headers.get('set-cookie').split(';')[0]; })();
+xr = await fetch(B + '/items/export', { method: 'POST', headers: { 'Content-Type': 'application/json', cookie: admCookie }, body: JSON.stringify({ hid: 'mithra' }) });
+const buf = Buffer.from(await xr.arrayBuffer());
+ok(xr.status === 200, 'export returns 200');
+ok(buf.slice(0, 2).toString() === 'PK', 'a real xlsx, not a mislabeled csv', buf.slice(0, 4).toString('hex'));
+ok(/spreadsheetml/.test(xr.headers.get('content-type') || ''), 'served with the right content type', xr.headers.get('content-type'));
+ok(/mithra-item-master-\d{4}-\d{2}-\d{2}\.xlsx/.test(xr.headers.get('content-disposition') || ''), 'filename matches the hid-item-master-date pattern', xr.headers.get('content-disposition'));
+
+const XLSX = (await import(new URL('../node_modules/xlsx/xlsx.mjs', import.meta.url))).default ?? await import(new URL('../node_modules/xlsx/xlsx.mjs', import.meta.url));
+const wb = XLSX.read(buf, { type: 'buffer' });
+ok(wb.SheetNames[0] === 'Item master', 'Sheet 1 is named exactly as the template', wb.SheetNames[0]);
+ok(wb.SheetNames.includes('Details'), 'Sheet 2 is the read-only Details sheet', wb.SheetNames.join(','));
+
+const tplRes = await fetch(B + '/template/items');
+const tplWb = XLSX.read(Buffer.from(await tplRes.arrayBuffer()), { type: 'buffer' });
+const tplHdr = XLSX.utils.sheet_to_json(tplWb.Sheets[tplWb.SheetNames[0]], { header: 1 })[0];
+const expHdr = XLSX.utils.sheet_to_json(wb.Sheets['Item master'], { header: 1 })[0];
+ok(JSON.stringify(tplHdr) === JSON.stringify(expHdr), "Sheet 1 headers are byte-identical to the template's", JSON.stringify(expHdr));
+
+// round trip: feed the export straight back through the real importer endpoint
+const rtFd = new FormData();
+rtFd.append('file', new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'export.xlsx');
+const rtRes = await fetch(B + '/parse/items?hid=mithra', { method: 'POST', headers: { cookie: admCookie }, body: rtFd });
+const rt = await rtRes.json();
+ok(rtRes.status === 200 && rt.source === 'template', 'the export reads back through the SAME importer, no AI needed', JSON.stringify(rt).slice(0, 200));
+const pan = rt.rows.find(x => x.name === 'Tab. Pantoprazole 40');
+ok(!!pan && pan.pack === '10s' && pan.nr === 36 && pan.mrp === 58, 'a known item round-trips name/pack/nr/mrp exactly', JSON.stringify(pan));
+const blankRow = rt.rows.find(x => x.name === 'Tab. Blank Pack 20');
+ok(!!blankRow && blankRow.pack === '', 'the blank-pack item exports and reads back blank, not a guess', JSON.stringify(blankRow));
+
+// fill the gap and re-upload through the ordinary bulk import path — this is
+// the actual fix for an item auto-created without a pack
+r = await mgr.req('POST', '/items/bulk', { hid: 'mithra', items: [{ name: 'Tab. Blank Pack 20', nr: 15, mrp: 22, pack: '10s' }] });
+ok(r.status === 200 && r.data.filled.length === 1 && r.data.filled[0].pack === '10s', 'the filled pack applies to the master on re-import', JSON.stringify(r.data));
+let boot2 = (await adm.req('GET', '/bootstrap')).data;
+ok(boot2.items.mithra.find(i => i.id === blankId).pack === '10s', 'and it sticks in the master', boot2.items.mithra.find(i => i.id === blankId).pack);
+
+// ids filter limits the export to those items, like rcvExport
+xr = await fetch(B + '/items/export', { method: 'POST', headers: { 'Content-Type': 'application/json', cookie: admCookie }, body: JSON.stringify({ hid: 'mithra', ids: [blankId] }) });
+const wb2 = XLSX.read(Buffer.from(await xr.arrayBuffer()), { type: 'buffer' });
+const rows2 = XLSX.utils.sheet_to_json(wb2.Sheets['Item master']);
+ok(rows2.length === 1 && rows2[0]['Product name'] === 'Tab. Blank Pack 20', 'ids filter limits the export to those items', JSON.stringify(rows2));
+
+// scope
+r = await stf.req('POST', '/items/export', { hid: 'siri' });
+ok(r.status === 403, 'a user scoped to a different hospital cannot export it', r.status);
+
 console.log('— invoice margin tally on entry save —');
 // master: Pantoprazole nr36/mrp58 → margin 37.9%. Invoice line at nr48/mrp58 → 17.2% → LOW → alert.
 // Ceftriaxone nr42/mrp66 → 36.4%. Invoice line nr42.5/mrp66 → 35.6% → within 2pp → no alert.

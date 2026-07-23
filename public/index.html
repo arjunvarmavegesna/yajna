@@ -4098,7 +4098,8 @@ function renderItems(){
       <span class="eyebrow">${all.length} items · avg margin ${pct(avgM)}</span>
       <span style="flex:1"></span>
       ${canEdit && pendCount? `<button class="btn btn-sm" id="itmPending" style="border-color:var(--amber);color:var(--amber);font-weight:700">${pendCount} new from purchases</button>`:''}
-      ${canEdit? `<button class="btn btn-sm" id="itmTplTop" title="The item-master sheet — product, pack size, net rate and MRP per single strip">${IC.dl} Template</button>
+      ${canEdit? `<button class="btn btn-sm" id="itmExport">${IC.dl} Export XLSX</button>
+      <button class="btn btn-sm" id="itmTplTop" title="The item-master sheet — product, pack size, net rate and MRP per single strip">${IC.dl} Template</button>
       <button class="btn btn-sm" id="itmImport">${IC.up} Import</button>
       <button class="btn btn-sm btn-primary" id="itmAdd">${IC.plus} Add item</button>`:''}
     </div>
@@ -4127,8 +4128,26 @@ function renderItems(){
   const ia=$('#itmAdd'); if(ia) ia.onclick=()=> itemModal(null);
   const ii=$('#itmImport'); if(ii) ii.onclick=()=> itemImportModal(hid);
   const itt=$('#itmTplTop'); if(itt) itt.onclick=()=> downloadTemplate('items', 'Item Master');
+  const ie=$('#itmExport'); if(ie) ie.onclick=()=> exportItems(hid, list.map(it=>it.id));
   const ipd=$('#itmPending'); if(ipd) ipd.onclick=()=> pendingDrawer(hid);
   $$('[data-iedit]').forEach(b=> b.onclick=()=> itemModal((db.items[hid]||[]).find(x=>x.id===b.dataset.iedit)));
+}
+
+/* mirrors exportRecvXlsx exactly — round-trips through the SAME template
+   headers the Item Master importer reads, so an export can be edited in
+   Excel and fed straight back in */
+async function exportItems(hid, ids){
+  if(state.demo){ toast('Export works in live mode','amber'); return; }
+  try{
+    const res = await fetch('/api/items/export', {method:'POST', credentials:'same-origin',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({hid, ids})});
+    if(!res.ok){ toast('Export failed','red'); return; }
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = `${hid}-item-master-${todayISO()}.xlsx`;
+    document.body.appendChild(a); a.click(); a.remove();
+    toast(`${ids.length} item${ids.length===1?'':'s'} exported to XLSX`,'green');
+  }catch(e){ toast('Export failed','red'); }
 }
 
 /* ---------------- pending items: the gate onto the master ----------------
@@ -4921,6 +4940,15 @@ function itemImportModal(hid){
     </div>
     <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn" id="icsvPrev">Preview</button><button class="btn btn-primary" id="icsvGo" disabled>Import</button></div>`);
   let parsed = [];
+  // a row for an item we already hold is not always a no-op: if it carries a
+  // molecule or pack size the master is missing, the import fills that blank
+  // (never a differing one — that stays whatever the master already says)
+  const fillOf = p=>{
+    if(!p.dup || p.bad) return null;
+    const ex = findItem(hid,p.name) || {};
+    const molFill = !!(p.molecule && !ex.molecule), packFill = !!(p.pack && !ex.pack);
+    return (molFill || packFill)? {molFill, packFill} : null;
+  };
   const doParse = text=>{
     parsed = [];
     text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).forEach(line=>{
@@ -4938,17 +4966,16 @@ function itemImportModal(hid){
   /* the same preview whether the rows came from a pasted CSV or a read template */
   const showPreview = (note)=>{
     const fresh = parsed.filter(p=>!p.dup && !p.bad);
-    // a row for an item we already hold is not always a no-op: if it carries a
-    // molecule the master is missing, the import fills that blank
-    const fills = parsed.filter(p=> p.dup && !p.bad && p.molecule && !(findItem(hid,p.name)||{}).molecule);
+    const fills = parsed.filter(p=> fillOf(p));
     $('#icsvPreview').innerHTML = parsed.length? `
       <div class="tbl-scroll" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:7px"><table class="tbl">
       <thead><tr><th>Product</th><th>Molecule</th><th>Pack</th><th class="r">Net rate/strip</th><th class="r">MRP/strip</th><th class="r">Expected margin</th><th></th></tr></thead>
       <tbody>${parsed.slice(0,200).map(p=>{
-        const fill = p.dup && !p.bad && p.molecule && !(findItem(hid,p.name)||{}).molecule;
-        return `<tr><td>${esc(p.name)}</td><td style="color:var(--muted);font-size:12.5px">${esc(p.molecule||'—')}</td><td class="num" style="color:var(--muted)">${esc(p.pack||'—')}</td><td class="r num">${p.nr}</td><td class="r num">${p.mrp}</td><td class="r num">${pct(marginPct(p.nr,p.mrp))}</td><td>${p.bad?'<span class="chip chip-red">Bad price</span>': fill?'<span class="chip chip-blue">Fills molecule</span>': p.dup?'<span class="chip chip-gray">Duplicate</span>':'<span class="chip chip-green">New</span>'}</td></tr>`;
+        const fill = fillOf(p);
+        const fillLabel = fill? (fill.molFill && fill.packFill? 'Fills molecule + pack' : fill.molFill? 'Fills molecule' : 'Fills pack') : '';
+        return `<tr><td>${esc(p.name)}</td><td style="color:var(--muted);font-size:12.5px">${esc(p.molecule||'—')}</td><td class="num" style="color:var(--muted)">${esc(p.pack||'—')}</td><td class="r num">${p.nr}</td><td class="r num">${p.mrp}</td><td class="r num">${pct(marginPct(p.nr,p.mrp))}</td><td>${p.bad?'<span class="chip chip-red">Bad price</span>': fill?`<span class="chip chip-blue">${fillLabel}</span>`: p.dup?'<span class="chip chip-gray">Duplicate</span>':'<span class="chip chip-green">New</span>'}</td></tr>`;
       }).join('')}</tbody></table></div>
-      <p class="mini-note">${note? esc(note)+' · ':''}${fresh.length} new item${fresh.length===1?'':'s'} will be imported${fills.length? ` · ${fills.length} existing item${fills.length===1?'':'s'} gain a molecule (prices untouched)`:''} · ${parsed.length-fresh.length-fills.length} skipped${parsed.some(p=>p.bad)? ' (a net rate above the MRP is refused — that would sell at a loss)':''}</p>` : '<p class="mini-note">No valid rows found.</p>';
+      <p class="mini-note">${note? esc(note)+' · ':''}${fresh.length} new item${fresh.length===1?'':'s'} will be imported${fills.length? ` · ${fills.length} existing item${fills.length===1?'':'s'} gain a molecule/pack (prices untouched)`:''} · ${parsed.length-fresh.length-fills.length} skipped${parsed.some(p=>p.bad)? ' (a net rate above the MRP is refused — that would sell at a loss)':''}</p>` : '<p class="mini-note">No valid rows found.</p>';
     $('#icsvGo').disabled = fresh.length===0 && fills.length===0;
   };
   const it=$('#itmTpl'); if(it) it.onclick = ()=> downloadTemplate('items', 'Item Master');
@@ -4973,10 +5000,10 @@ function itemImportModal(hid){
   };
   $('#icsvGo').onclick = async ()=>{
     const fresh = parsed.filter(p=>!p.dup && !p.bad);
-    const fills = parsed.filter(p=> p.dup && !p.bad && p.molecule && !(findItem(hid,p.name)||{}).molecule);
+    const fills = parsed.filter(p=> fillOf(p));
     if(state.demo){
       fresh.forEach(p=> db.items[hid].push({id:'i'+Date.now()+Math.random(), name:p.name, key:nameKey(p.name), pack:p.pack, molecule:p.molecule||'', nr:p.nr, mrp:p.mrp, source:'import', updatedAt:Date.now()}));
-      fills.forEach(p=>{ const it=findItem(hid,p.name); if(it) it.molecule = p.molecule; });
+      fills.forEach(p=>{ const it=findItem(hid,p.name); if(!it) return; const f=fillOf(p); if(f.molFill) it.molecule=p.molecule; if(f.packFill) it.pack=p.pack; });
       closeModal(); toast(`${fresh.length} item${fresh.length===1?'':'s'} imported (demo)`,'green'); renderItems(); return;
     }
     const btn=$('#icsvGo'); btn.disabled=true;
@@ -4985,7 +5012,7 @@ function itemImportModal(hid){
       r.created.forEach(it=> db.items[hid].push(it));
       (r.filled||[]).forEach(f=>{ const it=(db.items[hid]||[]).find(x=>x.id===f.id); if(it) Object.assign(it, f); });
       closeModal();
-      toast(`${r.created.length} item${r.created.length===1?'':'s'} imported${(r.filled||[]).length? ` · ${r.filled.length} molecule${r.filled.length===1?'':'s'} filled in`:''}`,'green');
+      toast(`${r.created.length} item${r.created.length===1?'':'s'} imported${(r.filled||[]).length? ` · ${r.filled.length} filled in`:''}`,'green');
       renderItems();
     }catch(err){ btn.disabled=false; toast(err.message,'red'); }
   };

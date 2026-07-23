@@ -2256,26 +2256,67 @@ app.post('/api/items/bulk', auth, requireRole('admin'), (req, res) => {
   const tx = db.transaction(() => {
     const find = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
     const ins = db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,source,updated_at,molecule) VALUES(?,?,?,?,?,?,?,?,?,?)');
-    const setMol = db.prepare('UPDATE items SET molecule=?, updated_at=? WHERE id=?');
+    const fill = db.prepare('UPDATE items SET molecule=?, pack=?, updated_at=? WHERE id=?');
     for (const raw of items.slice(0, 3000)) {
       const name = S(raw.name, 150).trim();
       const nr = N(raw.nr), mrp = N(raw.mrp);
       if (!name || nr <= 0 || mrp <= 0 || nr > mrp) continue;
-      const key = nameKey(name), mol = S(raw.molecule, 150).trim();
+      const key = nameKey(name), mol = S(raw.molecule, 150).trim(), pack = S(raw.pack, 60).trim();
       const ex = find.get(hid, key);
       if (ex) {
         // a re-import does not overwrite prices, but it MAY fill in a molecule
-        // the master is missing — that is how the group comparison gets populated
-        if (mol && !ex.molecule) { setMol.run(mol, now, ex.id); filled.push(rowItem({ ...ex, molecule: mol, updated_at: now })); }
+        // or pack size the master is missing (blank -> value only, a differing
+        // one is never overwritten) — this is how the group comparison gets
+        // populated, and how an item auto-created without a pack gets one
+        const molFill = mol && !ex.molecule, packFill = pack && !ex.pack;
+        if (molFill || packFill) {
+          const newMol = molFill ? mol : ex.molecule, newPack = packFill ? pack : ex.pack;
+          fill.run(newMol, newPack, now, ex.id);
+          filled.push(rowItem({ ...ex, molecule: newMol, pack: newPack, updated_at: now }));
+        }
         continue;
       }
-      const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack: S(raw.pack, 60), nr, mrp, molecule: mol, source: 'import', updated_at: now };
+      const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack, nr, mrp, molecule: mol, source: 'import', updated_at: now };
       ins.run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.source, it.updated_at, it.molecule);
       created.push(rowItem(it));
     }
   });
   tx();
   res.json({ created, filled });
+});
+
+/* XLSX of the item master — its Sheet 1 headers are the SAME ones
+   templateHeaders('items') writes, so an export can be edited in Excel and fed
+   straight back through the Item Master importer. This is also how a blank
+   pack on an item auto-created from an invoice gets fixed: export, fill the
+   gap, re-import (the bulk endpoint above fills a blank pack on re-import). */
+app.post('/api/items/export', auth, (req, res) => {
+  const b = req.body || {};
+  scopeCheck(req, S(b.hid, 60));
+  const ids = Array.isArray(b.ids) ? b.ids.map(x => S(x, 60)) : null;
+  let rows = db.prepare('SELECT * FROM items WHERE hospital_id=?').all(b.hid).map(rowItem);
+  if (ids) rows = rows.filter(r => ids.includes(r.id));
+  rows.sort((a, z) => a.name.localeCompare(z.name));
+  const today = todayISO();
+  const T = TEMPLATES.items;
+  const hdr = templateHeaders('items');
+  const hdrOf = {}; T.cols.forEach((c, i) => { hdrOf[c] = hdr[i]; });
+  const data = rows.map(r => ({
+    [hdrOf.name]: r.name, [hdrOf.mol]: r.molecule || '', [hdrOf.pack]: r.pack || '',
+    [hdrOf.nr]: r.nr, [hdrOf.mrp]: r.mrp
+  }));
+  const details = rows.map(r => ({
+    'Product name': r.name, 'Opening qty': r.openingQty || 0,
+    'Preferred vendor': r.preferredVendor || '', Source: r.source || '',
+    'Last updated': r.updatedAt ? msToISO(r.updatedAt) : ''
+  }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(data.length ? data : [{ Note: 'No items on the master yet' }]), T.sheet);
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(details.length ? details : [{ Note: 'No items on the master yet' }]), 'Details');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${b.hid}-item-master-${today}.xlsx"`);
+  res.send(buf);
 });
 
 /* ---------- receivables ---------- */
@@ -2794,9 +2835,16 @@ const TEMPLATES = {
 };
 
 const STRIPS_HELPER_HDR = '» Strips used (auto — do not fill)';
+/* the header row a template writes for its columns, in cols order — shared
+   with the export routes so an exported sheet's headers can never drift from
+   what the uploader actually matches against */
+function templateHeaders(kind) {
+  const T = TEMPLATES[kind];
+  return T.cols.map(c => (T.hdrs && T.hdrs[c]) || COL[c].hdr);
+}
 function buildTemplate(kind) {
   const T = TEMPLATES[kind];
-  let hdr = T.cols.map(c => (T.hdrs && T.hdrs[c]) || COL[c].hdr);
+  let hdr = templateHeaders(kind);
   let widthKeys = [...T.cols];
   if (T.helperAfter) {
     /* a read-only "what the app will count" column, inserted after the tablets
