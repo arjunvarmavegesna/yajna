@@ -5698,23 +5698,9 @@ function invAsOfView(hid, canEdit){
   const rMain = (val, pack)=>{ const u = packUnits(pack); return QV==='tablets' && u? (val/u).toFixed(3) : r2(val); };
   const qtyTitle = QV==='strips'? 'Strips' : QV==='tablets'? 'Tablets (strips × pack); items with no strip size stay in units' : 'Strips — the grey line under each figure is the tablet equivalent';
   const q = nameKey(state.invQuery||'');
-  /* Unit-suspect (read-only, never auto-corrected): an item probably entered in
-     TABLETS looks like this — its Sold or Opening divides cleanly by its pack
-     size, AND its stock value dwarfs its peers by roughly that factor. Either
-     signal alone is everywhere (round numbers are normal); together they mark
-     the rows worth a human look. */
-  {
-    const vals = s.items.filter(i=> i.stock>0 && i.valueNr>0).map(i=> i.valueNr).sort((a,b)=>a-b);
-    const median = vals.length? vals[Math.floor(vals.length/2)] : 0;
-    s.items.forEach(i=>{
-      const u = packUnits(i.pack);
-      const clean = v=> u>=10 && v >= u && Math.abs(v/u - Math.round(v/u)) < 1e-9;
-      i.unitSuspect = !!u && (clean(i.sold) || clean(i.opening)) && median>0 && i.valueNr > 4*median;
-    });
-  }
   let list = s.items;
   if(q) list = list.filter(i=> i.key.includes(q));
-  const KNOWN_INV_FILTERS = ['all','neg','out','moving','adj','expiring','suspect'];
+  const KNOWN_INV_FILTERS = ['all','neg','out','moving','adj','expiring'];
   if(!KNOWN_INV_FILTERS.includes(state.invFilter)) state.invFilter = 'all';
   const f = state.invFilter||'all';
   if(f==='neg') list = list.filter(i=> i.stock < 0);
@@ -5722,7 +5708,6 @@ function invAsOfView(hid, canEdit){
   else if(f==='moving') list = list.filter(i=> i.purchased || i.sold || i.rtv);
   else if(f==='adj') list = list.filter(i=> i.adj);
   else if(f==='expiring') list = list.filter(i=> i.batches.some(b=> b.qty>0 && ['expired','b30','b90'].includes(expiryBucketOf(b, v.asOf))));
-  else if(f==='suspect') list = list.filter(i=> i.unitSuspect);
 
 
 
@@ -5758,7 +5743,7 @@ function invAsOfView(hid, canEdit){
     <div class="section-title"><h2>Items</h2><span>${tb? issueMethodLabel(hid)+' · click a row for its batches — the batch rows are where the real numbers live' : 'expiry not tracked · click a row for its purchase lots — each lot holds the net rate frozen from its own invoice line'}</span></div>
     <div class="entry-bar">
       <input class="in" id="invSearch" placeholder="Search items…" value="${esc(state.invQuery||'')}" style="width:220px">
-      <div class="seg">${[['all','All'],['moving','Moving'],['out','Out of stock'],['neg','Negative'],['adj','Adjusted'],...(tb?[['expiring','Expiring (0–90)']]:[]),['suspect','Unit-suspect']].map(([k,t])=>
+      <div class="seg">${[['all','All'],['moving','Moving'],['out','Out of stock'],['neg','Negative'],['adj','Adjusted'],...(tb?[['expiring','Expiring (0–90)']]:[])].map(([k,t])=>
         `<button class="${f===k?'active':''}" data-invf="${k}">${t}</button>`).join('')}</div>
       <span style="flex:1"></span>
       <div class="seg" title="How quantities read — the ledger stores strips either way">${[['strips','Strips'],['tablets','Tablets'],['both','Both']].map(([k,t])=>`<button class="${QV===k?'active':''}" data-invqv="${k}">${t}</button>`).join('')}</div>
@@ -5776,7 +5761,7 @@ function invAsOfView(hid, canEdit){
         const open = state.invOpen===i.key;
         const nx = i.nearestExp? (monthEndOf(i.nearestExp) < v.asOf? 'var(--red)' : 'var(--ink)') : 'var(--faint)';
         return `<tr>
-          <td><b>${esc(i.name)}</b>${i.onMaster?'':' <span class="chip chip-gray" style="font-size:10px" title="Seen in sales/purchases but not on the Item Master">off master</span>'}${i.negMargin?' <span class="chip chip-red" style="font-size:10px">below cost</span>':''}${i.unitSuspect?` <span class="chip chip-amber" style="font-size:10px" title="Sold or Opening divides cleanly by the pack (${esc(i.pack)}) AND the value dwarfs peers — this may have been entered in tablets. Review the source day; nothing is auto-corrected.">units?</span>`:''}</td>
+          <td><b>${esc(i.name)}</b>${i.onMaster?'':' <span class="chip chip-gray" style="font-size:10px" title="Seen in sales/purchases but not on the Item Master">off master</span>'}${i.negMargin?' <span class="chip chip-red" style="font-size:10px">below cost</span>':''}</td>
           <td style="color:var(--muted);font-weight:600" ${QV==='tablets' && !packUnits(i.pack)? 'title="No strip size — counted in units, 1 unit = 1 strip; never divided"':''}>${esc(i.pack||'—')}${QV==='tablets' && !packUnits(i.pack)? ' <span class="chip chip-gray" style="font-size:10px">not in strips</span>':''}</td>
           <td class="r num">${i.nrStrip? rMain(i.nrStrip, i.pack):'—'}${i.mixedRate? ' <span style="color:var(--faint);font-size:10px" title="Lots of this item cost different amounts — this is the weighted average">avg</span>':''}</td>
           <td class="r num" style="color:var(--muted)">${i.mrpStrip? rMain(i.mrpStrip, i.pack):'—'}</td>

@@ -184,29 +184,28 @@ ok(!doc.querySelector('#adjTabs'), 'a vial item gets NO converter — nothing to
 ok(/no strip size/i.test(doc.querySelector('.modal-body').textContent), 'and says so instead of guessing');
 w.eval(`closeModal()`); await tick(150);
 
-console.log('— unit-suspect: flagged for review, never corrected —');
+console.log('— the unit-suspect heuristic is GONE: expensive is not a unit error —');
 w.eval(`
   const T = todayISO();
-  // peer items so a median exists; the suspect sold 150 (clean ×10) and dwarfs them
+  // the exact false positive that killed the heuristic: an EXPENSIVE item held
+  // in a clean round number of strips — NALTRAX 50TAB, 20 strips of a 10'S pack
+  // at Rs.759/strip. Correct data; the old value>4×median leg flagged it anyway.
   db.items.viraj = [
-    {id:'s1', name:'Tab. Suspect', key:nameKey('Tab. Suspect'), pack:'10s', nr:100, mrp:150, openingQty:200, source:'demo', updatedAt:Date.now()},
+    {id:'s1', name:'NALTRAX 50TAB', key:nameKey('NALTRAX 50TAB'), pack:"10'S", nr:759, mrp:1080, openingQty:20, source:'demo', updatedAt:Date.now()},
     {id:'p1', name:'Tab. Peer A', key:nameKey('Tab. Peer A'), pack:'10s', nr:10, mrp:20, openingQty:7, source:'demo', updatedAt:Date.now()},
     {id:'p2', name:'Tab. Peer B', key:nameKey('Tab. Peer B'), pack:'10s', nr:10, mrp:20, openingQty:9, source:'demo', updatedAt:Date.now()},
     {id:'p3', name:'Tab. Peer C', key:nameKey('Tab. Peer C'), pack:'10s', nr:10, mrp:20, openingQty:11, source:'demo', updatedAt:Date.now()}];
   db.adjustments.viraj = []; db.snapshots.viraj = []; db.dailyData.viraj = {};
-  db.dailyData.viraj[T] = { savedAt:Date.now(), purchases:[], rtv:[], invoices:[],
-    sales:{mrp:0,cogs:0,cash:0,credit:0,cancels:0}, cash:{opening:0,receipts:0,payments:0,actual:'',reason:''},
-    itemSales:[{item:'Tab. Suspect', qty:150, amount:22500, nr:100, mrp:150, pack:'10s'}],
-    audit:{opening:0,actual:'',unbilled:false,bounces:[]}, hv:[] };
   invState().mode='asof'; renderInventory();
 `); await tick(400);
-ok(!!doc.querySelector('[data-invf="suspect"]'), 'the Inventory filters include Unit-suspect');
-ok(/units\?/.test(doc.querySelector('#invBody').textContent), 'the row wears a "units?" flag', 'flag present');
-doc.querySelector('[data-invf="suspect"]').click(); await tick(300);
-const srows = [...doc.querySelectorAll('#invBody tbody tr')].filter(tr=> tr.querySelector('td b'));
-ok(srows.length === 1 && /Suspect/.test(srows[0].textContent), 'the filter shows exactly the suspect row', srows.length);
-ok(w.eval(`stockAsOf('viraj', todayISO()).items.find(m=>m.key===nameKey('Tab. Suspect')).sold`) === 150, 'and the DATA is untouched — surfaced, never auto-corrected');
-w.eval(`state.invFilter='all'`);
+ok(!/units\?/.test(doc.querySelector('#invBody').textContent), 'no "units?" chip anywhere — the costly round-number row is not accused', 'clean');
+ok(!doc.querySelector('[data-invf="suspect"]'), 'the Unit-suspect filter chip is gone from the bar');
+ok(/NALTRAX/.test(doc.querySelector('#invBody').textContent), 'and the item renders normally');
+ok(/off master|below cost|All/.test(doc.querySelector('#content').textContent), 'the remaining chips and filters are untouched');
+// a session left on the removed filter must not render an empty table
+w.eval(`state.invFilter='suspect'; renderInventory()`); await tick(300);
+ok(w.eval('state.invFilter') === 'all', 'a stale "suspect" filter falls back to All');
+ok([...doc.querySelectorAll('#invBody tbody tr td b')].length >= 1, 'and rows still render', [...doc.querySelectorAll('#invBody tbody tr td b')].length);
 
 console.log('— quantity cells audit their strip basis on hover —');
 const stockCell = [...doc.querySelectorAll('#invBody td[title*="strips"]')];
