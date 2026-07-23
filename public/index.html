@@ -6100,7 +6100,8 @@ function openingStockModal(hid){
       <div class="lock-note" style="margin-bottom:12px">
         <div><b>Counts are in STRIPS, rates are per single strip.</b> A 10s and a 15s are both just "1 strip" — the pack size is recorded so inventory knows what a unit is, and the stock is valued at the net rate of one strip. Everything after this date — invoices in, sales out, RTV — adjusts it automatically.</div>
         <button class="btn btn-sm" id="osTpl" style="margin-left:auto;flex:none">${IC.dl} Download template</button></div>
-      <div class="field"><label>Stock counted as on</label><input class="in" type="date" id="osDate" value="${esc(h.stockDate || h.startDate || todayISO())}" max="${todayISO()}"></div>
+      <div class="field"><label>Stock counted as on</label><input class="in" type="date" id="osDate" value="${todayISO()}" max="${todayISO()}">
+        <p class="ivnote">Everything entered on or after this date is applied on top of this count. Set it to the day the shelf was physically counted — not today's upload.</p></div>
       ${state.demo? '' : `<div class="field"><label>Filled template, or any stock report (Excel / CSV / PDF / photo)</label><input class="in" type="file" id="osFile" accept=".xls,.xlsx,.csv,.pdf,image/*">
         <p class="ivnote">The template is read straight from its columns. Anything else${state.aiEnabled? ' goes through the AI reader':' needs the template — the AI reader is not configured'}.</p></div>`}
       <div class="field"><label>Or paste rows — <span class="num" style="font-size:12px">Product name, Opening strips, Net rate/strip, MRP/strip, Pack size</span></label>
@@ -6125,6 +6126,7 @@ function openingStockModal(hid){
     const valNr = rows.reduce((a,r)=> a + num(r.qty)*(num(r.nr) || num((findItem(hid,r.name)||{}).nr)), 0);
     const valMrp = rows.reduce((a,r)=> a + num(r.qty)*(num(r.mrp) || num((findItem(hid,r.name)||{}).mrp)), 0);
     $('#osPrev').innerHTML = rows.length? `
+      <p class="mini-note" style="margin-top:0">Counting as on <b>${fmtDateShort($('#osDate').value||todayISO())}</b> — check this before saving; it decides what movements land on top of this count.</p>
       <div class="grid2" style="margin:8px 0">
         <div class="kpi"><div class="l">Stock value (at net rate)</div><div class="v num" style="font-size:17px">${fmtRs(valNr)}</div><div class="d">Σ strips × net rate</div></div>
         <div class="kpi"><div class="l">Value at MRP</div><div class="v num" style="font-size:17px">${fmtRs(valMrp)}</div><div class="d">potential margin ${pct(valMrp>0? (valMrp-valNr)/valMrp*100 : 0)}</div></div>
@@ -6163,10 +6165,26 @@ function openingStockModal(hid){
     // pasted rows follow OUR column order — that is the template contract, strips
     parseText($('#osPaste').value);
   };
+  // changing the date after a preview is already up re-reads it, in case the
+  // user reads a file, then goes back and corrects the date before saving
+  $('#osDate').onchange = ()=>{ if(parsed) preview(rawRows, lastNote); };
+
   $('#osGo').onclick = async ()=>{
     if(!parsed || !parsed.length) return;
-    const stockDate = $('#osDate').value || todayISO();
+    const stockDate = $('#osDate').value;
+    if(!stockDate){ toast('Pick the date this stock was counted','red'); return; }
     const btn=$('#osGo'); btn.disabled=true;
+    if(!state.demo && stockDate < todayISO()){
+      // a past count date is about to have real activity applied on top of it —
+      // make sure that is actually what happened, not just what the box says
+      try{
+        const chk = await api(`/items/opening/movements-after?hid=${encodeURIComponent(hid)}&date=${encodeURIComponent(stockDate)}`);
+        if(chk.count > 0){
+          const go = confirm(`${chk.count} day${chk.count===1?'':'s'} of movements already exist on or after ${fmtDateShort(stockDate)}. They will be applied on top of this count.\n\nConfirm this count was taken on ${fmtDateShort(stockDate)}, before that activity.`);
+          if(!go){ btn.disabled=false; return; }
+        }
+      }catch(err){ btn.disabled=false; toast(err.message,'red'); return; }
+    }
     if(state.demo){
       db.hospitals[hid].stockDate = stockDate;
       parsed.forEach(r=>{

@@ -2184,13 +2184,34 @@ app.get('/api/items/:id/history', auth, (req, res) => {
   res.json({ history: rows });
 });
 
+/* Before saving an opening count with a date that isn't today, the modal asks
+   this: is there already daily activity on/after that date? If so the count is
+   about to have real purchases/sales/RTV layered on top of it, and the user
+   needs to actively confirm the count really was taken before that activity —
+   not just accept whatever date happened to be in the box. */
+app.get('/api/items/opening/movements-after', auth, requireRole('admin'), (req, res) => {
+  const hid = S(req.query.hid, 60);
+  scopeCheck(req, hid);
+  const date = S(req.query.date, 12);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'A valid date is required' });
+  const count = db.prepare('SELECT COUNT(*) c FROM entries WHERE hospital_id=? AND date>=?').get(hid, date).c;
+  res.json({ count });
+});
+
 /* opening stock: the one-time count taken when the pharmacy starts with us.
    Upserts the master (name/pack/nr/mrp) and sets each item's opening quantity. */
 app.post('/api/items/opening', auth, requireRole('admin'), (req, res) => {
   const { hid, stockDate, rows } = req.body || {};
   const h = scopeCheck(req, S(hid, 60));
   if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows must be an array' });
-  const sd = /^\d{4}-\d{2}-\d{2}$/.test(S(stockDate)) ? stockDate : (h.stock_date || h.start_date);
+  /* The count date decides which movements land on top of it — a wrong date
+     double-counts or drops real activity. The client always sends one; a
+     silent fallback to the hospital's start date is exactly how Viraj Gastro
+     got anchored to 15 Jul when the count was actually taken later. Refuse
+     rather than guess. */
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(S(stockDate)))
+    return res.status(400).json({ error: 'Stock count date is required — pick the day the shelf was physically counted' });
+  const sd = stockDate;
   if (sd > todayISO()) return res.status(400).json({ error: 'Stock count date cannot be in the future' });
   const now = Date.now();
   const created = [], updated = [];
