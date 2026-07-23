@@ -60,16 +60,50 @@ ok(Math.abs(stock - 8.5) < 0.001, 'stock = 10 opening − 1.5 strips sold = 8.5 
 const soldRow = w.eval(`stockAsOf('viraj', todayISO()).items.find(m=>m.key===nameKey('Tab. Unit Test')).sold`);
 ok(Math.abs(soldRow - 1.5) < 0.001, 'and the Sold column reads 1.5 strips', soldRow);
 
-console.log('— the Inventory table shows tablets without doubling the columns —');
-w.eval(`openHospital('viraj','inventory'); invState().mode='asof'; invState().qtyView='both'; renderInventory();`); await tick(400);
-ok([...doc.querySelectorAll('[data-invqv]')].map(b=>b.dataset.invqv).join() === 'strips,tablets,both', 'a Strips / Tablets / Both view seg', [...doc.querySelectorAll('[data-invqv]')].length);
-// stock is 8.5 strips of a 10s from the earlier world → 85 tabs on the subline
-ok(/85 tabs/.test(doc.querySelector('#invBody').textContent), 'Both: the grey subline carries the tablet equivalent (8.5 strips → 85 tabs)');
+console.log('— the Inventory toggle governs the WHOLE table: headers, quantities, rates —');
+// a deterministic row for the spec's own numbers: 2,716 strips of a 10s at ₹76.94
+w.eval(`
+  db.items.viraj = [
+    {id:'qv1', name:'Tab. Invariant 10', key:nameKey('Tab. Invariant 10'), pack:'10s', nr:76.94, mrp:120, openingQty:2716, source:'demo', updatedAt:Date.now()},
+    {id:'qv2', name:'Inj. Vial Only', key:nameKey('Inj. Vial Only'), pack:'vial', nr:50, mrp:80, openingQty:7, source:'demo', updatedAt:Date.now()}];
+  db.hospitals.viraj.stockDate = addDays(todayISO(),-1);
+  db.adjustments.viraj=[]; db.dailyData.viraj={}; db.aliases.viraj=[]; db.snapshots.viraj=[];
+  setQtyView('viraj','both');
+  openHospital('viraj','inventory'); invState().mode='asof'; renderInventory();`); await tick(400);
+const body = () => doc.querySelector('#invBody');
+const hdrTxt = () => [...body().querySelectorAll('thead th')].map(t=>t.textContent).join('|');
+const cellFor = (name, ix) => { const tr = [...body().querySelectorAll('tbody tr')].find(t=>t.textContent.includes(name)); return [...tr.querySelectorAll('td')][ix].textContent.trim(); };
+ok([...doc.querySelectorAll('[data-invqv]')].map(b=>b.dataset.invqv).join() === 'strips,tablets,both', 'a Strips / Tablets / Both view seg');
+ok(/27,160 tabs/.test(body().textContent), 'Both: the grey subline carries the tablet equivalent (2,716 strips → 27,160 tabs)');
+const valueBoth = cellFor('Invariant', 10), mrpValBoth = cellFor('Invariant', 11), potBoth = cellFor('Invariant', 13);
 doc.querySelector('[data-invqv="strips"]').click(); await tick(300);
-ok(!/tabs/.test(doc.querySelector('#invBody').textContent), 'Strips: the sublines disappear');
+ok(!/tabs/.test(body().textContent), 'Strips: the sublines disappear');
+ok(/Opening \/ strip/.test(hdrTxt()) && /Net rate \/ strip ₹/.test(hdrTxt()), 'headers read / strip in strips mode');
+ok(/^76\.94/.test(cellFor('Invariant', 2)), 'rate reads ₹76.94 per strip', cellFor('Invariant', 2));
+const valueStrips = cellFor('Invariant', 10), potStrips = cellFor('Invariant', 13);
 doc.querySelector('[data-invqv="tablets"]').click(); await tick(300);
-ok(/8\.5 strips/.test(doc.querySelector('#invBody').textContent), 'Tablets: tabs lead and strips move to the subline — the ledger number is never hidden');
-w.eval(`invState().qtyView='both'`);
+ok(/Opening \/ tablet/.test(hdrTxt()) && /In stock \/ tablet/.test(hdrTxt()), 'headers flip to / tablet');
+ok(/Net rate \/ tablet ₹/.test(hdrTxt()) && /MRP \/ tablet ₹/.test(hdrTxt()), 'INCLUDING the rate headers');
+ok(/27,160/.test(cellFor('Invariant', 9)), 'tablets mode: 2,716 strips shows as 27,160', cellFor('Invariant', 9));
+ok(cellFor('Invariant', 2) === '7.694', 'and ₹76.94/strip renders ₹7.694/tablet — three decimals so the value reconciles', cellFor('Invariant', 2));
+const valueTabs = cellFor('Invariant', 10), mrpValTabs = cellFor('Invariant', 11), potTabs = cellFor('Invariant', 13);
+ok(valueTabs === valueStrips && valueTabs === valueBoth, 'Value (NR) is byte-identical in all three modes — (strips×pack)×(rate÷pack) ≡ strips×rate', `${valueStrips} / ${valueTabs}`);
+ok(mrpValTabs === mrpValBoth, 'MRP value identical too');
+ok(potTabs === potStrips && potTabs === potBoth, 'Pot. margin % identical in every mode — it is a ratio', potTabs);
+// qty × rate reconciles to the value column in tablets mode: 27,160 × 7.694 ≈ 2,716 × 76.94
+ok(Math.abs(27160*7.694 - 2716*76.94) < 0.01, 'qty × rate reconciles in both modes');
+// the vial: same number everywhere, marked, never divided
+ok(/not in strips/.test(body().textContent), 'a vial row is MARKED in tablets mode');
+ok(cellFor('Vial Only', 9) === '7', 'and its count is unchanged — never multiplied', cellFor('Vial Only', 9));
+ok(/^50\.00/.test(cellFor('Vial Only', 2)), 'nor its rate divided', cellFor('Vial Only', 2));
+// display-only: the ledger is untouched by toggling
+const led1 = w.eval(`stockAsOf('viraj', todayISO()).valueNr`);
+doc.querySelector('[data-invqv="strips"]').click(); await tick(250);
+doc.querySelector('[data-invqv="tablets"]').click(); await tick(250);
+ok(w.eval(`stockAsOf('viraj', todayISO()).valueNr`) === led1, 'toggling writes NOTHING — the stored ledger value never moves', led1);
+ok(w.eval(`localStorage.getItem('yps_qtyview:viraj')`) === 'tablets', 'the choice persists per hospital');
+ok(w.eval(`qtyViewOf('siri')`) === 'both', 'without leaking to another hospital');
+w.eval(`setQtyView('viraj','both')`);
 
 console.log('— the default follows the FILE SHAPE, remembered per hospital —');
 ok(w.eval(`fileUnits('viraj','template')`) === 'strips', 'our template asks for strips, so template files default to strips');

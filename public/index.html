@@ -3456,17 +3456,23 @@ function generateReport(){
     if(state.demo){ toast('Sending to the doctor works in live mode','amber'); return; }
     const phone = (h.doctorPhone||h.phone||'').replace(/\D/g,'');
     if(!phone){ toast("No WhatsApp number for the doctor — add it under Edit hospital",'red'); return; }
-    const btn=$('#waDocBtn'); btn.disabled=true;
+    const btn=$('#waDocBtn'); btn.disabled=true; const was=btn.innerHTML; btn.textContent='Building PDF…';
     try{
-      const r = await api('/wa/report',{method:'POST', body:{hid, text:state.lastSummary}});
-      if(r.sent && r.sent.ok){ toast(`Report sent to ${h.doctor||'the doctor'} on WhatsApp (${r.to})`,'green'); }
+      /* the doctor receives the SAME report the screen shows: the rendered
+         markup goes up, the server prints it to PDF and sends the document */
+      const doc = document.querySelector('#rpOut .report-doc');
+      const label = `${type} report ${type==='monthly'? monthLabel(state.reportMonth) : fmtDate(state.reportDate)}`;
+      const r = await api('/wa/report',{method:'POST', body:{hid, text:state.lastSummary, html: doc? doc.outerHTML : '', label}});
+      if(r.sent && r.sent.ok && r.sent.via==='document'){ toast(`PDF report sent to ${h.doctor||'the doctor'} on WhatsApp (${r.to})`,'green'); }
+      else if(r.sent && r.sent.queued){ toast(r.note || 'The PDF is queued — it delivers when the doctor replies on WhatsApp','amber'); }
+      else if(r.sent && r.sent.ok){ toast(`Report summary sent to ${h.doctor||'the doctor'} on WhatsApp (${r.to})`,'green'); }
       else{
         toast((r.sent && r.sent.error) || 'Direct send unavailable — opening your WhatsApp instead','amber');
         const w = window.open(r.waLink,'_blank');
         if(!w){ navigator.clipboard && navigator.clipboard.writeText(state.lastSummary); toast('Pop-up blocked — summary copied instead','amber'); }
       }
     }catch(err){ toast(err.message,'red'); }
-    btn.disabled=false;
+    btn.disabled=false; btn.innerHTML=was;
   };
   $('#waBtn').onclick = ()=>{
     const url = 'https://wa.me/?text=' + encodeURIComponent(state.lastSummary);
@@ -5409,6 +5415,10 @@ const INV_QUICK = [
   ['lastmonth','End of last month', ()=> addDays(monthKey(todayISO())+'-01',-1)],
   ['samedaylm','Same day last month', ()=> { const d=new Date(todayISO()+'T12:00:00'); d.setMonth(d.getMonth()-1); return iso(d); }]
 ];
+/* the Strips/Tablets/Both choice, remembered PER HOSPITAL — a preference of the
+   browser, like the collapsed menu; toggling never writes to the ledger */
+function qtyViewOf(hid){ try{ const v = localStorage.getItem('yps_qtyview:'+hid); return ['strips','tablets','both'].includes(v)? v : 'both'; }catch(e){ return 'both'; } }
+function setQtyView(hid, v){ try{ localStorage.setItem('yps_qtyview:'+hid, v); }catch(e){} }
 function invState(){
   if(!state.inv) state.inv = {mode:'asof', asOf:todayISO(), start:monthKey(todayISO())+'-01', end:todayISO(), interval:'daily'};
   return state.inv;
@@ -5641,15 +5651,25 @@ function invAsOfView(hid, canEdit){
   const h = db.hospitals[hid]||{};
   const tb = hasExpiryOn(hid, v.asOf);
   const eb = expiryBuckets(hid, v.asOf);
-  const QV = v.qtyView || 'both';
-  /* tablets are a DISPLAY of strips × pack — never a second stored number.
-     main figure + grey subline, so six columns do not become twelve. */
+  /* THE INVARIANT the whole toggle rests on: switching modes changes ONLY the
+     quantities and the per-unit rates, in opposite directions —
+         tablets = strips × pack        rate/tablet = rate/strip ÷ pack
+     so (strips × pack) × (rate ÷ pack) === strips × rate, and therefore
+     Value (NR), MRP value, Pot. margin ₹ and Pot. margin % are IDENTICAL in
+     every mode. The ledger stores strips; this is a display transform only,
+     and it never writes. */
+  const QV = qtyViewOf(hid);
+  const UW = QV==='tablets'? 'tablet' : 'strip';
   const qMain = (val, pack)=>{ const u = packUnits(pack); return QV==='tablets' && u? fmtQ(val*u) : fmtQ(val); };
   const qSub = (val, pack)=>{
     const u = packUnits(pack);
     if(!u || QV==='strips') return '';
     return `<div class="num" style="font-size:10.5px;color:var(--faint);font-weight:400">${QV==='tablets'? fmtQ(val)+' strips' : fmtQ(val*u)+' tabs'}</div>`;
   };
+  // per-unit rates move the OPPOSITE way to quantities; tablets need a third
+  // decimal (₹76.94/strip = ₹7.694/tablet) or the Value column stops reconciling
+  const rMain = (val, pack)=>{ const u = packUnits(pack); return QV==='tablets' && u? (val/u).toFixed(3) : r2(val); };
+  const qtyTitle = QV==='strips'? 'Strips' : QV==='tablets'? 'Tablets (strips × pack); items with no strip size stay in units' : 'Strips — the grey line under each figure is the tablet equivalent';
   const q = nameKey(state.invQuery||'');
   /* Unit-suspect (read-only, never auto-corrected): an item probably entered in
      TABLETS looks like this — its Sold or Opening divides cleanly by its pack
@@ -5719,10 +5739,10 @@ function invAsOfView(hid, canEdit){
     </div>
     <div class="card"><div class="tbl-scroll"><table class="tbl">
       <thead><tr><th>Product name</th><th>Pack size</th>
-        <th class="r" title="Cost of ONE strip, inclusive of GST. Where lots differ this is the weighted average of the lots holding stock — open the row for the true per-lot rates.">Net rate / strip ₹</th>
-        <th class="r" title="Printed MRP of ONE strip, weighted the same way">MRP / strip ₹</th>
-        <th class="r" title="Strips">Opening / strip</th><th class="r" title="Strips">Purchased / strip</th><th class="r" title="Strips">Sold / strip</th><th class="r" title="Strips">RTV / strip</th><th class="r" title="Strips">Adjusted / strip</th>
-        <th class="r" title="Strips on hand">In stock / strip</th><th class="r" title="Strips × net rate of one strip">Value (NR)</th><th class="r" title="Strips × MRP of one strip">MRP value</th><th class="r">Pot. margin ₹</th><th class="r">Pot. margin %</th>
+        <th class="r" title="Cost of ONE ${UW}, inclusive of GST${QV==='tablets'? ' — the strip rate ÷ pack':''}. Where lots differ this is the weighted average of the lots holding stock — open the row for the true per-lot rates.">Net rate / ${UW} ₹</th>
+        <th class="r" title="Printed MRP of ONE ${UW}${QV==='tablets'? ' — the strip MRP ÷ pack':''}, weighted the same way">MRP / ${UW} ₹</th>
+        <th class="r" title="${qtyTitle}">Opening / ${UW}</th><th class="r" title="${qtyTitle}">Purchased / ${UW}</th><th class="r" title="${qtyTitle}">Sold / ${UW}</th><th class="r" title="${qtyTitle}">RTV / ${UW}</th><th class="r" title="${qtyTitle}">Adjusted / ${UW}</th>
+        <th class="r" title="${qtyTitle} on hand">In stock / ${UW}</th><th class="r" title="Strips × net rate of one strip — IDENTICAL in every view mode">Value (NR)</th><th class="r" title="Strips × MRP of one strip — identical in every view mode">MRP value</th><th class="r">Pot. margin ₹</th><th class="r">Pot. margin %</th>
         ${tb? '<th>Nearest expiry</th>':''}<th class="r" title="One lot per purchase line — each carries its own frozen net rate">Lots</th><th>Last move</th><th></th></tr></thead>
       <tbody>${list.slice(0,400).map(i=>{
         const col = i.stock<0? 'var(--red)' : i.stock===0? 'var(--amber)' : 'var(--ink)';
@@ -5730,9 +5750,9 @@ function invAsOfView(hid, canEdit){
         const nx = i.nearestExp? (monthEndOf(i.nearestExp) < v.asOf? 'var(--red)' : 'var(--ink)') : 'var(--faint)';
         return `<tr>
           <td><b>${esc(i.name)}</b>${i.onMaster?'':' <span class="chip chip-gray" style="font-size:10px" title="Seen in sales/purchases but not on the Item Master">off master</span>'}${i.negMargin?' <span class="chip chip-red" style="font-size:10px">below cost</span>':''}${i.unitSuspect?` <span class="chip chip-amber" style="font-size:10px" title="Sold or Opening divides cleanly by the pack (${esc(i.pack)}) AND the value dwarfs peers — this may have been entered in tablets. Review the source day; nothing is auto-corrected.">units?</span>`:''}</td>
-          <td style="color:var(--muted);font-weight:600">${esc(i.pack||'—')}</td>
-          <td class="r num">${i.nrStrip? r2(i.nrStrip):'—'}${i.mixedRate? ' <span style="color:var(--faint);font-size:10px" title="Lots of this item cost different amounts — this is the weighted average">avg</span>':''}</td>
-          <td class="r num" style="color:var(--muted)">${i.mrpStrip? r2(i.mrpStrip):'—'}</td>
+          <td style="color:var(--muted);font-weight:600" ${QV==='tablets' && !packUnits(i.pack)? 'title="No strip size — counted in units, 1 unit = 1 strip; never divided"':''}>${esc(i.pack||'—')}${QV==='tablets' && !packUnits(i.pack)? ' <span class="chip chip-gray" style="font-size:10px">not in strips</span>':''}</td>
+          <td class="r num">${i.nrStrip? rMain(i.nrStrip, i.pack):'—'}${i.mixedRate? ' <span style="color:var(--faint);font-size:10px" title="Lots of this item cost different amounts — this is the weighted average">avg</span>':''}</td>
+          <td class="r num" style="color:var(--muted)">${i.mrpStrip? rMain(i.mrpStrip, i.pack):'—'}</td>
           <td class="r num" style="color:var(--faint)" title="= ${fmtQ(i.opening)} strips${packUnits(i.pack)? ` (pack ${packUnits(i.pack)}s = ${fmtQ(i.opening*packUnits(i.pack))} tablets)`:''}">${qMain(i.opening,i.pack)}${qSub(i.opening,i.pack)}</td>
           <td class="r num" style="color:var(--green)" title="= ${fmtQ(i.purchased)} strips${packUnits(i.pack)? ` (pack ${packUnits(i.pack)}s)`:''}">${i.purchased? '+'+qMain(i.purchased,i.pack)+qSub(i.purchased,i.pack):'—'}</td>
           <td class="r num" style="color:var(--muted)" title="= ${fmtQ(i.sold)} strips${packUnits(i.pack)? ` (pack ${packUnits(i.pack)}s = ${fmtQ(i.sold*packUnits(i.pack))} tablets)`:''}">${i.sold? '−'+qMain(i.sold,i.pack)+qSub(i.sold,i.pack):'—'}</td>
@@ -5827,7 +5847,7 @@ function wireInvTable(hid){
   const si=$('#invSearch');
   if(si) si.oninput = ()=>{ state.invQuery = si.value; renderInventory(); const s2=$('#invSearch'); if(s2){ s2.focus(); s2.setSelectionRange(s2.value.length, s2.value.length); } };
   $$('[data-invf]').forEach(b=> b.onclick=()=>{ state.invFilter=b.dataset.invf; renderInventory(); });
-  $$('[data-invqv]').forEach(b=> b.onclick=()=>{ invState().qtyView=b.dataset.invqv; renderInventory(); });
+  $$('[data-invqv]').forEach(b=> b.onclick=()=>{ setQtyView(hid, b.dataset.invqv); renderInventory(); });
   $$('[data-invexp]').forEach(b=> b.onclick=()=>{ state.invOpen = state.invOpen===b.dataset.invexp? null : b.dataset.invexp; renderInventory(); });
   $$('[data-invled]').forEach(b=> b.onclick=()=> ledgerModal(hid, b.dataset.invled));
   $$('[data-invadj]').forEach(b=> b.onclick=()=> adjustModal(hid, b.dataset.invadj));
@@ -5946,7 +5966,7 @@ function adjustModal(hid, key){
     <div class="modal-head"><h3>Adjust stock — ${esc(inv.name)}</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
       <div class="grid2" style="margin-bottom:14px">
-        <div class="kpi"><div class="l">In stock now</div><div class="v num" style="font-size:17px;color:${cur<0?'var(--red)':'var(--ink)'}">${fmtQ(cur)}</div><div class="d">${esc(inv.pack||'')} · strips</div></div>
+        <div class="kpi"><div class="l">In stock now</div><div class="v num" style="font-size:17px;color:${cur<0?'var(--red)':'var(--ink)'}">${(qtyViewOf(hid)==='tablets' && packUnits(inv.pack))? fmtQ(cur*packUnits(inv.pack)) : fmtQ(cur)}</div><div class="d">${esc(inv.pack||'')} · ${(qtyViewOf(hid)==='tablets' && packUnits(inv.pack))? 'tablets — recorded as '+fmtQ(cur)+' strips' : 'strips'}</div></div>
         <div class="kpi"><div class="l">After adjustment</div><div class="v num" style="font-size:17px;color:var(--green)" id="adjAfter">${fmtQ(cur)}</div><div class="d" id="adjDelta">no change</div></div>
       </div>
       <div class="seg" style="margin-bottom:12px">

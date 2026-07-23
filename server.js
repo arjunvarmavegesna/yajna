@@ -113,6 +113,16 @@ CREATE INDEX IF NOT EXISTS idx_snap_h ON expiry_snapshots(hospital_id);
 /* Items seen on a purchase that the master does not know. They are NOT added —
    they wait here for a manager, because "Rifaximn 550" is usually a typo of an
    item we already have, and an auto-add would mint a phantom. */
+/* Documents waiting for the doctor's 24h window to open. A closed window cannot
+   block a report forever: the PDF parks here, the doctor gets a template nudge,
+   and their reply — any reply — triggers delivery through the webhook. */
+CREATE TABLE IF NOT EXISTS wa_outbox(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL,
+  phone TEXT NOT NULL, filename TEXT NOT NULL, caption TEXT DEFAULT '',
+  mime TEXT NOT NULL DEFAULT 'application/pdf', payload BLOB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','failed')),
+  created_at INTEGER NOT NULL, sent_at INTEGER, last_error TEXT DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS pending_items(
   id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL,
   name TEXT NOT NULL, name_key TEXT NOT NULL,
@@ -529,7 +539,8 @@ const app = express();
 app.set('trust proxy', 1);
 // rawBody: the webhook signature is HMAC over the exact bytes received —
 // verifying a re-serialisation would break on any formatting difference
-app.use(express.json({ limit: '400kb', verify: (req, res, buf) => { req.rawBody = buf; } }));
+// 3mb: the report-to-PDF path carries the rendered report markup (a monthly can pass 400kb)
+app.use(express.json({ limit: '3mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(cookieParser());
 
 /* login rate limit: 10 attempts / 15 min per IP */
@@ -1282,6 +1293,8 @@ app.post('/wa/webhook', (req, res) => {
     const now = Date.now(), today = todayISO();
     db.prepare('INSERT INTO notifications(id,type,hospital_id,date,msg,ts,read) VALUES(?,?,?,?,?,?,0)')
       .run(uid('n'), 'doctor_reply', h.id, today, `${h.doctor || 'The doctor'} replied on WhatsApp: “${text.slice(0, 180)}”`, now);
+    /* their reply just opened the 24h window — deliver anything parked for them */
+    flushOutbox(from).then(n => { if (n) console.log(`[wa] outbox flushed for ${h.doctor || h.id}: ${n} pending`); }).catch(() => {});
     const awaiting = db.prepare(
       "SELECT * FROM margin_offers WHERE hospital_id=? AND status='proposed' AND approval_sent_at IS NOT NULL AND approved_at IS NULL ORDER BY approval_sent_at DESC LIMIT 1").get(h.id);
     if (awaiting) pushOfferAction(awaiting, 'note', `WhatsApp reply from ${h.doctor || 'the doctor'}: ${text.slice(0, 300)}`, today, h.doctor || 'Doctor');
@@ -1308,6 +1321,89 @@ async function sendWATemplate(phone, templateName, languageCode, variables) {
     if (r.ok) return { ok: true, via: 'template' };
     return { ok: false, status: r.status, error: (data && (data.error?.message || data.error || data.message)) || `template send failed (${r.status})` };
   } catch (e) { return { ok: false, error: e.message || 'network error' }; }
+}
+
+/* ---------- report PDFs ----------
+   The report the doctor receives is the SAME report the console shows: the
+   client sends the rendered report markup, and the page's own stylesheet is
+   lifted out of index.html and wrapped around it — one styling source, no
+   second layout to drift. Chrome headless-shell does the printing. */
+const CHROME_BIN = process.env.CHROME_BIN ||
+  '/root/.cache/puppeteer/chrome-headless-shell/linux-147.0.7727.57/chrome-headless-shell-linux64/chrome-headless-shell';
+let _browser = null, _browserTimer = null;
+async function getBrowser() {
+  if (_browser && _browser.connected) return _browser;
+  const puppeteer = require('puppeteer-core');
+  _browser = await puppeteer.launch({ executablePath: CHROME_BIN, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  return _browser;
+}
+const touchBrowserIdle = () => {   // close after 60s idle — renders are bursts, RAM is shared
+  clearTimeout(_browserTimer);
+  _browserTimer = setTimeout(() => { if (_browser) { _browser.close().catch(() => {}); _browser = null; } }, 60000);
+};
+let _appCss = null;
+function appCss() {
+  if (_appCss) return _appCss;
+  try {
+    const html = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8');
+    const m = html.match(/<style>([\s\S]*?)<\/style>/);
+    _appCss = m ? m[1] : '';
+  } catch (e) { _appCss = ''; }
+  return _appCss;
+}
+async function renderReportPdf(reportHtml) {
+  const page = await (await getBrowser()).newPage();
+  try {
+    await page.setContent(`<!doctype html><html><head><meta charset="utf-8"><style>${appCss()}
+      body{background:#fff;margin:0;padding:0}
+      .report-doc{box-shadow:none;margin:0;max-width:none}
+    </style></head><body class="printing">${reportHtml}</body></html>`, { waitUntil: 'load', timeout: 20000 });
+    return await page.pdf({ format: 'A4', printBackground: true, margin: { top: '10mm', bottom: '10mm', left: '8mm', right: '8mm' } });
+  } finally {
+    await page.close().catch(() => {});
+    touchBrowserIdle();
+  }
+}
+
+/* a document over the BSP — same error contract as sendWA */
+async function sendWADocument(phone, buffer, filename, caption) {
+  if (!waEnabled()) return { ok: false, error: 'WhatsApp sending is not configured (TAI_API_KEY)' };
+  const digits = String(phone).replace(/\D/g, '');
+  if (digits.length < 10) return { ok: false, error: 'Not a usable phone number' };
+  try {
+    const r = await fetch(`${WA_BASE}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.TAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: `+${digits}`, type: 'document', filename,
+        mimeType: 'application/pdf', caption: caption || undefined,
+        dataBase64: buffer.toString('base64') }),
+      signal: AbortSignal.timeout(30000)
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) return { ok: true };
+    return { ok: false, status: r.status, code: data && data.error && data.error.code,
+      error: (data && (data.error?.message || data.error || data.message)) || `document send failed (${r.status})` };
+  } catch (e) { return { ok: false, error: e.message || 'network error' }; }
+}
+
+/* park a document for delivery the moment the doctor's window opens */
+function queueOutbox(hid, phone, buffer, filename, caption) {
+  const id = uid('ob');
+  db.prepare('INSERT INTO wa_outbox(id,hospital_id,phone,filename,caption,mime,payload,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)')
+    .run(id, hid, String(phone).replace(/\D/g, ''), filename, caption || '', 'application/pdf', buffer, 'pending', Date.now());
+  return id;
+}
+async function flushOutbox(digits) {
+  const rows = db.prepare("SELECT * FROM wa_outbox WHERE phone=? AND status='pending' ORDER BY created_at").all(digits);
+  for (const row of rows) {
+    const sent = await sendWADocument(row.phone, row.payload, row.filename, row.caption);
+    if (sent.ok) db.prepare("UPDATE wa_outbox SET status='sent', sent_at=? WHERE id=?").run(Date.now(), row.id);
+    else {
+      db.prepare('UPDATE wa_outbox SET last_error=? WHERE id=?').run(String(sent.error || ''), row.id);
+      break;   // the window is either open for all of them or none — do not hammer
+    }
+  }
+  return rows.length;
 }
 
 /* ---------- doctor approval over WhatsApp ----------
@@ -1580,8 +1676,49 @@ app.post('/api/wa/report', auth, requireRole('admin'), async (req, res) => {
   if (!text) return res.status(400).json({ error: 'Nothing to send — generate the report first' });
   const phone = (h.doctor_phone || h.phone || '').replace(/\D/g, '');
   if (!phone) return res.status(400).json({ error: "No WhatsApp number for the doctor — add it under Edit hospital" });
+
+  /* The doctor gets the REPORT, not a summary of it: the client ships the
+     rendered markup, we print it to PDF and send the document. When the 24h
+     window is shut the PDF parks in the outbox, a template nudge goes out, and
+     the doctor's reply (webhook) delivers it. The text summary rides as the
+     caption — and stays the whole fallback when no HTML came. */
+  const html = typeof b.html === 'string' ? b.html.slice(0, 2_000_000) : '';
+  const label = S(b.label, 80) || 'report';
+  const fname = `Yajna-${(h.name || 'report').replace(/[^A-Za-z0-9]+/g, '-')}-${label.replace(/[^A-Za-z0-9]+/g, '-')}.pdf`;
+
+  let pdf = null, pdfError = '';
+  if (html) {
+    try { pdf = Buffer.from(await renderReportPdf(html)); }
+    catch (e) { pdfError = e.message || 'PDF render failed'; console.error('[wa] pdf render:', pdfError); }
+  }
+
+  if (pdf) {
+    const caption = `${h.doctor ? h.doctor + ' — ' : ''}${label} · Yajna Pharma Solutions`;
+    const sent = await sendWADocument(phone, pdf, fname, caption);
+    if (sent.ok) return res.json({ sent: { ok: true, via: 'document' }, to: `+${phone}` });
+
+    /* window shut (or no conversation yet): park the PDF + nudge via template */
+    const outboxId = queueOutbox(h.id, phone, pdf, fname, caption);
+    let nudge = { ok: false, error: 'TAI_REPORT_TEMPLATE not set' };
+    if (process.env.TAI_REPORT_TEMPLATE) {
+      nudge = await sendWATemplate(phone, process.env.TAI_REPORT_TEMPLATE,
+        process.env.TAI_TEMPLATE_LANG || 'en_US', [h.doctor || 'Doctor', label]);
+    }
+    return res.json({
+      sent: { ok: nudge.ok, via: nudge.ok ? 'template_nudge' : 'queued', queued: true,
+        error: nudge.ok ? undefined : `Direct send: ${sent.error}. Nudge: ${nudge.error || 'failed'}` },
+      to: `+${phone}`, outboxId,
+      note: nudge.ok
+        ? 'The PDF is queued — the doctor got a WhatsApp asking them to reply, and their reply delivers it automatically.'
+        : 'The PDF is queued and will deliver the next time the doctor messages the business number.',
+      waLink: `https://wa.me/${phone}?text=${encodeURIComponent(text)}`
+    });
+  }
+
+  // no PDF (no HTML from the client, or the render failed) — the text summary path
   const sent = await sendWA(phone, text);
-  res.json({ sent, to: `+${phone}`, waLink: `https://wa.me/${phone}?text=${encodeURIComponent(text)}` });
+  res.json({ sent, to: `+${phone}`, pdfError: pdfError || undefined,
+    waLink: `https://wa.me/${phone}?text=${encodeURIComponent(text)}` });
 });
 
 /* ---------- the group item master ----------

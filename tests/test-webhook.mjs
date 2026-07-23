@@ -61,5 +61,30 @@ await new Promise(r => setTimeout(r, 250));
 ok(!(await adm.req('GET', '/bootstrap')).data.notifications.some(n => /spam/.test(n.msg)), 'a number that is no doctor is ignored');
 ok(await hook({ event: 'message_status', id: 's1', data: { messageId: 'm1', status: 'delivered' } }) === 200, 'status receipts are acked and dropped');
 
+console.log('— the report goes as a real PDF, and a shut window parks it, never drops it —');
+{
+  // no TAI key in the test env: the direct document send cannot go, so the PDF
+  // must land in the outbox and the response must SAY it queued.
+  const html = '<div class="report-doc"><div class="rp-inner"><h1>Daily Report</h1><p>Sales Rs. 12,345</p></div></div>';
+  let rr = await adm.req('POST', '/wa/report', { hid: 'viraj', text: 'Daily summary', html, label: 'daily report 22 Jul' });
+  ok(rr.status === 200 && rr.data.sent && rr.data.sent.queued === true, 'the send reports QUEUED, not silently lost', JSON.stringify(rr.data.sent));
+  ok(!!rr.data.outboxId, 'and returns the outbox id');
+  ok(/queued/i.test(rr.data.note || ''), 'with a note saying how it will deliver', rr.data.note);
+
+  // the doctor replies → webhook → flush attempts delivery for THAT number
+  await hook(msg('ok send it', 'm-flush'));
+  await new Promise(r => setTimeout(r, 400));
+  // without a TAI key the flush attempt fails and records why — the row stays pending
+  const probeText = await adm.req('GET', '/bootstrap');
+  ok(probeText.status === 200, 'the console survives the flush attempt');
+}
+
+console.log('— no html = the text summary path, unchanged —');
+{
+  const rr = await adm.req('POST', '/wa/report', { hid: 'viraj', text: 'Just the summary' });
+  ok(rr.status === 200 && rr.data.sent && rr.data.sent.ok === false && /TAI_API_KEY/.test(rr.data.sent.error || ''), 'text-only still reports the unconfigured sender', JSON.stringify(rr.data.sent));
+  ok(!!rr.data.waLink, 'and always hands back the wa.me fallback');
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
