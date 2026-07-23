@@ -116,6 +116,7 @@ CREATE INDEX IF NOT EXISTS idx_snap_h ON expiry_snapshots(hospital_id);
 CREATE TABLE IF NOT EXISTS pending_items(
   id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL,
   name TEXT NOT NULL, name_key TEXT NOT NULL,
+  pack TEXT DEFAULT '',
   nr REAL DEFAULT 0, mrp REAL DEFAULT 0,
   source_vendor TEXT DEFAULT '', first_date TEXT NOT NULL, last_date TEXT NOT NULL,
   seen_count INTEGER NOT NULL DEFAULT 1,
@@ -205,6 +206,10 @@ CREATE INDEX IF NOT EXISTS idx_plog_item ON price_log(item_id);
   if (!icols.includes('molecule')) db.exec("ALTER TABLE items ADD COLUMN molecule TEXT NOT NULL DEFAULT ''");
 // who we WANT to buy this from next — overrides "who we last bought it from"
 if (!icols.includes('preferred_vendor')) db.exec("ALTER TABLE items ADD COLUMN preferred_vendor TEXT NOT NULL DEFAULT ''");
+{
+  const pcols2 = db.prepare('PRAGMA table_info(pending_items)').all().map(c => c.name);
+  if (pcols2.length && !pcols2.includes('pack')) db.exec("ALTER TABLE pending_items ADD COLUMN pack TEXT DEFAULT ''");
+}
 {
   const hcols = db.prepare('PRAGMA table_info(hospitals)').all().map(c => c.name);
   // the doctor's own WhatsApp number — reports and price approvals go THERE, not
@@ -327,6 +332,9 @@ function cleanEntry(x) {
           : l);
         return {
           item: S(l.item, 150),
+          // the pack rides on the line so an item BORN from a purchase carries a
+          // strip size into the master — without it, packUnits is null forever
+          pack: S(l.pack, 30).trim(),
           // batch identity: valuation is per batch, because the same brand arrives
           // repeatedly at different net rates and carries a different printed MRP
           // each time. expiry is per batch by law.
@@ -712,26 +720,41 @@ app.put('/api/entries/:hid/:date', auth, (req, res) => {
         if (!existing) {
           const pend = db.prepare('SELECT * FROM pending_items WHERE hospital_id=? AND name_key=?').get(hid, key);
           if (pend) {
-            // seen again — bump the count, keep the LATEST rates, and reopen a
-            // dismissed one (it is clearly still being bought)
-            db.prepare(`UPDATE pending_items SET seen_count=seen_count+1, last_date=?, nr=?, mrp=?,
+            // seen again — bump the count, keep the LATEST rates (and a pack, if
+            // this line finally supplies one), and reopen a dismissed one
+            db.prepare(`UPDATE pending_items SET seen_count=seen_count+1, last_date=?, nr=?, mrp=?, pack=?,
               source_vendor=?, status=CASE WHEN status='dismissed' THEN 'pending' ELSE status END WHERE id=?`)
-              .run(date, N(l.nr) || pend.nr, N(l.mrp) || pend.mrp, inv.vendor || pend.source_vendor, pend.id);
+              .run(date, N(l.nr) || pend.nr, N(l.mrp) || pend.mrp, S(l.pack, 30).trim() || pend.pack || '', inv.vendor || pend.source_vendor, pend.id);
             pendingTouched.push(pend.id);
           } else {
-            const pi = { id: uid('pi'), hospital_id: hid, name, name_key: key, nr: N(l.nr), mrp: N(l.mrp),
+            const pi = { id: uid('pi'), hospital_id: hid, name, name_key: key, pack: S(l.pack, 30).trim(), nr: N(l.nr), mrp: N(l.mrp),
               source_vendor: inv.vendor || '', first_date: date, last_date: date, seen_count: 1,
               status: 'pending', created_at: savedAt };
-            db.prepare(`INSERT INTO pending_items(id,hospital_id,name,name_key,nr,mrp,source_vendor,first_date,last_date,seen_count,status,created_at)
-              VALUES(?,?,?,?,?,?,?,?,?,1,'pending',?)`)
-              .run(pi.id, pi.hospital_id, pi.name, pi.name_key, pi.nr, pi.mrp, pi.source_vendor, pi.first_date, pi.last_date, pi.created_at);
+            db.prepare(`INSERT INTO pending_items(id,hospital_id,name,name_key,pack,nr,mrp,source_vendor,first_date,last_date,seen_count,status,created_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,1,'pending',?)`)
+              .run(pi.id, pi.hospital_id, pi.name, pi.name_key, pi.pack, pi.nr, pi.mrp, pi.source_vendor, pi.first_date, pi.last_date, pi.created_at);
             pendingTouched.push(pi.id);
           }
-        } else if (N(l.nr) > 0 && N(l.mrp) > 0) {
-          const lineM = marginPct(l.nr, l.mrp);
-          const masterM = marginPct(existing.nr, existing.mrp);
-          if (Math.abs(lineM - masterM) > MARGIN_TOL) {
-            marginAlerts.push(`"${existing.name}" margin ${lineM.toFixed(1)}% vs master ${masterM.toFixed(1)}% on ${inv.vendor || 'invoice'}${inv.invoiceNo ? ' #' + inv.invoiceNo : ''}`);
+        } else {
+          /* KNOWN item (directly or via alias). The line's pack can FILL a blank
+             master pack — a blank→value fill only. A DIFFERING pack is never
+             overwritten silently: it raises an alert like a margin mismatch, and
+             a human decides which record is wrong. */
+          const linePack = S(l.pack, 30).trim();
+          if (linePack) {
+            if (!String(existing.pack || '').trim()) {
+              db.prepare('UPDATE items SET pack=?, updated_at=? WHERE id=?').run(linePack, savedAt, existing.id);
+              existing.pack = linePack;
+            } else if (nameKey(existing.pack) !== nameKey(linePack)) {
+              marginAlerts.push(`"${existing.name}" pack size differs: master says ${existing.pack}, the ${inv.vendor || 'invoice'} line says ${linePack} — one of the two records is wrong`);
+            }
+          }
+          if (N(l.nr) > 0 && N(l.mrp) > 0) {
+            const lineM = marginPct(l.nr, l.mrp);
+            const masterM = marginPct(existing.nr, existing.mrp);
+            if (Math.abs(lineM - masterM) > MARGIN_TOL) {
+              marginAlerts.push(`"${existing.name}" margin ${lineM.toFixed(1)}% vs master ${masterM.toFixed(1)}% on ${inv.vendor || 'invoice'}${inv.invoiceNo ? ' #' + inv.invoiceNo : ''}`);
+            }
           }
         }
       }
@@ -1449,7 +1472,7 @@ app.delete('/api/offers/:id', auth, requireRole('admin'), (req, res) => {
   res.json({ ok: true, id: o.id });
 });
 
-const rowPending = (p) => ({ id: p.id, hid: p.hospital_id, name: p.name, key: p.name_key,
+const rowPending = (p) => ({ id: p.id, hid: p.hospital_id, name: p.name, key: p.name_key, pack: p.pack || '',
   nr: N(p.nr), mrp: N(p.mrp), vendor: p.source_vendor || '', firstDate: p.first_date, lastDate: p.last_date,
   seen: p.seen_count, status: p.status, matchedItemId: p.matched_item_id || null,
   resolvedBy: p.resolved_by || '', resolvedAt: p.resolved_at || null });
@@ -1477,7 +1500,7 @@ app.post('/api/pending-items/:id/approve', auth, requireRole('admin'), (req, res
   if (db.prepare('SELECT 1 FROM items WHERE hospital_id=? AND name_key=?').get(pi.hospital_id, key))
     return res.status(409).json({ error: 'That name is already on the master — use Match instead' });
   const now = Date.now();
-  const it = { id: uid('it'), hospital_id: pi.hospital_id, name, name_key: key, pack: S(b.pack, 60),
+  const it = { id: uid('it'), hospital_id: pi.hospital_id, name, name_key: key, pack: S(b.pack, 60).trim() || (pi.pack || ''),
     nr, mrp, molecule: S(b.molecule, 150).trim(), source: 'purchase', updated_at: now };
   const tx = db.transaction(() => {
     db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,source,updated_at,molecule) VALUES(?,?,?,?,?,?,?,?,?,?)')
@@ -2366,10 +2389,10 @@ const TEMPLATES = {
     /* LINE INPUTS ONLY — no vendor column (the vendor is chosen at upload and
        the whole file lands under them), no calculated columns, no totals. The
        app derives total qty, net rate, margin from these seven via calcLine. */
-    cols: ['name', 'pqty', 'oqty', 'rate', 'disc', 'gst', 'mrp'],
+    cols: ['name', 'pack', 'pqty', 'oqty', 'rate', 'disc', 'gst', 'mrp'],
     hdrs: { name: 'Item', mrp: 'MRP ₹ (per strip)' },
     need: ['name', 'pqty'],
-    eg: [['Tab. Rifaximin 550', 10, 1, 85, 10, 12, 120]],
+    eg: [['Tab. Rifaximin 550', '10s', 10, 1, 85, 10, 12, 120]],
     notes: [
       ['Purchase Qty (strips)', 'STRIPS billed by the vendor. Part strips are fine: 2.5 is two and a half. Must be 0 or more.'],
       ['Offer Qty (free / scheme)', 'Free / scheme strips — they enter stock and dilute the net rate, but you are not billed for them. 0 if none.'],
@@ -2378,7 +2401,8 @@ const TEMPLATES = {
       ['GST %', 'One of 0, 5, 12 or 18.'],
       ['MRP ₹', 'Printed MRP of one strip. Must be 0 or more.'],
       ['What the app computes', 'Total Qty = purchase + offer · Net Rate = billed amount ÷ total qty · Margin % = (MRP − net rate) ÷ MRP — the same calcLine math as manual entry, so nothing can disagree.'],
-      ['One vendor per file', 'There is no vendor column on purpose. You name the vendor when uploading and every line lands under them.']
+      ['One vendor per file', 'There is no vendor column on purpose. You name the vendor when uploading and every line lands under them.'],
+      ['Pack size', 'OPTIONAL for items already on the Item Master (their pack is known). REQUIRED when a line creates a NEW item — an item born without a pack can never convert tablets to strips.']
     ]
   },
   items: {
@@ -2418,7 +2442,7 @@ function buildTemplate(kind) {
        in text; the validations live in the legend and are ENFORCED at parse.) */
     ws = XLSX.utils.aoa_to_sheet([
       ['YAJNA PHARMA SOLUTIONS — Purchase Upload'],
-      ['One vendor per file (named at upload) · all quantities in STRIPS · qty/rate/MRP ≥ 0 · disc 0–100% · GST one of 0/5/12/18 · the app computes total qty, net rate and margin'],
+      ['One vendor per file (named at upload) · all quantities in STRIPS · pack required for NEW items · qty/rate/MRP ≥ 0 · disc 0–100% · GST one of 0/5/12/18 · the app computes total qty, net rate and margin'],
       [],
       hdr, ...T.eg
     ]);
@@ -2490,7 +2514,7 @@ function readTemplate(buf, kind) {
         if (kind === 'purchase') {
           /* raw INPUTS only — cleanEntry + calcLine derive everything on save,
              so the sheet can never smuggle in a wrong net rate */
-          const l = { item: name, pqty: N(row[col.pqty]), oqty: N(row[col.oqty ?? -1]),
+          const l = { item: name, pack: S(row[col.pack ?? -1], 30).trim(), pqty: N(row[col.pqty]), oqty: N(row[col.oqty ?? -1]),
             rate: N(row[col.rate ?? -1]), disc: N(row[col.disc ?? -1]), gst: N(row[col.gst ?? -1]), mrp: N(row[col.mrp ?? -1]) };
           if (l.pqty < 0 || l.rate < 0 || l.mrp < 0) continue;              // legend rule: ≥ 0
           l.disc = Math.min(100, Math.max(0, l.disc));                       // legend rule: 0–100
@@ -2546,14 +2570,27 @@ app.post('/api/parse/purchase', auth, requireRole('admin'), upload.single('file'
   const tpl = readTemplate(req.file.buffer, 'purchase');
   if (!tpl) return res.status(400).json({ error: 'The columns could not be found. Download the Purchase upload template and keep its header row — Item, Purchase Qty (strips), Offer Qty, Rate ₹, Vendor Disc %, GST %, MRP ₹.' });
   const date = /^\d{4}-\d{2}-\d{2}$/.test(S(req.query.date)) ? req.query.date : todayISO();
-  const lines = tpl.rows.slice(0, 500);
-  const invoice = { id: uid('inv'), vendor, invoiceNo, date, fileName: req.file.originalname || '', lines };
+  /* NEW items (not on the master, no alias) MUST bring a pack — an item born
+     without one can never convert tablets to strips. Those rows are BLOCKED with
+     the reason; known items with a blank pack import fine (theirs is on file). */
+  const findIt = db.prepare('SELECT 1 FROM items WHERE hospital_id=? AND name_key=?');
+  const findAl = db.prepare('SELECT 1 FROM item_aliases WHERE hospital_id=? AND alias_key=?');
+  const known = (nm) => !!(findIt.get(hid, nameKey(nm)) || findAl.get(hid, nameKey(nm)));
+  const lines = [], blocked = [];
+  tpl.rows.slice(0, 500).forEach((l, ix) => {
+    const isNew = !known(l.item);
+    if (isNew && !l.pack) { blocked.push({ row: ix + 1, name: l.item, reason: 'pack size needed — this line creates a NEW item' }); return; }
+    lines.push({ ...l, isNew });
+  });
+  const invoice = { id: uid('inv'), vendor, invoiceNo, date, fileName: req.file.originalname || '',
+    lines: lines.map(({ isNew, ...l }) => l) };
   // the preview shows what calcLine WILL derive — same math, so the numbers the
   // user approves are the numbers the day will carry
   const preview = lines.map(l => { const d = calcLine(l); return { ...l,
     tqty: d.tqty, nr: +d.nr.toFixed(2), pamt: +d.pamt.toFixed(2), marginPct: +d.marginPct.toFixed(2) }; });
-  res.json({ source: 'template', sheet: tpl.sheet, invoice, preview,
-    note: `Read ${lines.length} line${lines.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}") — all for ${vendor}` });
+  res.json({ source: 'template', sheet: tpl.sheet, invoice, preview, blocked,
+    note: `Read ${lines.length} line${lines.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}") — all for ${vendor}`
+      + (blocked.length ? ` · ${blocked.length} row${blocked.length === 1 ? '' : 's'} blocked` : '') });
 });
 
 app.post('/api/parse/items', auth, requireRole('admin'), upload.single('file'), (req, res) => {

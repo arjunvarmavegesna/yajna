@@ -2191,7 +2191,7 @@ function lineNote(i, j, d, st){
 function invTotal(inv){ return (inv.lines||[]).reduce((a,l)=>a+calcLine(l).pamt, 0); }
 /* batch and exp stay on the model — the pharmacy software's expiry report
    stamps them on later — but they are never keyed here. */
-function blankLine(){ return {item:'', batch:'', exp:'', pqty:1, oqty:0, rate:'', disc:0, gst:12, mrp:''}; }
+function blankLine(){ return {item:'', pack:'', batch:'', exp:'', pqty:1, oqty:0, rate:'', disc:0, gst:12, mrp:''}; }
 function invUid(){ return 'iv'+Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
 
 /* Each invoice owns one row in the Purchase entry table — vendor, item count and
@@ -2288,9 +2288,13 @@ function invLineModal(e, i, j, locked){
   openModal(`
     <div class="modal-head"><h3>${isNew?'Add line':'Edit line'} — ${esc(inv.vendor||'invoice')}${inv.invoiceNo? ' #'+esc(inv.invoiceNo):''}</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
-      <div class="field"><label>Item</label>
-        <div style="position:relative"><input class="in" id="lmItem" value="${esc(L.item)}" placeholder="Start typing — suggestions show each item's master MRP and expected margin" autocomplete="off"></div>
-        <p class="ivnote" id="lmMaster"></p></div>
+      <div class="grid2" style="grid-template-columns:2fr 1fr">
+        <div class="field"><label>Item</label>
+          <div style="position:relative"><input class="in" id="lmItem" value="${esc(L.item)}" placeholder="Start typing — suggestions show each item's master MRP and expected margin" autocomplete="off"></div></div>
+        <div class="field"><label>Pack size <span class="ivnote" id="lmPackWhy"></span></label>
+          <input class="in" id="lmPack" value="${esc(L.pack||'')}" placeholder="10s / 15s / vial"></div>
+      </div>
+      <p class="ivnote" id="lmMaster" style="margin-top:-6px"></p>
       <div class="subhead" style="margin-top:6px"><h4>From the invoice</h4><div class="rule"></div></div>
       <div class="grid2">
         <div class="field"><label>Purchase qty — strips (part strips fine: 1.5)</label><input class="in num" type="number" min="0" step="any" id="lmPqty" value="${esc(L.pqty)}"></div>
@@ -2310,15 +2314,36 @@ function invLineModal(e, i, j, locked){
       <button class="btn btn-primary" id="lmSave">${isNew?'Add line':'Save line'}</button>
     </div>`);
 
-  const read = ()=>({ ...L, item:$('#lmItem').value, pqty:$('#lmPqty').value, oqty:$('#lmOqty').value,
+  const read = ()=>({ ...L, item:$('#lmItem').value, pack:$('#lmPack').value.trim(), pqty:$('#lmPqty').value, oqty:$('#lmOqty').value,
     rate:$('#lmRate').value, disc:$('#lmDisc').value, gst:$('#lmGst').value, mrp:$('#lmMrp').value });
 
+  /* the pack field follows the item: a KNOWN item shows the master's pack as
+     locked context (a small edit affordance corrects a blank or wrong one); a
+     NEW item MUST bring one — an item born without a pack can never convert
+     tablets to strips. */
+  let packEdit = false;
+  const syncPack = (l, m)=>{
+    const inp = $('#lmPack'), why = $('#lmPackWhy');
+    if(m){
+      if(!packEdit){
+        inp.value = m.pack || l.pack || '';
+        inp.readOnly = true; inp.style.background = '#F4F6F5';
+        why.innerHTML = `from the master · <a href="#" id="lmPackEdit" style="color:var(--green)">edit</a>`;
+        const pe = $('#lmPackEdit'); if(pe) pe.onclick = (ev)=>{ ev.preventDefault(); packEdit = true; inp.readOnly = false; inp.style.background=''; inp.focus(); paint(); };
+      } else { why.textContent = m.pack && nameKey(inp.value)!==nameKey(m.pack)? `master says ${m.pack} — a differing pack raises an alert on save` : 'editing'; }
+    } else {
+      inp.readOnly = false; inp.style.background='';
+      why.textContent = String(l.item).trim()? 'required — new item' : '';
+    }
+  };
   const paint = ()=>{
     const l = read(), d = calcLine(l), st = lineStatus(hid, l);
     const m = findItem(hid, l.item);
+    syncPack(l, m);
+    const packMissing = !m && String(l.item).trim() && !$('#lmPack').value.trim();
     $('#lmMaster').innerHTML = m
       ? `On the Item Master: MRP ${r2(m.mrp)} · expected margin ${pct(marginPct(m.nr, m.mrp))}`
-      : (String(l.item).trim()? 'Not on the Item Master — it will be added automatically when this day is saved.' : '');
+      : (String(l.item).trim()? 'Not on the Item Master — it goes to the manager\'s pending queue when this day is saved, with this pack size on it.' : '');
     $('#lmCalc').innerHTML = `
       <table class="tbl" style="margin:0">
         <tbody>
@@ -2335,14 +2360,15 @@ function invLineModal(e, i, j, locked){
         </tbody></table>`;
     const warn = d.badMargin? '<span class="chip chip-red">MRP is below the net rate — this line sells at a loss</span>'
       : !String(l.item).trim()? '<span class="chip chip-gray">Enter an item</span>'
+      : packMissing? '<span class="chip chip-amber">Pack size needed — this line creates a NEW item</span>'
       : d.tqty<=0? '<span class="chip chip-gray">Enter a quantity</span>'
       : !d.mrp? '<span class="chip chip-gray">Enter the MRP to see the margin</span>' : '';
     $('#lmWarn').innerHTML = warn;
-    $('#lmSave').disabled = !String(l.item).trim() || d.tqty<=0;
+    $('#lmSave').disabled = !String(l.item).trim() || d.tqty<=0 || packMissing;
     const a=$('#lmAnother'); if(a) a.disabled = $('#lmSave').disabled;
   };
 
-  ['#lmItem','#lmPqty','#lmOqty','#lmRate','#lmDisc','#lmGst','#lmMrp'].forEach(sel=>{
+  ['#lmItem','#lmPack','#lmPqty','#lmOqty','#lmRate','#lmDisc','#lmGst','#lmMrp'].forEach(sel=>{
     const el=$(sel); el.oninput = paint; el.onchange = paint;
   });
   // picking a known item fills the MRP only: the master's rate is GST-inclusive
@@ -2927,7 +2953,8 @@ function purchaseUploadModal(e, locked){
         <tbody>${rows.slice(0,200).map(l=>{
           const d = calcLine(l);
           const st = lineStatus(state.hospital, l);
-          return `<tr><td>${esc(l.item)}</td>
+          const isNew = !findItem(state.hospital, l.item);
+          return `<tr><td>${esc(l.item)}${isNew? ` <span class="chip chip-amber" style="font-size:10px" title="Not on the Item Master — it queues for the manager with this pack (${esc(l.pack||'—')})">new item</span>`:''}${l.pack? ` <span style="color:var(--faint);font-size:11px">${esc(l.pack)}</span>`:''}</td>
             <td class="r num">${units==='tablets' && l.packU? `${fmtQ(l.srcPqty)} → <b>${fmtQ(d.pqty)}</b> <span style="color:var(--faint)">(${l.packU}s)</span>` : fmtQ(d.pqty)}</td>
             <td class="r num">${d.oqty? fmtQ(d.oqty):'—'}</td>
             <td class="r num">${r2(d.rate)}</td><td class="r num">${d.disc||'—'}</td><td class="r num">${d.gst||'—'}</td><td class="r num">${r2(d.mrp)}</td>
@@ -2937,7 +2964,8 @@ function purchaseUploadModal(e, locked){
         }).join('')}</tbody></table></div>
       <p class="mini-note">${rows.length} line${rows.length===1?'':'s'} · ${fmtQ(totals.tq)} strips in · purchase value ${fmtRs(totals.amt)} — all under <b>${esc($('#puVendor').value.trim())}</b>.</p>
       ${unitsSeg('puu', units)}
-      ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} item${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size on the Item Master to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}`;
+      ${units==='tablets' && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} item${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size on the Item Master to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}
+      ${(parsed.blocked||[]).length? `<p class="mini-note" style="color:var(--red)">✕ ${parsed.blocked.length} row${parsed.blocked.length===1?'':'s'} blocked:<br>${parsed.blocked.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name)}: ${esc(x.reason)}`).join('<br>')}${parsed.blocked.length>6?'<br>…':''}<br>Fill the pack on those rows and re-upload — the rows above import fine.</p>`:''}`;
     $$('[data-puu]').forEach(b=> b.onclick = ()=>{ units = b.dataset.puu; setFileUnits(state.hospital, 'template', units); renderPuPrev(); });
     $('#puGo').disabled = !rows.length;
   };
@@ -3066,6 +3094,9 @@ function gpUploadModal(e, locked){
   };
 }
 
+/* the one floating suggestion box — declared, not an accidental global:
+   killSuggest can run before any suggestion has ever been shown */
+let sugEl = null;
 function killSuggest(){ if(sugEl){ sugEl.remove(); sugEl=null; } }
 function attachSuggest(input, onPick){
   const show = ()=>{
@@ -4148,7 +4179,7 @@ function drawPending(hid){
         return `<div class="pend-card">
           <div style="display:flex;align-items:baseline;gap:8px"><b>${esc(p.name)}</b>
             <span class="eyebrow" style="font-weight:400">${esc(p.vendor||'—')} · seen ${p.seen}× · ${fmtDateShort(p.lastDate)}</span></div>
-          <div class="num" style="font-size:12.5px;color:var(--muted);margin:3px 0 4px">NR ${p.nr? r2(p.nr):'—'} · MRP ${p.mrp? r2(p.mrp):'—'}${p.mrp>0? ` · margin ${pct(m)}`:''}</div>
+          <div class="num" style="font-size:12.5px;color:var(--muted);margin:3px 0 4px">${p.pack? `pack ${esc(p.pack)} · `:''}NR ${p.nr? r2(p.nr):'—'} · MRP ${p.mrp? r2(p.mrp):'—'}${p.mrp>0? ` · margin ${pct(m)}`:''}</div>
           ${suggs.length? `<div class="eyebrow">Is it one of these?</div>
             ${suggs.map(it=>`<div class="sugg"><span style="flex:1"><b>${esc(it.name)}</b> <span style="color:var(--faint);font-size:11.5px">${esc(it.pack||'')} · NR ${it.nr}</span></span>
               <button class="btn btn-sm btn-primary" data-pmatch="${esc(p.id)}" data-pitem="${esc(it.id)}">Match</button></div>`).join('')}` : ''}
@@ -4219,7 +4250,7 @@ function pendApproveModal(hid, p){
       <div class="field"><label>Item name <span style="color:var(--faint);font-weight:400">— fix any spelling now; the purchased spelling still resolves here</span></label>
         <input class="in" id="paName" value="${esc(p.name)}"></div>
       <div class="grid2">
-        <div class="field"><label>Pack</label><input class="in" id="paPack" placeholder="10s / vial"></div>
+        <div class="field"><label>Pack</label><input class="in" id="paPack" value="${esc(p.pack||'')}" placeholder="10s / vial"></div>
         <div class="field"><label>Molecule / salt</label><input class="in" id="paMol" placeholder="optional"></div>
       </div>
       <div class="grid2">

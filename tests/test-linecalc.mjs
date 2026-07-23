@@ -106,6 +106,7 @@ ok(!!doc.querySelector('#lmItem'), 'adding an invoice opens the line dialog');
 ok(doc.querySelectorAll('[data-il]').length === 0, 'nothing is keyed inline any more');
 const fill = (o) => {
   if (o.item !== undefined) setV('#lmItem', o.item);
+  if (o.pack !== undefined) setV('#lmPack', o.pack);
   if (o.pqty !== undefined) setV('#lmPqty', o.pqty);
   if (o.oqty !== undefined) setV('#lmOqty', o.oqty);
   if (o.rate !== undefined) setV('#lmRate', o.rate);
@@ -116,7 +117,8 @@ const fill = (o) => {
 const calcTxt = () => doc.querySelector('#lmCalc').textContent.replace(/\s+/g, ' ');
 
 // the spec's own sample: 10 + 2 free, rate 100, 5% disc, 5% GST, MRP 150
-fill({ item: 'Tab. Spec 150', pqty: '10', oqty: '2', rate: '100', disc: '5', gst: 5, mrp: '150' });
+// a NEW item now demands its pack before Add line enables (Jul 22)
+fill({ item: 'Tab. Spec 150', pack: '10s', pqty: '10', oqty: '2', rate: '100', disc: '5', gst: 5, mrp: '150' });
 await tick(150);
 let c = calcTxt();
 ok(/Total qty 10 billed \+ 2 free\s*12/.test(c), 'Total Qty = 12, and it spells out why', c.slice(0, 60));
@@ -158,7 +160,10 @@ console.log('— guards —');
 click('[data-adl]'); await tick(250);
 ok(doc.querySelector('#lmSave').disabled, 'a blank line cannot be saved');
 fill({ item: 'Something' }); await tick(120);
-ok(!doc.querySelector('#lmSave').disabled, 'naming an item enables it');
+ok(doc.querySelector('#lmSave').disabled, 'a NEW item without a pack still cannot save — an item born pack-less can never convert tablets');
+ok(/Pack size needed/i.test(doc.querySelector('#lmWarn').textContent), 'and says so', doc.querySelector('#lmWarn').textContent);
+fill({ pack: '10s' }); await tick(120);
+ok(!doc.querySelector('#lmSave').disabled, 'name + pack enables it');
 fill({ pqty: '0', oqty: '0' }); await tick(120);
 ok(doc.querySelector('#lmSave').disabled, 'zero quantity disables it again');
 ok(doc.querySelector('#lmWarn').textContent.includes('quantity'), 'and says so', doc.querySelector('#lmWarn').textContent);
@@ -181,8 +186,8 @@ ok(/Low margin/.test(calcTxt()), 'worse-than-master trips Low margin', calcTxt()
 ok(/-12\.6 points worse/.test(calcTxt()), 'and quantifies the gap in points', calcTxt().slice(-90));
 fill({ rate: '200' }); await tick(150);
 ok(/Above master/.test(calcTxt()), 'better-than-master reads Above master');
-fill({ item: 'Totally New Item' }); await tick(150);
-ok(doc.querySelector('#lmMaster').textContent.includes('added automatically'), 'an unknown item says it will join the master');
+fill({ item: 'Totally New Item', pack: '10s' }); await tick(150);
+ok(doc.querySelector('#lmMaster').textContent.includes('pending queue'), 'an unknown item says it goes to the manager\'s pending queue — no more silent auto-add');
 ok(/New item/.test(calcTxt()), 'and is flagged New item');
 fill({ item: 'Tab. Rifaximin 550', rate: '303' }); await tick(150);   // ~26.5% vs 27.7% -> inside tolerance
 ok(/Match/.test(calcTxt()), 'inside the ±2pt tolerance still reads Match');
