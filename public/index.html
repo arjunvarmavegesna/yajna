@@ -329,6 +329,7 @@ body.nav-collapsed .nav-sub{display:none}
 #modalRoot{position:fixed;inset:0;z-index:100;display:none;align-items:center;justify-content:center;background:rgba(23,30,27,.45);padding:20px}
 #modalRoot.on{display:flex}
 .modal{background:#fff;border-radius:12px;width:100%;max-width:520px;max-height:88vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.25)}
+.modal.modal-lg{max-width:760px}
 .modal-head{display:flex;align-items:center;padding:17px 22px;border-bottom:1px solid var(--border)}
 .modal-head h3{font-size:16px;font-weight:700}
 .modal-x{margin-left:auto;border:none;background:transparent;font-size:20px;color:var(--muted);padding:2px 8px;border-radius:6px}
@@ -647,6 +648,18 @@ const r2 = n => (Math.round(num(n)*100)/100).toLocaleString('en-IN',{minimumFrac
 function aliasOf(hid, key){ const a=(db.aliases[hid]||[]).find(x=>x.aliasKey===key); return a? (db.items[hid]||[]).find(i=>i.id===a.itemId)||null : null; }
 function resolveKey(hid, key){ const it = aliasOf(hid, key); return it? it.key : key; }
 function findItem(hid, name){ const k=nameKey(name); return (db.items[hid]||[]).find(i=>i.key===k) || aliasOf(hid, k) || null; }
+/* every inventory-facing upload (sales, opening stock, purchase) checks its
+   product names against the Item Master up front — a name that doesn't
+   match is very often a typo, and catching it before the day saves is
+   cheaper than untangling it in the pending queue afterwards. */
+function masterMatchBanner(hid, names){
+  const uniq = [...new Set(names.filter(Boolean))];
+  if(!uniq.length) return '';
+  const unmatched = uniq.filter(n=> !findItem(hid, n));
+  if(!unmatched.length) return `<p class="mini-note" style="color:var(--green);font-weight:600">✓ All ${uniq.length} product name${uniq.length===1?'':'s'} matched the Item Master.</p>`;
+  return `<p class="mini-note" style="color:var(--amber);font-weight:600">⚠ ${unmatched.length} of ${uniq.length} product name${uniq.length===1?'':'s'} ${unmatched.length===1?'is':'are'} NOT on the Item Master (highlighted below): ${unmatched.slice(0,8).map(esc).join(', ')}${unmatched.length>8?`, +${unmatched.length-8} more`:''}</p>`;
+}
+const unmatchedRowStyle = (hid, name)=> findItem(hid, name)? '' : 'style="background:var(--amber-light)"';
 const MARGIN_TOL = 2; // percentage points, mirrors the server
 
 const ITEM_POOL = [
@@ -1114,7 +1127,7 @@ function toast(msg, kind){
   $('#toastRoot').appendChild(t);
   setTimeout(()=>{ t.style.opacity='0'; t.style.transition='opacity .3s'; setTimeout(()=>t.remove(),320); }, 2600);
 }
-function openModal(html){ const r=$('#modalRoot'); r.innerHTML = `<div class="modal">${html}</div>`; r.classList.add('on'); $$('.modal-x',r).forEach(b=>b.onclick=closeModal); r.onclick=e=>{ if(e.target===r) closeModal(); }; }
+function openModal(html, opts){ const r=$('#modalRoot'); r.innerHTML = `<div class="modal${opts&&opts.lg?' modal-lg':''}">${html}</div>`; r.classList.add('on'); $$('.modal-x',r).forEach(b=>b.onclick=closeModal); r.onclick=e=>{ if(e.target===r) closeModal(); }; }
 function closeModal(){ const r=$('#modalRoot'); r.classList.remove('on'); r.innerHTML=''; }
 
 function applyBootstrap(b){
@@ -3025,7 +3038,7 @@ function purchaseUploadModal(e, locked){
       <div class="field"><label>Filled purchase template (Excel)</label><input class="in" type="file" id="puFile" accept=".xls,.xlsx"></div>
       <div id="puPrev"><p class="mini-note">Seven inputs per line — Item, Purchase Qty (strips), Offer Qty, Rate ₹, Vendor Disc %, GST %, MRP ₹. Everything else is derived.</p></div>
     </div>
-    <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn" id="puParse">Read file</button><button class="btn btn-primary" id="puGo" disabled>Add to day</button></div>`);
+    <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn" id="puParse">Read file</button><button class="btn btn-primary" id="puGo" disabled>Add to day</button></div>`, {lg:true});
   $('#puTpl').onclick = ()=> downloadTemplate('purchase', 'Purchase upload');
   attachSuggest($('#puVendor'), ()=>{});
 
@@ -3035,13 +3048,14 @@ function purchaseUploadModal(e, locked){
     const totals = rows.reduce((a,l)=>{ const d=calcLine(l); a.amt+=d.pamt; a.tq+=d.tqty; return a; }, {amt:0, tq:0});
     $('#puPrev').innerHTML = `
       <p class="mini-note">${esc(parsed.note||'')}</p>
+      ${masterMatchBanner(state.hospital, rows.map(l=>l.item))}
       <div class="tbl-scroll" style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:7px"><table class="tbl">
         <thead><tr><th>Item</th><th class="r">Purchase qty</th><th class="r">Offer</th><th class="r">Rate</th><th class="r">Disc%</th><th class="r">GST%</th><th class="r">MRP</th><th class="r" title="Billed amount ÷ total qty — computed by the app, never read from the sheet">Net rate</th><th class="r">Margin %</th><th></th></tr></thead>
         <tbody>${rows.slice(0,200).map(l=>{
           const d = calcLine(l);
           const st = lineStatus(state.hospital, l);
           const isNew = !findItem(state.hospital, l.item);
-          return `<tr><td>${esc(l.item)}${isNew? ` <span class="chip chip-amber" style="font-size:10px" title="Not on the Item Master — it queues for the manager with this pack (${esc(l.pack||'—')})">new item</span>`:''}${l.pack? ` <span style="color:var(--faint);font-size:11px">${esc(l.pack)}</span>`:''}</td>
+          return `<tr ${unmatchedRowStyle(state.hospital, l.item)}><td>${esc(l.item)}${isNew? ` <span class="chip chip-amber" style="font-size:10px" title="Not on the Item Master — it queues for the manager with this pack (${esc(l.pack||'—')})">new item</span>`:''}${l.pack? ` <span style="color:var(--faint);font-size:11px">${esc(l.pack)}</span>`:''}</td>
             <td class="r num">${units==='tablets' && l.packU? `${fmtQ(l.srcPqty)} → <b>${fmtQ(d.pqty)}</b> <span style="color:var(--faint)">(${l.packU}s)</span>` : fmtQ(d.pqty)}</td>
             <td class="r num">${d.oqty? fmtQ(d.oqty):'—'}</td>
             <td class="r num">${r2(d.rate)}</td><td class="r num">${d.disc||'—'}</td><td class="r num">${d.gst||'—'}</td><td class="r num">${r2(d.mrp)}</td>
@@ -3118,7 +3132,7 @@ function gpUploadModal(e, locked){
       <div class="field"><label>Report file (Excel / CSV / PDF / photo)</label><input class="in" type="file" id="gpFile" accept=".xls,.xlsx,.csv,.pdf,image/*"></div>
       <div id="gpPrev"><p class="mini-note">Sales at MRP, cost of goods sold and the margin are worked out from the rows and filled into this tab.</p></div>
     </div>
-    <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn" id="gpParse">Read report</button><button class="btn btn-primary" id="gpApply" disabled>Fill sales &amp; margin</button></div>`);
+    <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn" id="gpParse">Read report</button><button class="btn btn-primary" id="gpApply" disabled>Fill sales &amp; margin</button></div>`, {lg:true});
 
   $('#gpTpl').onclick = ()=> downloadTemplate('sales', 'Sales & margin');
 
@@ -3138,11 +3152,12 @@ function gpUploadModal(e, locked){
           <div class="kpi"><div class="l">Rows read</div><div class="v num" style="font-size:17px">${items.length}</div><div class="d">${parsed.source==='template'? 'from the template — no AI needed':'read by AI from a free-form export'}</div></div>
         </div>
         <p class="mini-note">${esc(parsed.note||'')}</p>
+        ${masterMatchBanner(state.hospital, items.map(r=>r.item))}
         ${priced.length? `<table class="tbl"><thead><tr><th>Item</th><th>Pack</th><th class="r">Qty</th><th class="r">Net rate</th><th class="r">MRP</th><th class="r">Margin %</th><th></th></tr></thead>
           <tbody>${priced.slice(0,8).map(r=>{
             const mp = num(r.mrp)>0? (num(r.mrp)-num(r.nr))/num(r.mrp)*100 : 0;
             const st = lineStatus(state.hospital, {item:r.item, pqty:1, oqty:0, rate:num(r.nr), disc:0, gst:0, mrp:num(r.mrp)});
-            return `<tr><td>${esc(r.item)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${srcQtyCell(r, units)}</td><td class="r num">${r2(r.nr)}</td><td class="r num">${r2(r.mrp)}</td><td class="r num" style="font-weight:700;color:${marginCol(st.status)}">${pct(mp)}</td><td>${marginChip(st.status)}</td></tr>`;
+            return `<tr ${unmatchedRowStyle(state.hospital, r.item)}><td>${esc(r.item)}${findItem(state.hospital,r.item)?'':' <span class="chip chip-amber" style="font-size:10px">not on Item Master</span>'}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${srcQtyCell(r, units)}</td><td class="r num">${r2(r.nr)}</td><td class="r num">${r2(r.mrp)}</td><td class="r num" style="font-weight:700;color:${marginCol(st.status)}">${pct(mp)}</td><td>${marginChip(st.status)}</td></tr>`;
           }).join('')}</tbody></table>
           <p class="mini-note">${priced.length>8? `First 8 of ${priced.length} priced rows. `:''}Margin % is <b>(MRP − net rate) ÷ MRP</b> — a ratio, so the strip size never enters it. It only needs both rates on the same basis, and they are: both per strip.</p>`
           : (items.length? '<p class="mini-note">These rows carry no cost price, so only the day\'s totals can be filled — not the per-item margin.</p>':'')}
@@ -6293,7 +6308,7 @@ function openingStockModal(hid){
         <textarea class="in" id="osPaste" rows="4" placeholder="Tab. Pantoprazole 40,120,38,58,10s"></textarea></div>
       <div id="osPrev"></div>
     </div>
-    <div class="modal-foot" id="osFoot"><button class="btn modal-x">Cancel</button><button class="btn" id="osRead">Read / preview</button><button class="btn btn-primary" id="osGo" disabled>Save opening stock</button></div>`);
+    <div class="modal-foot" id="osFoot"><button class="btn modal-x">Cancel</button><button class="btn" id="osRead">Read / preview</button><button class="btn btn-primary" id="osGo" disabled>Save opening stock</button></div>`, {lg:true});
 
   const ot=$('#osTpl'); if(ot) ot.onclick = ()=> downloadTemplate('opening', 'Opening stock');
 
@@ -6328,9 +6343,10 @@ function openingStockModal(hid){
       </div>
       <div class="tbl-scroll" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:7px"><table class="tbl">
         <thead><tr><th>Product</th><th>Pack</th><th class="r">Strips</th><th class="r">Net rate/strip</th><th class="r">MRP/strip</th><th></th></tr></thead>
-        <tbody>${rows.slice(0,200).map(r=>`<tr><td>${esc(r.name)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${srcQtyCell(r, units)}</td><td class="r num">${r.nr? r2(r.nr):'—'}</td><td class="r num">${r.mrp? r2(r.mrp):'—'}</td>
+        <tbody>${rows.slice(0,200).map(r=>`<tr ${unmatchedRowStyle(hid, r.name)}><td>${esc(r.name)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${srcQtyCell(r, units)}</td><td class="r num">${r.nr? r2(r.nr):'—'}</td><td class="r num">${r.mrp? r2(r.mrp):'—'}</td>
           <td>${findItem(hid,r.name)? '<span class="chip chip-blue">On master</span>':'<span class="chip chip-green">New item</span>'}</td></tr>`).join('')}</tbody></table></div>
       <p class="mini-note">${rows.length} item${rows.length===1?'':'s'} · ${known} already on the master (opening qty updated) · ${rows.length-known} will be added.${note? ' '+esc(note):''}</p>
+      ${masterMatchBanner(hid, rows.map(r=>r.name))}
       ${lastMeta.tabletsCol? '<p class="mini-note">This sheet has its own tablets column — each row already says which unit it counts, so the file-level toggle is off.</p>' : unitsSeg('osu', units)}
       ${units==='tablets' && !lastMeta.tabletsCol && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}
       ${readSkipNote()}` :

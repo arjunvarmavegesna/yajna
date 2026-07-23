@@ -264,7 +264,18 @@ ok(/qty in strips/i.test(modal), 'and says the qty is in strips', modal.slice(0,
 ok(/cost price including GST/i.test(modal), 'and that the cost price includes GST');
 ok(!!doc.querySelector('#gpFile') && !!doc.querySelector('#gpApply'), 'with a file picker and an apply button');
 ok(doc.querySelector('#gpApply').disabled, 'apply is disabled until something is read');
+ok(doc.querySelector('.modal').classList.contains('modal-lg'), 'the upload modals ask for the wider modal size');
 w.eval('closeModal()'); await tick(120);
+
+console.log('— product names are checked against the Item Master, and a mismatch is highlighted —');
+w.eval(`db.items.viraj = (db.items.viraj||[]).concat([{id:'mm1', name:'Tab. Master Item', key:nameKey('Tab. Master Item'), pack:'10s', nr:10, mrp:20, openingQty:0, source:'demo', updatedAt:Date.now()}])`);
+const allMatched = w.eval(`masterMatchBanner('viraj', ['Tab. Master Item'])`);
+ok(/All 1 product name/i.test(allMatched) && /matched the Item Master/i.test(allMatched), 'a fully-matched set says so plainly', allMatched);
+const someUnmatched = w.eval(`masterMatchBanner('viraj', ['Tab. Master Item', 'Totally Unknown Drug'])`);
+ok(/1 of 2/.test(someUnmatched) && /Totally Unknown Drug/.test(someUnmatched), 'an unmatched name is called out by name in the summary', someUnmatched);
+ok(w.eval(`masterMatchBanner('viraj', [])`) === '', 'nothing to say when there are no names at all');
+ok(w.eval(`unmatchedRowStyle('viraj', 'Tab. Master Item')`) === '', 'a matched row gets no highlight');
+ok(/amber-light/.test(w.eval(`unmatchedRowStyle('viraj', 'Totally Unknown Drug')`)), 'an unmatched row is visually highlighted, not just chipped');
 // the other two templates are downloadable where their import lives
 w.eval('openingStockModal(state.hospital)'); await tick(250);
 ok(!!doc.querySelector('#osTpl'), 'the opening-stock modal offers its template');
