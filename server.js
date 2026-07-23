@@ -965,7 +965,7 @@ app.post('/api/clear', auth, requireRole('admin'), (req, res) => {
 /* Every table a hospital owns. Deleting the hospital takes all of it — this is
    the single most destructive thing in the app, so the list is explicit rather
    than inferred, and the impact is countable before anything happens. */
-const HOSPITAL_TABLES = ['entries', 'notifications', 'vendors', 'payments', 'items', 'price_log', 'pending_items', 'item_aliases',
+const HOSPITAL_TABLES = ['entries', 'notifications', 'vendors', 'payments', 'items', 'price_log', 'pending_items', 'item_aliases', 'wa_outbox',
   'stock_adjustments', 'receivables', 'receivable_actions', 'expiry_snapshots', 'period_data',
   'hv_tracked', 'report_prefs'];
 
