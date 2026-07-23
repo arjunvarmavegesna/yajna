@@ -660,6 +660,59 @@ function masterMatchBanner(hid, names){
   return `<p class="mini-note" style="color:var(--amber);font-weight:600">⚠ ${unmatched.length} of ${uniq.length} product name${uniq.length===1?'':'s'} ${unmatched.length===1?'is':'are'} NOT on the Item Master (highlighted below): ${unmatched.slice(0,8).map(esc).join(', ')}${unmatched.length>8?`, +${unmatched.length-8} more`:''}</p>`;
 }
 const unmatchedRowStyle = (hid, name)=> findItem(hid, name)? '' : 'style="background:var(--amber-light)"';
+
+/* What a sales upload will do to the shelf, computed BEFORE it is applied —
+   sales consume stock, but that happens invisibly behind the entry save, so
+   this projects it up front instead of letting a mismatch surface in next
+   month's audit. Rows are keyed by the RESOLVED item (aliases included) and
+   summed first — two lines for the same item must draw on stock together,
+   not be checked one at a time, or a cumulative shortfall would be missed.
+   `asOfDate` is the day BEFORE the entry being edited, so re-opening an
+   already-saved day's sales never counts what is already staged against
+   itself. Three mutually exclusive buckets, always summing to reportItems:
+     clean     — matched, deducts without going negative (the boring majority)
+     notFound  — no Item Master match at all — the sale records, but nothing
+                 on any real shelf moves, because there is nothing to move
+     negative  — matched, but stock would go below zero — a symptom (a missed
+                 purchase or a short opening count), not a stock level */
+function salesStockImpact(hid, rows, asOfDate){
+  const snap = stockAsOf(hid, asOfDate);
+  const stockByKey = {}; snap.items.forEach(i=> stockByKey[i.key] = i.stock);
+  const byItem = new Map();
+  rows.forEach(r=>{
+    const it = findItem(hid, r.item);
+    const bucketKey = it? it.key : ('!unmatched!'+nameKey(r.item));
+    if(!byItem.has(bucketKey)) byItem.set(bucketKey, {name:r.item, qty:0, item:it});
+    byItem.get(bucketKey).qty += num(r.qty);
+  });
+  const notFound=[], negative=[], clean=[];
+  byItem.forEach(b=>{
+    if(!b.item){ notFound.push(b.name); return; }
+    const cur = stockByKey[b.item.key] ?? 0;
+    if(cur - b.qty < -0.0000001){ negative.push({name:b.name, have:cur, selling:b.qty}); return; }
+    clean.push(b.name);
+  });
+  const cogs = rows.reduce((a,r)=>a+num(r.cost),0);
+  return {
+    stockNowItems: snap.items.length, stockNowValue: snap.valueNr,
+    reportItems: byItem.size, reportStrips: rows.reduce((a,r)=>a+num(r.qty),0), reportCogs: cogs,
+    stockAfterValue: snap.valueNr - cogs,
+    notFound, negative, clean
+  };
+}
+function renderStockImpact(impact){
+  const adjusted = impact.clean.length;
+  return `
+    <div class="subhead" style="margin-top:10px"><h4>What this does to the shelf</h4><div class="rule"></div></div>
+    <div class="grid2" style="margin-bottom:6px">
+      <div class="kpi"><div class="l">Stock now</div><div class="v num" style="font-size:16px">${impact.stockNowItems} items</div><div class="d">${fmtRs(impact.stockNowValue)} at cost</div></div>
+      <div class="kpi"><div class="l">This report sells</div><div class="v num" style="font-size:16px">${impact.reportItems} items · ${fmtQ(impact.reportStrips)} strips</div><div class="d">${fmtRs(impact.reportCogs)} at cost</div></div>
+    </div>
+    <p class="mini-note" style="margin:0 0 8px"><b>Stock after: ${impact.stockNowItems} items · ${fmtRs(impact.stockAfterValue)} at cost</b> <span style="color:var(--faint)">(${fmtN(impact.stockNowValue)} − ${fmtN(impact.reportCogs)} = ${fmtN(impact.stockAfterValue)})</span></p>
+    <p class="mini-note"><b>${adjusted} item${adjusted===1?'':'s'} adjusted</b>${impact.notFound.length? ` · <span style="color:var(--red)">${impact.notFound.length} not found in inventory — nothing deducted</span>`:''}${impact.negative.length? ` · <span style="color:var(--red)">${impact.negative.length} would go negative</span>`:''}</p>
+    ${impact.notFound.length? `<p class="mini-note" style="color:var(--red)">Not on the Item Master, so the sale records but nothing comes off any real shelf: ${impact.notFound.slice(0,8).map(esc).join(', ')}${impact.notFound.length>8?`, +${impact.notFound.length-8} more`:''}. Fix the name (a typo, or add it to the Item Master) and re-read.</p>`:''}
+    ${impact.negative.length? `<p class="mini-note" style="color:var(--red)">Would go negative — a symptom of a missed purchase or a short opening count, not just a low stock level: ${impact.negative.slice(0,8).map(n=>`${esc(n.name)} (has ${fmtQ(n.have)}, selling ${fmtQ(n.selling)})`).join(', ')}${impact.negative.length>8?`, +${impact.negative.length-8} more`:''}.</p>`:''}`;
+}
 const MARGIN_TOL = 2; // percentage points, mirrors the server
 
 const ITEM_POOL = [
@@ -3242,6 +3295,10 @@ function gpUploadModal(e, locked){
       // rows whose margin disagrees with the Item Master are the whole point of reading per item
       const off = priced.map(r=>({...r, st: lineStatus(state.hospital, {item:r.item, pqty:1, oqty:0, rate:num(r.nr), disc:0, gst:0, mrp:num(r.mrp)})}))
         .filter(r=> r.st.status==='low' || r.st.status==='high');
+      // stock as it stood BEFORE this file — the day before the one being
+      // entered, so re-opening an already-saved day never counts what is
+      // already staged against itself
+      const impact = items.length? salesStockImpact(state.hospital, items, addDays(state.date,-1)) : null;
       $('#gpPrev').innerHTML = `
         <div class="grid2" style="margin-bottom:8px">
           <div class="kpi"><div class="l">Sales (MRP)</div><div class="v num" style="font-size:17px">${fmtRs(parsed.salesMrp)}</div>${parsed.source==='template'? '<div class="d">Σ qty × MRP</div>':''}</div>
@@ -3249,6 +3306,7 @@ function gpUploadModal(e, locked){
           <div class="kpi good"><div class="l">Gross margin</div><div class="v num" style="font-size:17px">${pct(m)}</div><div class="d">(sales − COGS) ÷ sales</div></div>
           <div class="kpi"><div class="l">Rows read</div><div class="v num" style="font-size:17px">${items.length}</div><div class="d">${parsed.source==='template'? 'from the template — no AI needed':'read by AI from a free-form export'}</div></div>
         </div>
+        ${impact? renderStockImpact(impact) : ''}
         <p class="mini-note">${esc(parsed.note||'')}</p>
         ${masterMatchBanner(state.hospital, items.map(r=>r.item))}
         ${priced.length? `<table class="tbl"><thead><tr><th>Item</th><th>Pack</th><th class="r">Qty</th><th class="r">Net rate</th><th class="r">MRP</th><th class="r">Margin %</th><th></th></tr></thead>
@@ -3286,15 +3344,21 @@ function gpUploadModal(e, locked){
     if(parsed.cash>0) e.sales.cash = parsed.cash;
     if(parsed.credit>0) e.sales.credit = parsed.credit;
     // what lands on the entry is the STRIP view — the conversion, if any, is done
-    if(parsed.items && parsed.items.length) e.itemSales = viewItems().rows.map(r=>({
+    const rows = viewItems().rows;
+    if(parsed.items && parsed.items.length) e.itemSales = rows.map(r=>({
       item:r.item, qty:num(r.qty), amount:num(r.amount),
       pack:r.pack||'', nr:num(r.nr), mrp:num(r.mrp), cost:num(r.cost)
     }));
     saveImportReceipt(state.hospital, 'sales', parsed);
-    closeModal();
     toast(`Sales & margin filled${parsed.items&&parsed.items.length? ` · ${parsed.items.length} item row${parsed.items.length===1?'':'s'} loaded`:''}`,'green');
-    state.entryTab = 1;
-    renderEntryTab(e, locked);
+    const proceed = ()=>{ closeModal(); state.entryTab = 1; renderEntryTab(e, locked); };
+    // confirm the SAME shelf-impact numbers as what actually got staged, one
+    // more read before the day itself is saved
+    const impact = rows.length? salesStockImpact(state.hospital, rows, addDays(state.date,-1)) : null;
+    if(!impact){ proceed(); return; }
+    $('#gpPrev').innerHTML = `<p class="mini-note" style="margin-top:0"><b>Staged — this is what will happen to the shelf once the day saves:</b></p>` + renderStockImpact(impact);
+    $('.modal-foot').innerHTML = `<span style="flex:1"></span><button class="btn btn-primary" id="gpContinue">Continue to Data Entry</button>`;
+    $('#gpContinue').onclick = proceed;
   };
 }
 
