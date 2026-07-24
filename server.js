@@ -3478,7 +3478,16 @@ function readTemplate(buf, kind) {
   let wb;
   try { wb = XLSX.read(buf, { type: 'buffer' }); } catch (e) { return { matched: false, expected: templateHeaders(kind) }; }
   for (const sn of wb.SheetNames.slice(0, 5)) {
-    const grid = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, blankrows: false });
+    // blankrows must stay TRUE (the default) — sheet_to_json with false
+    // DELETES blank rows from the array rather than leaving an empty [] at
+    // their position, which shifts every later index out from under the
+    // real sheet row it came from. The template ships with ~2,500 blank
+    // rows before TOTAL specifically so a real file can carry that many
+    // batch lines; compacting them made TOTAL (and anything genuinely past
+    // it) report the wrong row number — "row 474" for a row that is
+    // actually row 2997. Blank rows are still never reported as rejections
+    // (see the blank-row skip just below); this only fixes their address.
+    const grid = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, blankrows: true });
     for (let h = 0; h < Math.min(grid.length, 15); h++) {
       const hdr = (grid[h] || []).map(c => String(c == null ? '' : c).trim());
       const col = {};
@@ -3498,6 +3507,12 @@ function readTemplate(buf, kind) {
       for (let r = h + 1; r < grid.length; r++) {
         const row = grid[r] || [];
         const sheetRow = r + 1;
+        // a fully empty row is just template space (the ~2,500-row gap
+        // before TOTAL), never a rejected data row — it is silently ignored,
+        // not counted in fileRows and never shown as "no product name".
+        // Anything with SOME content but no name is a real anomaly and
+        // still falls through to that rejection below.
+        if (row.every(c => c === undefined || c === null || String(c).trim() === '')) continue;
         const name = S(row[col.name], 150).trim();
         /* whatever this template's columns hold for this row, captured ONCE up
            front — so a rejected row can be handed back with its original

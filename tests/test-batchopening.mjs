@@ -284,5 +284,49 @@ console.log('— named-batch sales: consumes the NAMED batch, FEFO still works w
   ok(before.nr === 10 && after.nr === 999, 'and the recomputed ledger actually reflects the new rate — the cache did not serve a stale lot', JSON.stringify({ before: before.nr, after: after.nr }));
 }
 
+console.log('— row numbers reported to the user are the REAL sheet address, not a count of non-blank rows —');
+{
+  // a real template ships with thousands of blank rows before TOTAL (so a
+  // real multi-batch file has room to grow into). sheet_to_json's
+  // blankrows:false used to DELETE those blank rows from the array rather
+  // than leaving a gap, which shifted every later index — TOTAL at real row
+  // 3002 was reported as row 5 (its position among non-blank rows). Proven
+  // here with a hand-built file that has real data both BEFORE and AFTER a
+  // 50-row blank gap, plus a row with content but no name in the middle of
+  // a second gap, so every category (real row, blank row, anomalous row,
+  // TOTAL) gets its own true address checked.
+  const hdr = ['Product name', 'Opening stock (strips)', 'Net rate — single strip (incl. GST)', 'MRP — single strip'];
+  const rows = new Array(105).fill(null).map(() => []);
+  rows[0] = ['Row Alpha', 10, 5, 8];       // sheet row 2
+  rows[1] = ['Row Beta', 20, 6, 9];        // sheet row 3
+  // rows[2..51] stay blank — 50 blank rows (sheet rows 4-53)
+  rows[52] = ['', 7, 1, 2];                // sheet row 54 — content, no name
+  rows[53] = ['Row Gamma', 5, 3, 4];       // sheet row 55
+  // rows[54..103] stay blank — 50 more blank rows (sheet rows 56-105)
+  rows[104] = ['TOTAL', '', '', ''];       // sheet row 106
+  const ws = XLSX.utils.aoa_to_sheet([hdr, ...rows]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Opening stock');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+  const fd = new FormData(); fd.append('file', new Blob([buf]), 'gaps.xlsx');
+  const up = await fetch(`${B}/parse/stock?hid=${HID}`, { method: 'POST', headers: { cookie: adm.cookie() }, body: fd });
+  const data = await up.json();
+  ok(up.status === 200 && data.source === 'template', 'the hand-built file with real gaps still matches the template', JSON.stringify(data.error || data.source));
+
+  const byName = Object.fromEntries(data.items.map(i => [i.name, i.row]));
+  ok(byName['Row Alpha'] === 2 && byName['Row Beta'] === 3, 'rows before the gap keep their true row numbers (2, 3)', JSON.stringify(byName));
+  ok(byName['Row Gamma'] === 55, 'a row AFTER a 50-row blank gap reports its true row number (55), not row 4 (its position among non-blank rows)', byName['Row Gamma']);
+
+  const noName = data.skipped.find(s => /no product name/i.test(s.reason));
+  ok(noName && noName.row === 54, 'a row with real content but no name is still flagged, at ITS true row (54) — blank rows around it are invisible, not miscounted into its address', JSON.stringify(noName));
+
+  const total = data.skipped.find(s => s.name === 'TOTAL');
+  ok(total && total.row === 106, 'TOTAL is reported at its true row (106), not row 5 (its position among the 4 non-blank rows seen before it)', JSON.stringify(total));
+
+  ok(data.fileRows === 5, 'fileRows counts only the 5 real rows (2 + anomaly + Gamma + TOTAL) — the 100 blank rows are never counted at all', data.fileRows);
+  ok(data.items.length === 3 && data.skipped.length === 2, 'reconciliation holds: 3 imported + 2 skipped = fileRows(5)', JSON.stringify({ items: data.items.length, skipped: data.skipped.length }));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

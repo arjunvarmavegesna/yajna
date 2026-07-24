@@ -94,6 +94,12 @@ console.log('— uploading the fresh, UNMODIFIED template: exactly 4 real rows, 
   ok(data.fileRows === 5 && data.items.length === 4 && data.skipped.length === 1, 'reconciliation: fileRows(5) = imported(4) + skipped(1) — the TOTAL row is the +1', JSON.stringify({ fileRows: data.fileRows, imported: data.items.length, skipped: data.skipped.length }));
   ok(data.ignored === 1, 'and it is counted as an IGNORED row (noise, not a data problem), not a real rejection', data.ignored);
   ok(data.skipped[0].name === 'TOTAL' && /total row/i.test(data.skipped[0].reason), 'the skip reason names it for what it is', JSON.stringify(data.skipped[0]));
+  // the TOTAL row's reported address must be its REAL row in the sheet
+  // (3002, past ~2,500 blank rows) — not a count of non-blank rows seen so
+  // far (which would read 5). Opening a real file at "row 5" to find TOTAL
+  // sitting at row 3002 is exactly the bug this pins.
+  ok(data.skipped[0].row === 3002, 'TOTAL is reported at its real sheet row, not the position among non-blank rows processed', data.skipped[0].row);
+  ok(data.items.every(i => i.row >= 2 && i.row <= 5), 'the 4 real rows keep their own true row numbers too (2–5)', JSON.stringify(data.items.map(i => i.row)));
   const byName = Object.fromEntries(data.items.map(i => [i.name, i]));
   ok(byName['Tab. Rifaximin 550']?.qty === 120, 'plain strips row reads correctly', byName['Tab. Rifaximin 550']?.qty);
   ok(byName['Tab. Sample Combo 10']?.qty === 10.3, 'full strips + loose tablets sums to a part strip, 10.3', byName['Tab. Sample Combo 10']?.qty);
