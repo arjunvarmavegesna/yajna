@@ -49,9 +49,9 @@ let templateBuf;
   templateBuf = Buffer.from(await r.arrayBuffer());
   const wb = XLSX.read(templateBuf, { type: 'buffer', cellFormula: true });
   const ws = wb.Sheets['Opening stock'];
-  ok(ws['!ref'] === 'A1:K1002', 'the sheet reports its full range through the TOTAL row', ws['!ref']);
+  ok(ws['!ref'] === 'A1:M3002', 'the sheet reports its full range through the TOTAL row — M for the appended Batch/Expiry columns, 3002 for headroom over multi-batch files', ws['!ref']);
 
-  ok(ws['A1002'] && ws['A1002'].v === 'TOTAL' && !ws['A1002'].f, 'the TOTAL row\'s name cell is a plain value — always readable even before any spreadsheet recalculates it', JSON.stringify(ws['A1002']));
+  ok(ws['A3002'] && ws['A3002'].v === 'TOTAL' && !ws['A3002'].f, 'the TOTAL row\'s name cell is a plain value — always readable even before any spreadsheet recalculates it', JSON.stringify(ws['A3002']));
 
   // the xlsx package's own reader drops a formula-only cell entirely (no
   // cached <v>, since this library never evaluates formulas) — so formula
@@ -64,9 +64,9 @@ let templateBuf;
   ok(/<c r="E2">/.test(sheetXml) && sheetXml.includes('C2+IF'), 'row 2\'s Total-strips cell is a live formula, not a static number', sheetXml.match(/<c r="E2"[^]*?<\/c>/)?.[0]);
   ok(sheetXml.includes('E2*F2'), 'row 2\'s Value-at-cost cell derives from Total-strips × net rate');
   ok(sheetXml.includes('E5*G5'), 'row 5\'s (the vial) Value-at-MRP cell is a formula too');
-  ok(sheetXml.includes('SUM(J2:J1000)'), 'the TOTAL row sums Value-at-cost over a generous row range');
-  ok(sheetXml.includes('SUM(K2:K1000)'), 'and Value-at-MRP the same way');
-  ok(sheetXml.includes('COUNTA(A2:A1000)'), 'and a product count, from the same kind of range');
+  ok(sheetXml.includes('SUM(J2:J3000)'), 'the TOTAL row sums Value-at-cost over a generous row range');
+  ok(sheetXml.includes('SUM(K2:K3000)'), 'and Value-at-MRP the same way');
+  ok(sheetXml.includes('COUNTA(A2:A3000)'), 'and a batch-line count, from the same kind of range — batches, not products, since one product can now span several rows');
 
   // the safety property: NOTHING is touched between row 5 and row 1002 — a
   // fresh, never-recalculated read must show only the header + 4 examples +

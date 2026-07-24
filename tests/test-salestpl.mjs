@@ -55,7 +55,8 @@ ok(/spreadsheetml/.test(res.headers.get('content-type') || ''), 'with the right 
 const tplWb = XLSX.read(tplBuf, { type: 'buffer' });
 ok(tplWb.SheetNames.includes('Sales') && tplWb.SheetNames.includes('How to fill'), 'with a Sales sheet and instructions', tplWb.SheetNames.join(','));
 const tplHdr = XLSX.utils.sheet_to_json(tplWb.Sheets.Sales, { header: 1 })[0];
-ok(tplHdr.length === 13, 'thirteen columns — strips, loose tablets, and six read-only helpers (total strips + per-piece rates + margin figures)', tplHdr.join('|'));
+ok(tplHdr.length === 14, 'fourteen columns — strips, loose tablets, six read-only helpers (total strips + per-piece rates + margin figures), and an optional batch column', tplHdr.join('|'));
+ok(/batch/i.test(tplHdr[13]), 'batch is the last column, optional — named-batch sales consume that batch, blank falls back to FEFO', tplHdr[13]);
 ok(/product/i.test(tplHdr[0]) && /pack/i.test(tplHdr[1]) && /qty.*strips/i.test(tplHdr[2]) && /qty.*tablets/i.test(tplHdr[3]) && /total strips/i.test(tplHdr[4]) && /net rate/i.test(tplHdr[5]) && /mrp/i.test(tplHdr[6]),
    'product / pack / qty strips / qty tablets / » total strips / net rate / MRP', tplHdr.join(' | '));
 ok(/auto — do not fill/i.test(tplHdr[4]), 'the total-strips helper says do not fill');

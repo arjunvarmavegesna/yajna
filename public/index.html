@@ -575,7 +575,7 @@ const RTV_STATUS = ['Pending','Received','Disputed'];
 const BOUNCE_MOLECULES = {'Tab. Rifaximin 550':'Rifaximin','Inj. Pantoprazole 40':'Pantoprazole','Syp. Lactulose 200ml':'Lactulose','Tab. UDCA 300':'Ursodeoxycholic acid','Inj. Ceftriaxone 1g':'Ceftriaxone','Tab. Ecosprin AV 75':'Aspirin + Atorvastatin','Inj. Ondansetron 4mg':'Ondansetron','Cap. Pregabalin 75':'Pregabalin','Tab. Metformin 500':'Metformin','Inj. Tramadol 50':'Tramadol'};
 
 /* ---------------- db (populated from server in live mode, seeded in demo) ---------------- */
-const db = { hospitals:{}, dailyData:{}, vendors:{}, payments:{}, users:{}, userList:[], notifications:[], reportPrefs:{}, hvTracked:{}, items:{}, adjustments:{}, pendingItems:{}, aliases:{}, offers:{}, offerActions:{}, receivables:{}, recvActions:{}, snapshots:{}, periodData:{}, adjReasons:[], bounceReasons:[], bounceActions:[], cashVarThreshold:100, partyTypes:[], receiptModes:[], overrideValues:[], adjThreshold:5000, overrideMaxDays:45, overrideDefaultDays:15 };
+const db = { hospitals:{}, dailyData:{}, vendors:{}, payments:{}, users:{}, userList:[], notifications:[], reportPrefs:{}, hvTracked:{}, items:{}, openingBatches:{}, adjustments:{}, pendingItems:{}, aliases:{}, offers:{}, offerActions:{}, receivables:{}, recvActions:{}, snapshots:{}, periodData:{}, adjReasons:[], bounceReasons:[], bounceActions:[], cashVarThreshold:100, partyTypes:[], receiptModes:[], overrideValues:[], adjThreshold:5000, overrideMaxDays:45, overrideDefaultDays:15 };
 
 /* weekly / monthly manual report-section data */
 function periodGet(hid, ptype, pkey){
@@ -716,12 +716,43 @@ function salesStockImpact(hid, rows){
     if(cur - b.qty < -0.0000001){ negative.push({name:b.name, have:cur, selling:b.qty}); return; }
     clean.push(b.name);
   });
+
+  /* Named batches get a SEPARATE, ADDITIONAL check — never instead of the
+     item-level one above. The item-level check alone can miss a row that
+     names a real but wrong or depleted batch on an otherwise well-stocked
+     product; this check alone would miss a cumulative oversell spread across
+     several unnamed rows. Both run, independently. */
+  const batchNotFound=[], batchInsufficient=[];
+  const byItemBatch = new Map();
+  rows.forEach(r=>{
+    const bn = String(r.batch||'').trim();
+    if(!bn || RESERVED_BATCH.has(bn.toLowerCase())) return;
+    const it = findItem(hid, r.item);
+    if(!it) return;   // already reported via notFound above
+    const k = it.key+'|'+bn.toLowerCase();
+    if(!byItemBatch.has(k)) byItemBatch.set(k, {name:r.item, batch:bn, key:it.key, qty:0});
+    byItemBatch.get(k).qty += num(r.qty);
+  });
+  if(byItemBatch.size){
+    const lotByKeyBatch = {};
+    snap.batches.forEach(b=>{
+      const bk = b.key+'|'+String(b.batchNo||'').trim().toLowerCase();
+      lotByKeyBatch[bk] = (lotByKeyBatch[bk]||0) + b.qty;
+    });
+    byItemBatch.forEach(b=>{
+      const bk = b.key+'|'+b.batch.toLowerCase();
+      const have = lotByKeyBatch[bk];
+      if(have===undefined){ batchNotFound.push({name:b.name, batch:b.batch}); return; }
+      if(have - b.qty < -0.0000001) batchInsufficient.push({name:b.name, batch:b.batch, have, selling:b.qty});
+    });
+  }
+
   return {
     noBaseline:false,
     stockNowItems: snap.items.length, stockNowValue: snap.valueNr,
     reportItems: byItem.size, reportStrips, reportCogs: cogs,
     stockAfterValue: snap.valueNr - cogs,
-    notFound, negative, clean
+    notFound, negative, clean, batchNotFound, batchInsufficient
   };
 }
 function renderStockImpact(impact){
@@ -738,9 +769,11 @@ function renderStockImpact(impact){
       <div class="kpi"><div class="l">This report sells</div><div class="v num" style="font-size:16px">${impact.reportItems} items · ${fmtQ(impact.reportStrips)} strips</div><div class="d">${fmtRs(impact.reportCogs)} at cost</div></div>
     </div>
     <p class="mini-note" style="margin:0 0 8px"><b>Stock after: ${impact.stockNowItems} items · ${fmtRs(impact.stockAfterValue)} at cost</b> <span style="color:var(--faint)">(${fmtN(impact.stockNowValue)} − ${fmtN(impact.reportCogs)} = ${fmtN(impact.stockAfterValue)})</span></p>
-    <p class="mini-note"><b>${adjusted} item${adjusted===1?'':'s'} adjusted</b>${impact.notFound.length? ` · <span style="color:var(--red)">${impact.notFound.length} not found in inventory — nothing deducted</span>`:''}${impact.negative.length? ` · <span style="color:var(--red)">${impact.negative.length} would go negative</span>`:''}</p>
+    <p class="mini-note"><b>${adjusted} item${adjusted===1?'':'s'} adjusted</b>${impact.notFound.length? ` · <span style="color:var(--red)">${impact.notFound.length} not found in inventory — nothing deducted</span>`:''}${impact.negative.length? ` · <span style="color:var(--red)">${impact.negative.length} would go negative</span>`:''}${impact.batchNotFound&&impact.batchNotFound.length? ` · <span style="color:var(--red)">${impact.batchNotFound.length} named batch${impact.batchNotFound.length===1?'':'es'} not found</span>`:''}${impact.batchInsufficient&&impact.batchInsufficient.length? ` · <span style="color:var(--red)">${impact.batchInsufficient.length} named batch${impact.batchInsufficient.length===1?'':'es'} short of stock</span>`:''}</p>
     ${impact.notFound.length? `<p class="mini-note" style="color:var(--red)">Not on the Item Master, so the sale records but nothing comes off any real shelf: ${impact.notFound.slice(0,8).map(esc).join(', ')}${impact.notFound.length>8?`, +${impact.notFound.length-8} more`:''}. Fix the name (a typo, or add it to the Item Master) and re-read.</p>`:''}
-    ${impact.negative.length? `<p class="mini-note" style="color:var(--red)">Would go negative — a symptom of a missed purchase or a short opening count, not just a low stock level: ${impact.negative.slice(0,8).map(n=>`${esc(n.name)} (has ${fmtQ(n.have)}, selling ${fmtQ(n.selling)})`).join(', ')}${impact.negative.length>8?`, +${impact.negative.length-8} more`:''}.</p>`:''}`;
+    ${impact.negative.length? `<p class="mini-note" style="color:var(--red)">Would go negative — a symptom of a missed purchase or a short opening count, not just a low stock level: ${impact.negative.slice(0,8).map(n=>`${esc(n.name)} (has ${fmtQ(n.have)}, selling ${fmtQ(n.selling)})`).join(', ')}${impact.negative.length>8?`, +${impact.negative.length-8} more`:''}.</p>`:''}
+    ${impact.batchNotFound&&impact.batchNotFound.length? `<p class="mini-note" style="color:var(--red)">Named a batch that doesn't exist on record — the sale records, but not against that lot: ${impact.batchNotFound.slice(0,8).map(n=>`${esc(n.name)} (batch "${esc(n.batch)}")`).join(', ')}${impact.batchNotFound.length>8?`, +${impact.batchNotFound.length-8} more`:''}. Check the batch number, or leave it blank to fall back to first-expiry-first-out.</p>`:''}
+    ${impact.batchInsufficient&&impact.batchInsufficient.length? `<p class="mini-note" style="color:var(--red)">The named batch exists but doesn't have enough left — a real signal about the count or the billing, not just guessed away: ${impact.batchInsufficient.slice(0,8).map(n=>`${esc(n.name)} batch "${esc(n.batch)}" (has ${fmtQ(n.have)}, selling ${fmtQ(n.selling)})`).join(', ')}${impact.batchInsufficient.length>8?`, +${impact.batchInsufficient.length-8} more`:''}.</p>`:''}`;
 }
 const MARGIN_TOL = 2; // percentage points, mirrors the server
 
@@ -1218,7 +1251,7 @@ function applyBootstrap(b){
   db.hospitals = b.hospitals||{}; db.vendors = b.vendors||{}; db.payments = b.payments||{};
   db.dailyData = b.dailyData||{}; db.notifications = b.notifications||[];
   db.reportPrefs = b.reportPrefs||{}; db.hvTracked = b.hvTracked||{};
-  db.items = b.items||{}; db.periodData = b.periodData||{};
+  db.items = b.items||{}; db.openingBatches = b.openingBatches||{}; db.periodData = b.periodData||{};
   db.adjustments = b.adjustments||{}; db.adjReasons = b.adjReasons||[];
   db.offers = b.offers||{}; db.offerActions = b.offerActions||{};
   db.pendingItems = b.pendingItems||{}; db.aliases = b.aliases||{};
@@ -1231,7 +1264,7 @@ function applyBootstrap(b){
   Object.keys(db.hospitals).forEach(h=>{
     db.vendors[h]=db.vendors[h]||[]; db.payments[h]=db.payments[h]||[];
     db.dailyData[h]=db.dailyData[h]||{}; db.hvTracked[h]=db.hvTracked[h]||[];
-    db.reportPrefs[h]=db.reportPrefs[h]||{}; db.items[h]=db.items[h]||[]; db.adjustments[h]=db.adjustments[h]||[]; db.offers[h]=db.offers[h]||[]; db.offerActions[h]=db.offerActions[h]||[]; db.pendingItems[h]=db.pendingItems[h]||[]; db.aliases[h]=db.aliases[h]||[]; db.receivables[h]=db.receivables[h]||[]; db.recvActions[h]=db.recvActions[h]||[]; db.snapshots[h]=db.snapshots[h]||[];
+    db.reportPrefs[h]=db.reportPrefs[h]||{}; db.items[h]=db.items[h]||[]; db.openingBatches[h]=db.openingBatches[h]||[]; db.adjustments[h]=db.adjustments[h]||[]; db.offers[h]=db.offers[h]||[]; db.offerActions[h]=db.offerActions[h]||[]; db.pendingItems[h]=db.pendingItems[h]||[]; db.aliases[h]=db.aliases[h]||[]; db.receivables[h]=db.receivables[h]||[]; db.recvActions[h]=db.recvActions[h]||[]; db.snapshots[h]=db.snapshots[h]||[];
     db.periodData[h]=db.periodData[h]||{weekly:{},monthly:{}};
   });
 }
@@ -1520,7 +1553,10 @@ function ledgerSig(hid){
   const adj = hashStr((db.adjustments[hid]||[]).map(a=> a.id+':'+a.qty+':'+a.reason+':'+a.date+':'+a.key).join(','));
   // a new alias re-routes old purchase lines to the real item — the ledger must rebuild
   const al = hashStr((db.aliases[hid]||[]).map(a=> a.aliasKey+'>'+a.itemId).join(','));
-  return `${n}:${saved}:${(db.items[hid]||[]).length}:${iv}:${adj}:${al}:${stockDateOf(hid)}:${issueMethodOf(hid)}`;
+  // hashed by CONTENT like adjustments — a batch's qty/rate/exp can change
+  // (a correction, a reload) without the count of batches changing at all
+  const ob = hashStr((db.openingBatches[hid]||[]).map(b=> b.id+':'+b.qty+':'+b.nr+':'+b.mrp+':'+b.batch+':'+b.exp).join(','));
+  return `${n}:${saved}:${(db.items[hid]||[]).length}:${iv}:${adj}:${al}:${ob}:${stockDateOf(hid)}:${issueMethodOf(hid)}`;
 }
 const monthEndOf = (ym)=>{ const [y,m] = ym.split('-').map(Number); return new Date(Date.UTC(y, m, 0)).toISOString().slice(0,10); };
 const ISSUE_ORDER_LABEL = {fefo:'FEFO — first expiry, first out', fifo:'FIFO — first in, first out'};
@@ -1541,7 +1577,15 @@ const snapshotFor = (hid, asOf) => snapshotsFor(hid).find(s=> s.asOf<=asOf) || n
 const hasExpiryData = hid => snapshotsFor(hid).length > 0;
 /* What matters at a given date is whether a report COVERS it — a hospital can
    have reports and still have none on or before the date being looked at. */
-const hasExpiryOn = (hid, asOf) => !!snapshotFor(hid, asOf);
+/* Expiry no longer has to wait on a separate uploaded report — once real
+   batch/expiry data exists on the ledger's own lots (opening batches loaded
+   with an expiry column, or purchase lines carrying one), that is real
+   expiry data too. A snapshot still takes precedence wherever one actually
+   covers the date (unchanged behavior, and it can carry a rate the ledger
+   doesn't); the ledger is only ever the fallback for a date no snapshot
+   reaches. */
+const ledgerHasExpiryOn = (hid, asOf) => stockLedger(hid).lots.some(l=> l.exp && l.received<=asOf);
+const hasExpiryOn = (hid, asOf) => !!snapshotFor(hid, asOf) || ledgerHasExpiryOn(hid, asOf);
 
 /* The snapshot as it applies to a date, with each row's cost basis: the report's
    own rate when it prints one, else the Item Master's. Never MRP — an expiry
@@ -1583,6 +1627,14 @@ function snapReconcile(hid, asOf){
     withExpiry: rows.filter(r=>r.expiry).length, withBatch: rows.filter(r=>r.batch).length};
 }
 
+// labels the app itself mints for an unidentified/oversold lot, plus the
+// placeholder characters a real export uses for "blank" — a batch column
+// value that happens to be one of these is not a real user batch number, so
+// it is treated as "no batch named" (falls back to FEFO) rather than chased
+// as a real one. Shared by the ledger's own draw() and by the preview-time
+// salesStockImpact() check, so the two can never disagree about what counts
+// as "no batch entered".
+const RESERVED_BATCH = new Set(['opening','unsourced','—','-','n/a','na']);
 function stockLedger(hid){
   const sig = ledgerSig(hid);
   if(_ledgerCache[hid] && _ledgerCache[hid].sig===sig) return _ledgerCache[hid];
@@ -1597,9 +1649,23 @@ function stockLedger(hid){
   };
   const move = (date, lot, type, qty, ref, by)=> movements.push({date, bkey:lot.bkey, key:lot.key, type, qty, ref:ref||'', by:by||''});
 
-  // opening stock predates any batch data — synthetic OPENING lot, no expiry.
-  // The weakest link in any historical valuation, so it stays flagged.
+  /* Opening stock is batch-wise: each row in db.openingBatches becomes its
+     own lot with its own frozen cost/exp — nothing averaged or flattened.
+     A product with NO batch rows on file yet (data loaded before this
+     existed, or a pharmacy that never supplied batch data) falls back to
+     the old single-synthetic-lot behavior straight from items.openingQty —
+     so nothing already live regresses to zero stock the moment this ships. */
+  const batchedKeys = new Set();
+  (db.openingBatches[hid]||[]).forEach(b=>{
+    const q = num(b.qty); if(q<=0) return;
+    batchedKeys.add(b.key);
+    const l = addLot({key:b.key, name:b.name, batchNo: b.batch||'OPENING', exp: b.exp||null, nr:num(b.nr), mrp:num(b.mrp),
+      received: b.stockDate||from, synthetic: b.batch? null : 'opening', src:'Opening stock load'});
+    l.remaining = q; l.qtyReceived = q;
+    move(l.received, l, 'opening', q, 'Opening stock load');
+  });
   (db.items[hid]||[]).forEach(it=>{
+    if(batchedKeys.has(it.key)) return;   // real batch data already covers this product
     const q = num(it.openingQty); if(q<=0) return;
     const l = addLot({key:it.key, name:it.name, batchNo:'OPENING', exp:null, nr:num(it.nr), mrp:num(it.mrp),
       received:from, synthetic:'opening', src:'Opening stock load'});
@@ -1616,7 +1682,7 @@ function stockLedger(hid){
       const q = calcLine(l).tqty;
       if(nameKey(l.item) && q>0) events.push({date:d, kind:'purchase', item:l.item, qty:q, line:l, inv});
     }));
-    (e.itemSales||[]).forEach(s=>{ if(nameKey(s.item) && num(s.qty)>0) events.push({date:d, kind:'sale', item:s.item, qty:num(s.qty), ref:'Marg GP report'}); });
+    (e.itemSales||[]).forEach(s=>{ if(nameKey(s.item) && num(s.qty)>0) events.push({date:d, kind:'sale', item:s.item, qty:num(s.qty), ref:'Marg GP report', batch:s.batch||''}); });
     (e.rtv||[]).forEach(r=>{ if(nameKey(r.drug) && num(r.qty)>0) events.push({date:d, kind:'rtv', item:r.drug, qty:num(r.qty), ref:(r.vendor||'RTV')+(r.reason?' — '+r.reason:'')}); });
   });
   (db.adjustments[hid]||[]).forEach(a=>{
@@ -1644,9 +1710,16 @@ function stockLedger(hid){
 
   const issues = {unbatched:0, noExpiry:0, unsourced:[]};
 
-  // pull `need` units out of `key` on `date`, oldest-expiring first
-  const draw = (key, date, need, type, ref, by, name)=>{
-    for(const lot of issueOrder(key, date)){
+  // pull `need` units out of `key` on `date`, oldest-expiring first. When
+  // wantBatch names a real batch, draw ONLY from lot(s) matching it — a sale
+  // that names its batch should consume THAT stock, never guess via FEFO.
+  const draw = (key, date, need, type, ref, by, name, wantBatch)=>{
+    const want = String(wantBatch||'').trim();
+    const usableWant = want && !RESERVED_BATCH.has(want.toLowerCase()) ? want : '';
+    const forWant = (all)=> usableWant
+      ? all.filter(l=> String(l.batchNo||'').trim().toLowerCase()===usableWant.toLowerCase())
+      : all;
+    for(const lot of forWant(issueOrder(key, date))){
       if(need<=0) break;
       if(lot.remaining<=0) continue;
       const take = Math.min(need, lot.remaining);
@@ -1655,13 +1728,16 @@ function stockLedger(hid){
     }
     if(need>0.0000001){
       // more went out than ever came in. NEVER clamp to zero — that hides the
-      // defect. The shortfall lands on a real lot so it carries a real cost.
-      const cands = issueOrder(key, date);
+      // defect. The shortfall lands on a real lot so it carries a real cost —
+      // the SAME named lot if one was named (letting it go negative, same as
+      // any other oversell), or the app's usual UNSOURCED fallback otherwise.
+      const cands = forWant(issueOrder(key, date));
       let lot = cands[cands.length-1];
       if(!lot){
         const m = master[key];
-        lot = addLot({key, name: name||(m?m.name:key), batchNo:'UNSOURCED', exp:null,
-          nr: m? num(m.nr):0, mrp: m? num(m.mrp):0, received:from, synthetic:'unsourced', src:'No receipt on record'});
+        lot = addLot({key, name: name||(m?m.name:key), batchNo: usableWant? `BATCH NOT FOUND: ${usableWant}` : 'UNSOURCED', exp:null,
+          nr: m? num(m.nr):0, mrp: m? num(m.mrp):0, received:from, synthetic:'unsourced',
+          src: usableWant? `Named batch "${usableWant}" not found` : 'No receipt on record'});
         lot.qtyReceived = 0;
         issues.unsourced.push(name||key);
       }
@@ -1707,7 +1783,7 @@ function stockLedger(hid){
         ev.adj.reason + (ev.adj.note? ' — '+ev.adj.note : ''), ev.adj.user, ev.adj.item);
       return;
     }
-    draw(key, ev.date, ev.qty, ev.kind, ev.ref, '', ev.item);
+    draw(key, ev.date, ev.qty, ev.kind, ev.ref, '', ev.item, ev.kind==='sale'? ev.batch : undefined);
   });
 
   const L = {sig, from, method, lots, movements, issues, master};
@@ -1799,6 +1875,38 @@ function rollupItems(hid, live, date){
   return Object.values(map).sort((a,b)=> a.name.localeCompare(b.name));
 }
 
+/* Keeps the Item Master's reference price current with whatever batches are
+   actually on the shelf right now, reusing rollupItems' OWN weighted-average
+   math (nrStrip/mrpStrip) — never a second, separate calculation that could
+   drift from what the Inventory tab already shows. Only pushes a change for
+   a product rollupItems computed a REAL average for (qPos>0) — a zero-stock
+   product's nrStrip/mrpStrip already equals its current nr/mrp (rollupItems'
+   own fallback), so it never shows up as a diff here: "last known price,
+   unchanged once stock hits zero" happens simply because nothing gets sent,
+   not because of a separate check. Called after anything that can change
+   stock; a missed sync is not fatal — the next such action retries it. */
+async function syncItemPrices(hid){
+  if(state.demo) return;
+  try{
+    const items = stockAsOf(hid, todayISO()).items;
+    const updates = [];
+    items.forEach(m=>{
+      if(!m.onMaster) return;
+      const it = (db.items[hid]||[]).find(x=>x.key===m.key);
+      if(!it) return;
+      const nrDiff = Math.abs(num(m.nrStrip) - num(it.nr)) > 0.005;
+      const mrpDiff = Math.abs(num(m.mrpStrip) - num(it.mrp)) > 0.005;
+      if(nrDiff || mrpDiff) updates.push({key:m.key, nr:+num(m.nrStrip).toFixed(2), mrp:+num(m.mrpStrip).toFixed(2)});
+    });
+    if(!updates.length) return;
+    const r = await api('/items/sync-prices', {method:'POST', body:{hid, updates}});
+    (r.updated||[]).forEach(u=>{
+      const it = (db.items[hid]||[]).find(x=>x.key===u.key);
+      if(it){ it.nr=u.nr; it.mrp=u.mrp; it.priceAsOf=u.priceAsOf; it.updatedAt=u.updatedAt; }
+    });
+  }catch(e){ /* not fatal — see comment above */ }
+}
+
 /* MODE B — movement between two dates. Everything is valued at the lot's own
    net rate: this is a cost ledger, so sales come out at NR, never at MRP.
    Opening is the value you START start_date with, i.e. the close of the day
@@ -1863,7 +1971,7 @@ const EXPIRY_BUCKETS = [
   {k:'b90', l:'31–90 days', d:'at risk — push or return', cls:'warn'},
   {k:'b180', l:'91–180 days', d:'watch', cls:''},
   {k:'healthy', l:'180+ days', d:'healthy', cls:'good'},
-  {k:'noexp', l:'No expiry recorded', d:'opening-load batches — flagged, not trusted', cls:'warn'}
+  {k:'noexp', l:'No expiry recorded', d:'no expiry on this batch — flagged, not trusted', cls:'warn'}
 ];
 function expiryBucketOf(b, asOf){
   const ex = b.expiry || b.exp;
@@ -1873,8 +1981,7 @@ function expiryBucketOf(b, asOf){
   const days = Math.round((new Date(e+'T12:00:00') - new Date(asOf+'T12:00:00'))/86400000);
   return days<=30? 'b30' : days<=90? 'b90' : days<=180? 'b180' : 'healthy';
 }
-function expiryBuckets(hid, asOf){
-  const {snap, rows} = snapRows(hid, asOf);
+function tallyExpiryRows(rows, asOf){
   const out = {}; EXPIRY_BUCKETS.forEach(b=> out[b.k] = {valueNr:0, qty:0, batches:[]});
   rows.filter(r=> r.qty>0).forEach(r=>{
     const k = expiryBucketOf(r, asOf);
@@ -1882,7 +1989,19 @@ function expiryBuckets(hid, asOf){
   });
   const total = Object.values(out).reduce((a,x)=>a+x.valueNr,0);
   EXPIRY_BUCKETS.forEach(b=> out[b.k].share = total>0? out[b.k].valueNr/total*100 : 0);
-  return {buckets:out, total, asOf, snap};
+  return {out, total};
+}
+function expiryBuckets(hid, asOf){
+  const {snap, rows} = snapRows(hid, asOf);
+  if(snap){
+    // an uploaded report covers this date — same precedence as always
+    const {out, total} = tallyExpiryRows(rows, asOf);
+    return {buckets:out, total, asOf, snap, source:'snapshot'};
+  }
+  // no report covers this date — fall back to the ledger's own lots, which
+  // now carry real .exp from opening batches and purchase lines directly
+  const {out, total} = tallyExpiryRows(stockAsOf(hid, asOf).live, asOf);
+  return {buckets:out, total, asOf, snap:null, source:'ledger'};
 }
 
 /* Expiring AND not selling — the highest-priority list there is: stock that is
@@ -1895,12 +2014,19 @@ function nonMoving(hid, asOf, days){
   L.movements.forEach(m=>{ if(m.type==='sale' && m.date>cut && m.date<=asOf) soldSince.add(m.key); });
   return s.items.filter(i=> i.stock>0 && !soldSince.has(i.key));
 }
+/* the expiring buckets, as flat rows — same source precedence as
+   expiryBuckets (report when one covers the date, else the ledger's own
+   lots), field names normalized to batchNo/exp either way since a snapshot
+   row's own fields are named batch/expiry, not batchNo/exp */
+function expiringRows(hid, asOf){
+  const eb = expiryBuckets(hid, asOf);
+  return ['expired','b30','b90'].flatMap(k=> eb.buckets[k].batches)
+    .map(r=> ({...r, batchNo: r.batchNo || r.batch || '', exp: r.exp || r.expiry || null}));
+}
 function expiringNonMoving(hid, asOf){
   // their expiry × our sale movements — neither system knows this on its own
   const nm = new Set(nonMoving(hid, asOf, 90).map(i=>i.key));
-  return snapRows(hid, asOf).rows
-    .filter(r=> r.qty>0 && nm.has(r.key) && ['expired','b30','b90'].includes(expiryBucketOf(r, asOf)))
-    .sort((a,b)=> b.valueNr-a.valueNr);
+  return expiringRows(hid, asOf).filter(r=> nm.has(r.key)).sort((a,b)=> b.valueNr-a.valueNr);
 }
 
 /* kept for the alerting/adjust paths that only ever ask about today */
@@ -2871,6 +2997,7 @@ function removeSalesConfirmModal(e){
       (r.notifications||[]).forEach(n=> db.notifications.unshift(n));
       closeModal();
       toast(`Sales removed — ${r.removal.itemsCount} row${r.removal.itemsCount===1?'':'s'}, ${fmtRs(r.removal.costValue)} at cost`, 'green');
+      syncItemPrices(hid);   // the stock those sales drew down just came back
       renderEntry();
     }catch(err){ toast(err.message,'red'); btn.disabled=false; btn.textContent='Remove sales'; }
   };
@@ -3261,7 +3388,7 @@ function purchaseUploadModal(e, locked){
           <input class="in" id="puInvNo" placeholder="As printed on the bill"></div>
       </div>
       <div class="field"><label>Filled purchase template (Excel)</label><input class="in" type="file" id="puFile" accept=".xls,.xlsx"></div>
-      <div id="puPrev"><p class="mini-note">Seven inputs per line — Item, Purchase Qty (strips), Offer Qty, Rate ₹, Vendor Disc %, GST %, MRP ₹. Everything else is derived.</p></div>
+      <div id="puPrev"><p class="mini-note">Seven inputs per line — Item, Purchase Qty (strips), Offer Qty, Rate ₹, Vendor Disc %, GST %, MRP ₹ — plus optional Batch No. and Expiry, printed on the vendor's invoice. Everything else is derived.</p></div>
     </div>
     <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn" id="puParse">Read file</button><button class="btn btn-primary" id="puGo" disabled>Add to day</button></div>`, {lg:true});
   $('#puTpl').onclick = ()=> downloadTemplate('purchase', 'Purchase upload');
@@ -3275,7 +3402,7 @@ function purchaseUploadModal(e, locked){
       <p class="mini-note">${esc(parsed.note||'')}</p>
       ${masterMatchBanner(state.hospital, rows.map(l=>l.item))}
       <div class="tbl-scroll" style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:7px"><table class="tbl">
-        <thead><tr><th>Item</th><th class="r">Purchase qty</th><th class="r">Offer</th><th class="r">Rate</th><th class="r">Disc%</th><th class="r">GST%</th><th class="r">MRP</th><th class="r" title="Billed amount ÷ total qty — computed by the app, never read from the sheet">Net rate</th><th class="r">Margin %</th><th></th></tr></thead>
+        <thead><tr><th>Item</th><th class="r">Purchase qty</th><th class="r">Offer</th><th class="r">Rate</th><th class="r">Disc%</th><th class="r">GST%</th><th class="r">MRP</th><th class="r" title="Billed amount ÷ total qty — computed by the app, never read from the sheet">Net rate</th><th class="r">Margin %</th><th>Batch</th><th>Expiry</th><th></th></tr></thead>
         <tbody>${rows.slice(0,200).map(l=>{
           const d = calcLine(l);
           const st = lineStatus(state.hospital, l);
@@ -3286,6 +3413,8 @@ function purchaseUploadModal(e, locked){
             <td class="r num">${r2(d.rate)}</td><td class="r num">${d.disc||'—'}</td><td class="r num">${d.gst||'—'}</td><td class="r num">${r2(d.mrp)}</td>
             <td class="r num" style="font-weight:600">${r2(d.nr)}</td>
             <td class="r num" style="font-weight:700;color:${marginCol(st.status)}">${pct(d.marginPct)}</td>
+            <td style="color:var(--muted);font-size:12px">${esc(l.batch||'—')}</td>
+            <td style="color:var(--muted);font-size:12px">${esc(l.exp||'—')}</td>
             <td>${marginChip(st.status)}</td></tr>`;
         }).join('')}</tbody></table></div>
       <p class="mini-note">${rows.length} line${rows.length===1?'':'s'} · ${fmtQ(totals.tq)} strips in · purchase value ${fmtRs(totals.amt)} — all under <b>${esc($('#puVendor').value.trim())}</b>.</p>
@@ -3351,7 +3480,7 @@ function gpUploadModal(e, locked){
     <div class="modal-head"><h3>Upload the day's sales</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
       <div class="lock-note" style="margin-bottom:12px">
-        <div><b>Use the Yajna template for the cleanest read.</b> It has the four columns the margin needs — product, qty in strips, cost price including GST, and MRP — and it is read by matching the column headings, so nothing is guessed. A Marg export in any other shape still works; it goes through the AI reader instead.</div>
+        <div><b>Use the Yajna template for the cleanest read.</b> It has the four columns the margin needs — product, qty in strips, cost price including GST, and MRP — plus an optional batch column: if the report names which batch was billed, the sale draws down that exact lot instead of guessing. It is read by matching the column headings, so nothing is guessed. A Marg export in any other shape still works; it goes through the AI reader instead.</div>
         <button class="btn btn-sm" id="gpTpl" style="margin-left:auto;flex:none">${IC.dl} Download template</button>
       </div>
       ${(e.itemSales&&e.itemSales.length)? `<p class="mini-note" style="color:var(--amber)">⚠ This day already has ${e.itemSales.length} row${e.itemSales.length===1?'':'s'} loaded${e.sales.fileName? ` from <b>${esc(e.sales.fileName)}</b>`:''}. Uploading here will <b>replace</b> them, not add to them.</p>`:''}
@@ -3382,11 +3511,11 @@ function gpUploadModal(e, locked){
         ${impact? renderStockImpact(impact) : ''}
         <p class="mini-note">${esc(parsed.note||'')}</p>
         ${masterMatchBanner(state.hospital, items.map(r=>r.item))}
-        ${priced.length? `<table class="tbl"><thead><tr><th>Item</th><th>Pack</th><th class="r">Qty</th><th class="r">Net rate</th><th class="r">MRP</th><th class="r">Margin %</th><th></th></tr></thead>
+        ${priced.length? `<table class="tbl"><thead><tr><th>Item</th><th>Pack</th><th class="r">Qty</th><th class="r">Net rate</th><th class="r">MRP</th><th class="r">Margin %</th><th>Batch</th><th></th></tr></thead>
           <tbody>${priced.slice(0,8).map(r=>{
             const mp = num(r.mrp)>0? (num(r.mrp)-num(r.nr))/num(r.mrp)*100 : 0;
             const st = lineStatus(state.hospital, {item:r.item, pqty:1, oqty:0, rate:num(r.nr), disc:0, gst:0, mrp:num(r.mrp)});
-            return `<tr ${unmatchedRowStyle(state.hospital, r.item)}><td>${esc(r.item)}${findItem(state.hospital,r.item)?'':' <span class="chip chip-amber" style="font-size:10px">not on Item Master</span>'}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${srcQtyCell(r, units)}</td><td class="r num">${r2(r.nr)}</td><td class="r num">${r2(r.mrp)}</td><td class="r num" style="font-weight:700;color:${marginCol(st.status)}">${pct(mp)}</td><td>${marginChip(st.status)}</td></tr>`;
+            return `<tr ${unmatchedRowStyle(state.hospital, r.item)}><td>${esc(r.item)}${findItem(state.hospital,r.item)?'':' <span class="chip chip-amber" style="font-size:10px">not on Item Master</span>'}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${srcQtyCell(r, units)}</td><td class="r num">${r2(r.nr)}</td><td class="r num">${r2(r.mrp)}</td><td class="r num" style="font-weight:700;color:${marginCol(st.status)}">${pct(mp)}</td><td style="color:var(--muted);font-size:12px">${esc(r.batch||'—')}</td><td>${marginChip(st.status)}</td></tr>`;
           }).join('')}</tbody></table>
           <p class="mini-note">${priced.length>8? `First 8 of ${priced.length} priced rows. `:''}Margin % is <b>(MRP − net rate) ÷ MRP</b> — a ratio, so the strip size never enters it. It only needs both rates on the same basis, and they are: both per strip.</p>`
           : (items.length? '<p class="mini-note">These rows carry no cost price, so only the day\'s totals can be filled — not the per-item margin.</p>':'')}
@@ -3422,7 +3551,7 @@ function gpUploadModal(e, locked){
       // rows and totals move together, or neither moves, so they physically cannot disagree
       e.itemSales = rows.map(r=>({
         item:r.item, qty:num(r.qty), amount:num(r.amount),
-        pack:r.pack||'', nr:num(r.nr), mrp:num(r.mrp), cost:num(r.cost)
+        pack:r.pack||'', nr:num(r.nr), mrp:num(r.mrp), cost:num(r.cost), batch:r.batch||''
       }));
       e.sales.mrp = Math.round(e.itemSales.reduce((a,r)=>a+num(r.amount),0)*100)/100;
       e.sales.cogs = Math.round(e.itemSales.reduce((a,r)=>a+num(r.cost),0)*100)/100;
@@ -3531,6 +3660,7 @@ async function saveEntry(e){
     const nv = (r.vendorsAdded||[]).length, ni = (r.itemsAdded||[]).length;
     toast('Saved & synced — ' + db.hospitals[hid].name + (nv? ` · ${nv} new vendor${nv>1?'s':''}`:'') + (ni? ` · ${ni} item${ni>1?'s':''} added to master`:''), 'green');
     if((r.notifications||[]).length) toast('Alert sent to Yajna admin', 'red');
+    syncItemPrices(hid);   // purchases/sales/RTV just changed what's on the shelf
     renderEntry();
   }catch(err){
     toast(err.message, 'red');
@@ -4198,7 +4328,9 @@ function stockSection(hid, asOf, level, start, noExpiry){
     tb? {l:'Expiring in 90 days', v:fmtRs(eb.buckets.expired.valueNr + eb.buckets.b30.valueNr + eb.buckets.b90.valueNr), cls:'warn'}
       : {l:'Items in stock', v:s.items.filter(i=>i.stock>0).length}]);
   if(!tb && noExpiry) h += '<p class="rp-note">Computed from the inventory ledger — opening stock, the purchase lines entered, the sales from the GP report, RTV and any adjustments.</p>';
-  if(tb) h += `<p class="rp-note">Expiry read from the batch report as on ${fmtDate(eb.snap.asOf)}, uploaded by ${esc(eb.snap.by)}. Quantities and expiry are the pharmacy software's; the valuation is ours, from the purchase lines.</p>`;
+  if(tb) h += eb.snap
+    ? `<p class="rp-note">Expiry read from the batch report as on ${fmtDate(eb.snap.asOf)}, uploaded by ${esc(eb.snap.by)}. Quantities and expiry are the pharmacy software's; the valuation is ours, from the purchase lines.</p>`
+    : `<p class="rp-note">Expiry read from the batch numbers on invoices and the opening count itself — no separate stock report has been uploaded for this hospital. Quantities and valuation are both ours, from the ledger.</p>`;
   h += `<p class="rp-note">Position as on ${fmtDate(asOf)}${s.unverified? ' — <b style="color:var(--red)">unverified: this date is before the physical count on '+fmtDate(s.from)+', so it is a reconstruction, not an audited figure</b>':''}. <b>Potential margin is unrealized</b> — what this stock would yield if every unit sold at full MRP before expiry. It is not earnings and never enters the margin baseline.</p>`;
   if(s.negBatches.length){
     const items = [...new Set(s.negBatches.map(b=>b.name))];
@@ -4568,6 +4700,10 @@ function renderItems(){
   const q = nameKey(state.itemQuery);
   const list = (q? all.filter(it=> it.key.includes(q)) : all).slice(0, 400);
   const avgM = all.length? all.reduce((a,it)=>a+marginPct(it.nr,it.mrp),0)/all.length : 0;
+  // a product with nothing on the shelf keeps its LAST computed price rather
+  // than losing its reference rate the moment stock runs out — flagged here
+  // so that number is never mistaken for a live, currently-weighted average
+  const stockByKey = {}; stockAsOf(hid, todayISO()).items.forEach(m=> stockByKey[m.key] = m.stock);
   $('#content').innerHTML = `
     <div class="entry-bar">
       ${hospSelect('itmHosp')}
@@ -4586,11 +4722,12 @@ function renderItems(){
       <tbody>${list.map(it=>{
         const m = marginPct(it.nr, it.mrp);
         const mc = m>=30? 'var(--green)' : m>=18? 'var(--amber)' : 'var(--red)';
+        const lastKnown = (stockByKey[it.key]||0)<=0 && it.priceAsOf;
         return `<tr>
           <td><b>${esc(it.name)}</b>${it.source==='invoice'?' <span class="chip chip-gray" style="font-size:10px">from invoice</span>':''}</td>
           <td style="color:${it.molecule?'var(--muted)':'var(--faint)'};font-size:12.5px">${esc(it.molecule||'—')}</td>
           <td style="color:var(--muted)">${esc(it.pack||'—')}</td>
-          <td class="r num">${it.nr}</td>
+          <td class="r num">${it.nr}${lastKnown? ` <span class="chip chip-gray" style="font-size:9px" title="No stock on hand — this is the last calculated rate, from ${esc(it.priceAsOf)}">last known</span>`:''}</td>
           <td class="r num">${it.mrp}</td>
           <td class="r num" style="color:${mc};font-weight:600">${pct(m)}</td>
           <td class="num" style="font-size:12px;color:var(--faint)">${fmtDateShort(iso(new Date(it.updatedAt||Date.now())))}</td>
@@ -6278,8 +6415,9 @@ function invAsOfView(hid, canEdit){
       <div class="kpi ${(s.adjValue+s.expValue)<0?'bad':s.adjItems?'warn':'good'}"><div class="l">Adjustments</div><div class="v num">${(s.adjValue+s.expValue)===0?'Nil':fmtRs(s.adjValue+s.expValue)}</div><div class="d">${s.adjItems? s.adjItems+' item'+(s.adjItems===1?'':'s')+' corrected'+(s.expValue? ' · '+fmtRs(-s.expValue)+' expired':'') : 'no manual corrections'}</div></div>
     </div>
     
-    ${tb && (!eb.snap || eb.snap.asOf!==v.asOf)? `<p class="mini-note">Expiry read from the batch report as on <b>${fmtDate(eb.snap.asOf)}</b> — the most recent one on or before ${fmtDate(v.asOf)}. Uploaded by ${esc(eb.snap.by)}.</p>`:''}
-    ${tb? `<div class="section-title"><h2>Expiry risk</h2><span>from the batch report as on ${fmtDate(eb.snap.asOf)} · valued at purchase cost — an expiry loses what was paid, never the MRP</span></div>
+    ${tb && eb.snap && eb.snap.asOf!==v.asOf? `<p class="mini-note">Expiry read from the batch report as on <b>${fmtDate(eb.snap.asOf)}</b> — the most recent one on or before ${fmtDate(v.asOf)}. Uploaded by ${esc(eb.snap.by)}.</p>`:''}
+    ${tb && !eb.snap? `<p class="mini-note">No separate stock report covers this date — expiry below is read straight from the batch numbers on invoices and the opening count itself.</p>`:''}
+    ${tb? `<div class="section-title"><h2>Expiry risk</h2><span>${eb.snap? `from the batch report as on ${fmtDate(eb.snap.asOf)}` : 'from batch numbers on invoices and the opening count'} · valued at purchase cost — an expiry loses what was paid, never the MRP</span></div>
     <div class="card"><table class="tbl">
       <thead><tr><th>Bucket</th><th></th><th class="r">Qty</th><th class="r">Value (NR)</th><th class="r">Share of stock</th></tr></thead>
       <tbody>${EXPIRY_BUCKETS.map(b=>{ const x = eb.buckets[b.k];
@@ -6600,7 +6738,8 @@ function adjustModal(hid, key){
       const r = await api('/stock/adjust',{method:'POST', body});
       db.adjustments[hid] = db.adjustments[hid]||[];
       db.adjustments[hid].unshift(r.adjustment);
-      closeModal(); toast(`${inv.name} adjusted by ${qty>0?'+':''}${fmtN(qty)} — ${body.reason}`,'green'); renderInventory();
+      closeModal(); toast(`${inv.name} adjusted by ${qty>0?'+':''}${fmtN(qty)} — ${body.reason}`,'green');
+      syncItemPrices(hid); renderInventory();
     }catch(err){ btn.disabled=false; toast(err.message,'red'); }
   };
 }
@@ -6640,7 +6779,8 @@ function ledgerModal(hid, key){
     try{
       await api('/stock/adjust/'+id, {method:'DELETE'});
       db.adjustments[hid] = (db.adjustments[hid]||[]).filter(a=>a.id!==id);
-      closeModal(); toast('Adjustment undone — stock reverted','green'); renderInventory();
+      closeModal(); toast('Adjustment undone — stock reverted','green');
+      syncItemPrices(hid); renderInventory();
     }catch(err){ b.disabled=false; toast(err.message,'red'); }
   });
 }
@@ -6651,6 +6791,8 @@ function openingStockModal(hid){
   let rawRows = null, lastNote = '', lastSrc = 'template', lastMeta = {};
   let units = fileUnits(hid, 'template');
   let valNr = 0, valMrp = 0;   // this file's own totals — set by preview(), read again on save
+  let productCount = 0;   // distinct products, not batch-line rows — set by preview(), read again on save
+  let saveCautions = [];  // merges reported by /items/opening at SAVE time (e.g. same batch twice, rates agreeing) — distinct from lastMeta.cautions, which are read-time only
   let priorLoad = null;        // the most recent recorded load, if any — for the second-load warning
   openModal(`
     <div class="modal-head"><h3>Opening stock — ${esc(h.name||'')}</h3><button class="modal-x">✕</button></div>
@@ -6663,8 +6805,8 @@ function openingStockModal(hid){
         <p class="ivnote">Everything entered on or after this date is applied on top of this count. Set it to the day the shelf was physically counted — not today's upload.</p></div>
       ${state.demo? '' : `<div class="field"><label>Filled template, or any stock report (Excel / CSV / PDF / photo)</label><input class="in" type="file" id="osFile" accept=".xls,.xlsx,.csv,.pdf,image/*">
         <p class="ivnote">The template is read straight from its columns. Anything else${state.aiEnabled? ' goes through the AI reader':' needs the template — the AI reader is not configured'}.</p></div>`}
-      <div class="field"><label>Or paste rows — <span class="num" style="font-size:12px">Product name, Opening strips, Net rate/strip, MRP/strip, Pack size</span></label>
-        <textarea class="in" id="osPaste" rows="4" placeholder="Tab. Pantoprazole 40,120,38,58,10s"></textarea></div>
+      <div class="field"><label>Or paste rows — <span class="num" style="font-size:12px">Product name, Opening strips, Net rate/strip, MRP/strip, Pack size, Batch no. (optional), Expiry MM-YYYY (optional)</span></label>
+        <textarea class="in" id="osPaste" rows="4" placeholder="Tab. Pantoprazole 40,120,38,58,10s,B2201,08-2027"></textarea></div>
       <div id="osPrev"></div>
       <div id="osChunked" style="margin-top:8px"></div>
     </div>
@@ -6705,21 +6847,34 @@ function openingStockModal(hid){
     const cv = units==='tablets'? tabletsToStrips(rows0, hid, 'name') : {rows:rows0, unknown:[]};
     const rows = cv.rows;
     parsed = rows;
-    const known = rows.filter(r=> findItem(hid, r.name)).length;
+    // a product can now arrive as more than one row (one per batch) — the
+    // batch-line count and the distinct-product count are both real figures
+    // and must be shown separately, never collapsed into one number
+    const keyOf = r=> nameKey(r.name);
+    const productKeys = new Set(rows.map(keyOf));
+    productCount = productKeys.size;
+    const batchLineCount = rows.length;
+    const hasBatches = rows.some(r=> r.batch);
+    const countLabel = batchLineCount!==productCount
+      ? `${batchLineCount} batch line${batchLineCount===1?'':'s'} across ${productCount} product${productCount===1?'':'s'}`
+      : `${productCount} product${productCount===1?'':'s'}`;
+    const knownKeys = new Set(rows.filter(r=> findItem(hid, r.name)).map(keyOf));
+    const known = knownKeys.size;
     valNr = rows.reduce((a,r)=> a + num(r.qty)*(num(r.nr) || num((findItem(hid,r.name)||{}).nr)), 0);
     valMrp = rows.reduce((a,r)=> a + num(r.qty)*(num(r.mrp) || num((findItem(hid,r.name)||{}).mrp)), 0);
     $('#osPrev').innerHTML = rows.length? `
       <p class="mini-note" style="margin-top:0">Counting as on <b>${fmtDateShort($('#osDate').value||todayISO())}</b> — check this before saving; it decides what movements land on top of this count.</p>
       <div class="grid2" style="margin:8px 0">
-        <div class="kpi"><div class="l">${rows.length} product${rows.length===1?'':'s'} · Stock value (at net rate)</div><div class="v num" style="font-size:17px">${fmtRs(valNr)}</div><div class="d">Σ strips × net rate</div></div>
+        <div class="kpi"><div class="l">${countLabel} · Stock value (at net rate)</div><div class="v num" style="font-size:17px">${fmtRs(valNr)}</div><div class="d">Σ strips × net rate</div></div>
         <div class="kpi"><div class="l">Value at MRP</div><div class="v num" style="font-size:17px">${fmtRs(valMrp)}</div><div class="d">potential margin ${pct(valMrp>0? (valMrp-valNr)/valMrp*100 : 0)}</div></div>
       </div>
-      <p class="mini-note">Check the <b>value at MRP</b> against the Marg report first — MRP carries no tax, so nothing distorts it. The value at cost can differ even when everything else is right: Marg commonly values stock excluding GST, so cost can be several percent off while MRP matches almost exactly. That gap is the GST, not a data problem.</p>
+      <p class="mini-note">Check the <b>value at MRP</b> against the Marg report first — MRP carries no tax, so nothing distorts it. The value at cost can differ even when everything else is right: Marg commonly values stock excluding GST, so cost can be several percent off while MRP matches almost exactly. That gap is the GST, not a data problem.${batchLineCount!==productCount? ` Also check the batch-line count itself against Marg — ${batchLineCount} lines across ${productCount} products should match what Marg shows for the same file; if it doesn't, some rows merged or split unexpectedly.`:''}</p>
       <div class="tbl-scroll" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:7px"><table class="tbl">
-        <thead><tr><th>Product</th><th>Pack</th><th class="r">Strips</th><th class="r">Net rate/strip</th><th class="r">MRP/strip</th><th></th></tr></thead>
+        <thead><tr><th>Product</th><th>Pack</th><th class="r">Strips</th><th class="r">Net rate/strip</th><th class="r">MRP/strip</th>${hasBatches? '<th>Batch</th><th>Expiry</th>':''}<th></th></tr></thead>
         <tbody>${rows.slice(0,200).map(r=>`<tr ${unmatchedRowStyle(hid, r.name)}><td>${esc(r.name)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${srcQtyCell(r, units)}</td><td class="r num">${r.nr? r2(r.nr):'—'}</td><td class="r num">${r.mrp? r2(r.mrp):'—'}</td>
+          ${hasBatches? `<td class="num" style="color:var(--muted)">${esc(r.batch||'—')}</td><td class="num" style="color:var(--muted)">${esc(r.exp||'—')}</td>`:''}
           <td>${findItem(hid,r.name)? '<span class="chip chip-blue">On master</span>':'<span class="chip chip-green">New item</span>'}</td></tr>`).join('')}</tbody></table></div>
-      <p class="mini-note">${rows.length} item${rows.length===1?'':'s'} · ${known} already on the master (opening qty updated) · ${rows.length-known} will be added.${note? ' '+esc(note):''}</p>
+      <p class="mini-note">${countLabel} · ${known} already on the master (opening qty updated) · ${productCount-known} will be added.${note? ' '+esc(note):''}</p>
       ${masterMatchBanner(hid, rows.map(r=>r.name))}
       ${lastMeta.tabletsCol? '<p class="mini-note">This sheet has its own tablets column — each row already says which unit it counts, so the file-level toggle is off.</p>' : unitsSeg('osu', units)}
       ${units==='tablets' && !lastMeta.tabletsCol && cv.unknown.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${cv.unknown.length} row${cv.unknown.length===1?'':'s'} ha${cv.unknown.length===1?'s':'ve'} no pack size to divide by — kept as-is: ${cv.unknown.slice(0,3).map(esc).join(', ')}${cv.unknown.length>3?'…':''}</p>`:''}
@@ -6740,7 +6895,7 @@ function openingStockModal(hid){
       if(p.length<2){ skipped.push({row, name:p[0], reason:'need at least name and opening qty'}); return; }
       const qty = num(p[1]);
       if(qty<0){ skipped.push({row, name:p[0], reason:'negative opening count'}); return; }
-      rows.push({name:p[0], qty, nr:num(p[2]), mrp:num(p[3]), pack:p[4]||''});
+      rows.push({name:p[0], qty, nr:num(p[2]), mrp:num(p[3]), pack:p[4]||'', batch:p[5]||'', exp:p[6]||''});
     });
     preview(rows, '', 'paste', {fileName:'', sheet:null, fileRows, parsed:rows.length, imported:0, skipped, ignored:0, source:'paste'});
   };
@@ -6794,6 +6949,14 @@ function openingStockModal(hid){
       // exactly what it is about to replace
       const go = confirm(`Opening stock here was already loaded — counted as on ${fmtDateShort(priorLoad.stockDate)}, ${priorLoad.itemsCount} item${priorLoad.itemsCount===1?'':'s'}, ${fmtRs(priorLoad.valueNr)} at cost / ${fmtRs(priorLoad.valueMrp)} at MRP.\n\nSaving now will REPLACE that count with this one. Confirm this is really a correction, not an accidental repeat.`);
       if(!go){ btn.disabled=false; return; }
+      // wipe the previous load's batches BEFORE this one starts writing —
+      // once, here, never per-chunk (a later chunk of THIS load must never
+      // delete rows an earlier chunk of the SAME load just landed)
+      try{
+        const rb = await api('/items/opening/reset-batches', {method:'POST', body:{hid}});
+        db.openingBatches[hid] = [];
+        (rb.zeroed||[]).forEach(it=>{ const ix = db.items[hid].findIndex(x=>x.id===it.id); if(ix>=0) db.items[hid][ix] = it; });
+      }catch(err){ btn.disabled=false; toast('Could not reset the previous opening load: '+err.message,'red'); return; }
     }
     if(state.demo){
       db.hospitals[hid].stockDate = stockDate;
@@ -6802,12 +6965,12 @@ function openingStockModal(hid){
         if(ex){ ex.openingQty = r.qty; if(r.nr>0) ex.nr=r.nr; if(r.mrp>0) ex.mrp=r.mrp; }
         else db.items[hid].push({id:'i'+Date.now()+Math.random(), name:r.name, key:nameKey(r.name), pack:r.pack||'', nr:r.nr, mrp:r.mrp, openingQty:r.qty, source:'opening', updatedAt:Date.now()});
       });
-      closeModal(); toast(`Opening stock saved for ${parsed.length} item${parsed.length===1?'':'s'} (demo)`,'green'); renderInventory(); return;
+      closeModal(); toast(`Opening stock saved for ${productCount} item${productCount===1?'':'s'} (demo)`,'green'); renderInventory(); return;
     }
     // large counts go through in batches, with a live tally and an in-place
     // fix for whatever doesn't land on the first pass (e.g. a price conflict)
     const uploader = chunkedSaveUI($('#osChunked'), {
-      fields: [{key:'name',label:'Product name'}, {key:'pack',label:'Pack'}, {key:'qty',label:'Opening qty'}, {key:'nr',label:'Net rate'}, {key:'mrp',label:'MRP'}],
+      fields: [{key:'name',label:'Product name'}, {key:'pack',label:'Pack'}, {key:'qty',label:'Opening qty'}, {key:'nr',label:'Net rate'}, {key:'mrp',label:'MRP'}, {key:'batch',label:'Batch'}, {key:'exp',label:'Expiry'}],
       validate: row=>{
         if(!String(row.name||'').trim()) return 'no product name';
         if(num(row.qty)<0) return 'negative opening count';
@@ -6815,23 +6978,38 @@ function openingStockModal(hid){
       },
       saveBatch: rows=> api('/items/opening',{method:'POST', body:{hid, stockDate, rows,
         fileName:lastMeta.fileName, source:lastMeta.source}}).then(r=>{ db.hospitals[hid] = r.hospital; return r; }),
-      countImported: r=> r.created.length + r.updated.length,
+      // row-based (batches loaded), not item-based (created+updated) — a
+      // chunk can land as fewer items than rows once same-batch duplicates
+      // merge, and the fileRows===imported+skipped invariant only holds
+      // counting rows
+      countImported: r=> r.batchesLoaded,
       applyResult: r=>{
         r.created.forEach(it=> db.items[hid].push(it));
         r.updated.forEach(it=>{ const ix = db.items[hid].findIndex(x=>x.id===it.id); if(ix>=0) db.items[hid][ix]=it; });
+        const arr = db.openingBatches[hid] = db.openingBatches[hid]||[];
+        (r.batches||[]).forEach(b=>{ const ix = arr.findIndex(x=>x.id===b.id); if(ix>=0) arr[ix]=b; else arr.push(b); });
+        saveCautions.push(...(r.cautions||[]));
         renderInventory();
       },
       onChange: tally=> saveImportReceipt(hid, 'opening', {...lastMeta, fileRows:tally.fileRows,
-        imported: tally.imported+tally.fixed, skipped: [], ignored:lastMeta.ignored||0})
+        imported: tally.imported+tally.fixed, skipped: [], ignored:lastMeta.ignored||0, cautions:[...(lastMeta.cautions||[]), ...saveCautions]})
     });
     await uploader.run({fileRows: lastMeta.fileRows ?? parsed.length, rows: parsed, preSkipped: lastMeta.skipped||[]});
+    // a same-batch duplicate merges rather than silently overwrites — that
+    // must be visible here, not only in the History tab's import receipt
+    if(saveCautions.length) $('#osChunked').insertAdjacentHTML('beforeend',
+      `<p class="mini-note" style="color:var(--amber)">⚠ ${saveCautions.length} duplicate row${saveCautions.length===1?'':'s'} merged into an existing batch rather than added separately: ${saveCautions.slice(0,6).map(c=>`row ${c.row} — ${esc(c.name)}: ${esc(c.reason)}`).join('; ')}${saveCautions.length>6?'…':''}</p>`);
+    // the client's own weighted-average math (rollupItems, via stockAsOf) now
+    // has real batch lots to compute from — sync once for the whole load,
+    // never per chunk, since one product's batches can split across chunks
+    await syncItemPrices(hid);
     // ONE record for the whole upload, not one per batch — the figures are
     // exactly what the preview already showed, so the record can never
     // disagree with what the person actually checked before saving
     let recorded = null;
     try{
       const r = await api('/opening-loads', {method:'POST', body:{hid, stockDate,
-        itemsCount: parsed.length, valueNr: valNr, valueMrp: valMrp, fileName: lastMeta.fileName||'', source: lastMeta.source||''}});
+        itemsCount: productCount, valueNr: valNr, valueMrp: valMrp, fileName: lastMeta.fileName||'', source: lastMeta.source||''}});
       recorded = r.load;
       state.openingLoads = state.openingLoads||{}; state.openingLoads[hid] = recorded;
     }catch(err){ toast('Opening stock saved, but the load record could not be written: '+err.message, 'amber'); }

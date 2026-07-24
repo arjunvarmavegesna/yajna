@@ -52,8 +52,8 @@ ok(/YAJNA PHARMA SOLUTIONS/.test(String(grid[0][0])), 'the YPS band is on top', 
 ok(/STRIPS/.test(String(grid[1][0])) && /0\/5\/12\/18/.test(String(grid[1][0])), 'the legend states the units and the validation rules');
 const hIx = grid.findIndex(r => (r || []).some(c => /purchase *qty/i.test(String(c || ''))));
 const hdr = grid[hIx].map(String);
-ok(hdr.length === 8, 'eight input columns — Pack size joined between Item and Purchase Qty', hdr.join(' | '));
-ok(/^item/i.test(hdr[0]) && /^pack size/i.test(hdr[1]) && /strips/i.test(hdr[2]) && /offer/i.test(hdr[3]) && /^rate/i.test(hdr[4]) && /disc/i.test(hdr[5]) && /gst/i.test(hdr[6]) && /^mrp/i.test(hdr[7]), 'Item / Pack size / Purchase Qty (strips) / Offer / Rate / Disc / GST / MRP', hdr.join(' | '));
+ok(hdr.length === 10, 'ten input columns — Pack size joined between Item and Purchase Qty, Batch/Expiry at the end', hdr.join(' | '));
+ok(/^item/i.test(hdr[0]) && /^pack size/i.test(hdr[1]) && /strips/i.test(hdr[2]) && /offer/i.test(hdr[3]) && /^rate/i.test(hdr[4]) && /disc/i.test(hdr[5]) && /gst/i.test(hdr[6]) && /^mrp/i.test(hdr[7]) && /^batch/i.test(hdr[8]) && /expir/i.test(hdr[9]), 'Item / Pack size / Purchase Qty (strips) / Offer / Rate / Disc / GST / MRP / Batch No. / Expiry', hdr.join(' | '));
 ok(!hdr.some(h => /^vendor\s*$|vendor *name/i.test(h)), 'NO vendor column — the vendor is named at upload (Vendor Disc % is a discount, not a vendor)');
 ok(!hdr.some(h => /net *rate|total|margin/i.test(h)), 'and NO calculated columns — the app derives those');
 ok(grid[hIx + 1] && String(grid[hIx + 1][0]).length > 0, 'an example row follows the header');

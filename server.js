@@ -194,6 +194,15 @@ CREATE TABLE IF NOT EXISTS opening_loads(
   items_count INTEGER NOT NULL DEFAULT 0, value_nr REAL NOT NULL DEFAULT 0, value_mrp REAL NOT NULL DEFAULT 0,
   file_name TEXT DEFAULT '', source TEXT DEFAULT '', loaded_by TEXT DEFAULT '', loaded_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_openingloads_h ON opening_loads(hospital_id, loaded_at);
+/* opening stock, batch-wise — one row per lot. Replaces the old flattened
+   items.opening_qty as the SOURCE of what's on the shelf; opening_qty stays
+   as a rolled-up display convenience, kept in sync from these rows. */
+CREATE TABLE IF NOT EXISTS opening_batches(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL, item_key TEXT NOT NULL,
+  name TEXT NOT NULL, pack TEXT DEFAULT '', batch TEXT DEFAULT '', exp TEXT,
+  qty REAL NOT NULL DEFAULT 0, nr REAL NOT NULL DEFAULT 0, mrp REAL NOT NULL DEFAULT 0,
+  stock_date TEXT NOT NULL, loaded_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_openingbatches_hk ON opening_batches(hospital_id, item_key);
 `);
 
 /* migrate: single hospital_id -> hospital_ids list + portal on/off flag */
@@ -245,6 +254,10 @@ CREATE INDEX IF NOT EXISTS idx_openingloads_h ON opening_loads(hospital_id, load
   if (!icols.includes('molecule')) db.exec("ALTER TABLE items ADD COLUMN molecule TEXT NOT NULL DEFAULT ''");
 // who we WANT to buy this from next — overrides "who we last bought it from"
 if (!icols.includes('preferred_vendor')) db.exec("ALTER TABLE items ADD COLUMN preferred_vendor TEXT NOT NULL DEFAULT ''");
+/* the date nr/mrp were last actually recomputed from live batches — set only
+   when there was stock to weight. Lets "last known, as of X" be shown once
+   stock runs out, instead of a bare unlabeled number that looks current. */
+if (!icols.includes('price_as_of')) db.exec('ALTER TABLE items ADD COLUMN price_as_of TEXT');
 {
   const pcols2 = db.prepare('PRAGMA table_info(pending_items)').all().map(c => c.name);
   if (pcols2.length && !pcols2.includes('pack')) db.exec("ALTER TABLE pending_items ADD COLUMN pack TEXT DEFAULT ''");
@@ -357,9 +370,11 @@ function cleanEntry(x) {
     },
     hv: arr(x.hv, 60).map(h => ({ drug: S(h.drug, 120), opening: prim(h.opening), received: prim(h.received), dispensed: prim(h.dispensed), closing: prim(h.closing) })),
     /* nr/mrp/pack ride along when the sales template supplied them — that is what
-       lets the day's margin be checked per item rather than only in total. */
+       lets the day's margin be checked per item rather than only in total.
+       batch rides along too, so a sale can consume that exact lot instead of
+       guessing via FEFO — optional, blank falls back to the usual issue order. */
     itemSales: arr(x.itemSales, 1000).map(r => ({ item: S(r.item, 150), qty: prim(r.qty), amount: prim(r.amount),
-      pack: S(r.pack, 30), nr: prim(r.nr), mrp: prim(r.mrp), cost: prim(r.cost) })),
+      pack: S(r.pack, 30), nr: prim(r.nr), mrp: prim(r.mrp), cost: prim(r.cost), batch: S(r.batch, 40).trim() })),
     invoices: arr(x.invoices, 20).map(inv => ({
       id: S(inv.id, 40), vendor: S(inv.vendor, 120), invoiceNo: S(inv.invoiceNo, 60), date: S(inv.date, 12), fileName: S(inv.fileName, 200),
       /* Derived values are recomputed here, never trusted from the client.
@@ -443,8 +458,11 @@ const rowHosp = (h) => ({ id: h.id, name: h.name, doctor: h.doctor, location: h.
 const rowVendor = (v) => ({ id: v.id, name: v.name, creditDays: v.credit_days, openingBal: v.opening_bal, phone: v.phone, addedOn: v.added_on });
 const rowPay = (p) => ({ id: p.id, vendorId: p.vendor_id, vendorName: p.vendor_name, amount: p.amount, date: p.date, note: p.note });
 const rowNotif = (n) => ({ id: n.id, type: n.type, hid: n.hospital_id, date: n.date, msg: n.msg, ts: n.ts, read: !!n.read });
-const rowItem = (i) => ({ molecule: i.molecule || '', preferredVendor: i.preferred_vendor || '', id: i.id, name: i.name, key: i.name_key, pack: i.pack, nr: i.nr, mrp: i.mrp, openingQty: i.opening_qty || 0, source: i.source, updatedAt: i.updated_at });
+const rowItem = (i) => ({ molecule: i.molecule || '', preferredVendor: i.preferred_vendor || '', id: i.id, name: i.name, key: i.name_key, pack: i.pack, nr: i.nr, mrp: i.mrp, openingQty: i.opening_qty || 0, source: i.source, updatedAt: i.updated_at, priceAsOf: i.price_as_of || null });
 const rowAdj = (a) => ({ id: a.id, key: a.item_key, item: a.item_name, date: a.date, qty: a.qty, reason: a.reason, note: a.note, user: a.user_name, ts: a.created_at });
+/* one row per opening-stock batch/lot — the ledger's source of truth for
+   opening lots, replacing the old single flattened opening_qty per item */
+const rowOpeningBatch = (b) => ({ id: b.id, key: b.item_key, name: b.name, pack: b.pack, batch: b.batch || '', exp: b.exp || null, qty: b.qty, nr: b.nr, mrp: b.mrp, stockDate: b.stock_date, loadedAt: b.loaded_at });
 
 /* why stock was corrected — required, because an unexplained adjustment is the
    easiest place for leakage to hide */
@@ -656,7 +674,7 @@ app.get('/api/bootstrap', auth, (req, res) => {
     ? (allowed.length ? db.prepare(`SELECT * FROM hospitals WHERE id IN (${allowed.map(() => '?').join(',')})`).all(...allowed) : [])
     : db.prepare('SELECT * FROM hospitals').all();
   const hids = hs.map(h => h.id);
-  const out = { user: rowUser(req.user), hospitals: {}, vendors: {}, payments: {}, dailyData: {}, hvTracked: {}, reportPrefs: {}, notifications: [], items: {}, adjustments: {}, pendingItems: {}, aliases: {}, offers: {}, offerActions: {}, receivables: {}, recvActions: {}, snapshots: {}, periodData: {}, offerStates: OFFER_STATES, offerActionTypes: OFFER_ACTIONS, adjReasons: ADJ_REASONS, issueMethods: ISSUE_METHODS, bounceReasons: BOUNCE_REASONS, bounceActions: BOUNCE_ACTIONS, cashVarThreshold: CASH_VAR_THRESHOLD, partyTypes: PARTY_TYPES, receiptModes: RECEIPT_MODES, overrideValues: OVERRIDE_VALUES, adjThreshold: ADJ_THRESHOLD, overrideMaxDays: OVERRIDE_MAX_DAYS, overrideDefaultDays: OVERRIDE_DEFAULT_DAYS, aiEnabled: !!process.env.ANTHROPIC_API_KEY, waEnabled: waEnabled() };
+  const out = { user: rowUser(req.user), hospitals: {}, vendors: {}, payments: {}, dailyData: {}, hvTracked: {}, reportPrefs: {}, notifications: [], items: {}, openingBatches: {}, adjustments: {}, pendingItems: {}, aliases: {}, offers: {}, offerActions: {}, receivables: {}, recvActions: {}, snapshots: {}, periodData: {}, offerStates: OFFER_STATES, offerActionTypes: OFFER_ACTIONS, adjReasons: ADJ_REASONS, issueMethods: ISSUE_METHODS, bounceReasons: BOUNCE_REASONS, bounceActions: BOUNCE_ACTIONS, cashVarThreshold: CASH_VAR_THRESHOLD, partyTypes: PARTY_TYPES, receiptModes: RECEIPT_MODES, overrideValues: OVERRIDE_VALUES, adjThreshold: ADJ_THRESHOLD, overrideMaxDays: OVERRIDE_MAX_DAYS, overrideDefaultDays: OVERRIDE_DEFAULT_DAYS, aiEnabled: !!process.env.ANTHROPIC_API_KEY, waEnabled: waEnabled() };
   for (const h of hs) {
     out.hospitals[h.id] = rowHosp(h);
     out.vendors[h.id] = db.prepare('SELECT * FROM vendors WHERE hospital_id=? ORDER BY name').all(h.id).map(rowVendor);
@@ -669,6 +687,7 @@ app.get('/api/bootstrap', auth, (req, res) => {
     const hv = db.prepare('SELECT drugs FROM hv_tracked WHERE hospital_id=?').get(h.id);
     out.hvTracked[h.id] = hv ? JSON.parse(hv.drugs) : [];
     out.items[h.id] = db.prepare('SELECT * FROM items WHERE hospital_id=? ORDER BY name').all(h.id).map(rowItem);
+    out.openingBatches[h.id] = db.prepare('SELECT * FROM opening_batches WHERE hospital_id=? ORDER BY name').all(h.id).map(rowOpeningBatch);
     out.adjustments[h.id] = db.prepare('SELECT * FROM stock_adjustments WHERE hospital_id=? ORDER BY date DESC, created_at DESC').all(h.id).map(rowAdj);
     out.pendingItems[h.id] = db.prepare("SELECT * FROM pending_items WHERE hospital_id=? ORDER BY status='pending' DESC, last_date DESC").all(h.id).map(rowPending);
     out.aliases[h.id] = db.prepare('SELECT * FROM item_aliases WHERE hospital_id=?').all(h.id).map(rowAlias);
@@ -1016,11 +1035,13 @@ app.post('/api/clear', auth, requireRole('admin'), (req, res) => {
 
   let deleted = 0;
   const tx = db.transaction(() => {
-    // opening stock is a column on the items, not a table — zero it and drop the
-    // anchor date, but leave the items and their prices standing
+    // opening stock is a column on the items (plus the batch rows behind it),
+    // not a table of its own — zero it and drop the anchor date, but leave the
+    // items and their prices standing
     if (key === 'opening') {
       deleted = db.prepare('SELECT COUNT(*) c FROM items WHERE hospital_id=? AND opening_qty!=0').get(hid).c;
       db.prepare('UPDATE items SET opening_qty=0 WHERE hospital_id=?').run(hid);
+      db.prepare('DELETE FROM opening_batches WHERE hospital_id=?').run(hid);
       db.prepare('UPDATE hospitals SET stock_date=NULL WHERE id=?').run(hid);
       return;
     }
@@ -1056,7 +1077,7 @@ app.post('/api/clear', auth, requireRole('admin'), (req, res) => {
    than inferred, and the impact is countable before anything happens. */
 const HOSPITAL_TABLES = ['entries', 'notifications', 'vendors', 'payments', 'items', 'price_log', 'pending_items', 'item_aliases', 'wa_outbox', 'approval_batches',
   'stock_adjustments', 'receivables', 'receivable_actions', 'expiry_snapshots', 'period_data',
-  'hv_tracked', 'report_prefs', 'import_receipts', 'sales_removals', 'opening_loads'];
+  'hv_tracked', 'report_prefs', 'import_receipts', 'sales_removals', 'opening_loads', 'opening_batches'];
 
 /* What would go, and who would be left without a hospital — answered BEFORE the
    delete, so the confirmation can show it rather than surprise anyone. */
@@ -1270,6 +1291,15 @@ function applyOffer(o, byName, approvedBy) {
   const newNr = N(o.new_nr), newMrp = N(o.new_mrp) || (it ? N(it.mrp) : 0);
   if (newMrp <= 0) return { error: 'No MRP to price against — set one on the Item Master first' };
   if (newNr > newMrp) return { error: 'The offered rate is above the MRP' };
+  /* the "old" rate shown to the doctor throughout the whole WhatsApp
+     approval flow was frozen the moment this offer was created — but the
+     Item Master's automatic batch-weighted sync keeps moving in the
+     background. A price that has drifted since then is worth flagging: not
+     a block, since the doctor already agreed to a specific NEW number, but
+     the comparison they saw may no longer match what's actually on file. */
+  const driftNote = (it && !RATE_TOL(N(o.old_nr), N(it.nr)))
+    ? `Note: the master's rate has moved to ₹${it.nr} since this offer was created (shown to the doctor as ₹${o.old_nr}) — the batches on hand changed in the meantime.`
+    : null;
   const src = (o.kind === 'manual') ? 'manual' : 'offer';
   const note = o.kind === 'manual'
     ? `${o.notes || 'Price revision'} — by ${o.negotiated_by}`
@@ -1293,7 +1323,7 @@ function applyOffer(o, byName, approvedBy) {
     pushOfferAction(o, 'applied', `Item Master moved to ${newNr} / ${newMrp}${approvedBy ? ` — approved by ${approvedBy}` : ''}`, today, byName);
   });
   tx();
-  return { item: db.prepare('SELECT * FROM items WHERE id=?').get(it.id) };
+  return { item: db.prepare('SELECT * FROM items WHERE id=?').get(it.id), driftNote };
 }
 
 app.post('/api/offers/:id/apply', auth, requireRole('admin'), (req, res) => {
@@ -1309,7 +1339,7 @@ app.post('/api/offers/:id/apply', auth, requireRole('admin'), (req, res) => {
   const r = applyOffer(o, req.user.name, o.approved_by);
   if (r.error) return res.status(400).json({ error: r.error });
   const fresh = db.prepare('SELECT * FROM margin_offers WHERE id=?').get(o.id);
-  res.json({ offer: rowOffer(fresh, today), actions: offerActions(o.id).map(rowOfferAction), item: rowItem(r.item) });
+  res.json({ offer: rowOffer(fresh, today), actions: offerActions(o.id).map(rowOfferAction), item: rowItem(r.item), driftNote: r.driftNote || null });
 });
 
 const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -2279,8 +2309,93 @@ app.get('/api/items/opening/movements-after', auth, requireRole('admin'), (req, 
   res.json({ count });
 });
 
-/* opening stock: the one-time count taken when the pharmacy starts with us.
-   Upserts the master (name/pack/nr/mrp) and sets each item's opening quantity. */
+/* a rounding-level difference, not a real disagreement — 2% relative, with a
+   small absolute floor so two near-zero rates don't trip it on noise */
+const RATE_TOL = (a, b) => Math.abs(a - b) <= Math.max(Math.abs(a), Math.abs(b)) * 0.02 + 0.01;
+
+/* Keeps items.nr/mrp current with the client's own weighted-average
+   computation across whatever batches a product currently holds — the
+   client already does this math for the Inventory tab's rollup (rollupItems'
+   nrStrip/mrpStrip); this just persists it. Mechanical/derived, never a
+   negotiated decision, so — same reasoning as /api/items/opening and
+   /api/items/bulk — it bypasses the margin_offers doctor-approval gate
+   entirely. Tagged source='sync' in price_log so the 30-row history view
+   isn't drowned in continuous small recomputations alongside real
+   negotiated changes. Only ever called with products that currently have
+   positive stock to weight (the client computes nothing to send otherwise),
+   which is what makes "last known price, unchanged once stock hits zero"
+   true — the write simply never happens for a depleted product. */
+app.post('/api/items/sync-prices', auth, (req, res) => {
+  const b = req.body || {};
+  const hid = S(b.hid, 60);
+  scopeCheck(req, hid);
+  const updates = Array.isArray(b.updates) ? b.updates : [];
+  const now = Date.now(), today = todayISO();
+  const updated = [];
+  const tx = db.transaction(() => {
+    const find = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
+    const upd = db.prepare('UPDATE items SET nr=?, mrp=?, price_as_of=?, updated_at=? WHERE id=?');
+    const logPrice = db.prepare(`INSERT INTO price_log(id,item_id,hospital_id,old_nr,old_mrp,new_nr,new_mrp,note,user_name,ts,source)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`);
+    for (const u of updates.slice(0, 2000)) {
+      const key = S(u.key, 150);
+      const ex = find.get(hid, key);
+      if (!ex) continue;
+      const nr = N(u.nr), mrp = N(u.mrp);
+      // same sanity floor every other nr/mrp writer already applies — the
+      // server can't verify the client's math, but it can still refuse an
+      // obviously broken payload
+      if (!(nr >= 0) || !(mrp >= 0) || (nr > mrp && mrp > 0)) continue;
+      if (Math.abs(nr - ex.nr) < 0.005 && Math.abs(mrp - ex.mrp) < 0.005) continue;   // nothing actually changed
+      logPrice.run(uid('pl'), ex.id, hid, ex.nr, ex.mrp, nr, mrp, 'Weighted average recomputed from current batches', 'system', now, 'sync');
+      upd.run(nr, mrp, today, now, ex.id);
+      updated.push({ key, nr, mrp, priceAsOf: today, updatedAt: now });
+    }
+  });
+  tx();
+  res.json({ updated });
+});
+
+/* Wipes this hospital's opening batches before a CONFIRMED second load
+   rewrites them from scratch — called once, before the chunked upload
+   sequence begins. Never folded into an ordinary per-chunk save, which must
+   never delete rows a previous chunk of the SAME load already landed. */
+app.post('/api/items/opening/reset-batches', auth, requireRole('admin'), (req, res) => {
+  const hid = S((req.body || {}).hid, 60);
+  scopeCheck(req, hid);
+  const zeroed = db.transaction(() => {
+    // a product dropped entirely from the corrective file should show ZERO
+    // opening qty — a real, immediate fact about what's now counted. nr/mrp
+    // stay untouched: "last known price" is correct once there's nothing
+    // left to weight, and the client's sync pass after this load recomputes
+    // properly from whatever lots (including purchases) still remain.
+    const now = Date.now();
+    const affected = db.prepare('SELECT DISTINCT item_key FROM opening_batches WHERE hospital_id=?').all(hid).map(r => r.item_key);
+    const zero = db.prepare('UPDATE items SET opening_qty=0, updated_at=? WHERE hospital_id=? AND name_key=?');
+    const findItem = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
+    // returned so the client can zero these same items in its own local
+    // mirror (db.items) — otherwise a product dropped from the corrective
+    // file would keep showing its old opening qty until the next full reload
+    const out = [];
+    for (const key of affected) {
+      zero.run(now, hid, key);
+      const it = findItem.get(hid, key);
+      if (it) out.push(rowItem(it));
+    }
+    db.prepare('DELETE FROM opening_batches WHERE hospital_id=?').run(hid);
+    return out;
+  })();
+  res.json({ ok: true, zeroed });
+});
+
+/* Opening stock, batch-wise: the one-time (or corrected) physical count.
+   Every row is its OWN lot with its own frozen cost/MRP — nothing is
+   flattened or averaged at load time (that's what the OLD single-lot-per-
+   item design did, and it's the actual bug this replaces). The Item Master
+   (name/pack/nr/mrp) is upserted per distinct product as the quantity-
+   weighted average across THAT product's current batches, computed fresh
+   from opening_batches after every row lands — never a single row's value
+   simply overwriting whatever was already there. */
 app.post('/api/items/opening', auth, requireRole('admin'), (req, res) => {
   const { hid, stockDate, rows, fileName, source } = req.body || {};
   const h = scopeCheck(req, S(hid, 60));
@@ -2295,42 +2410,112 @@ app.post('/api/items/opening', auth, requireRole('admin'), (req, res) => {
   const sd = stockDate;
   if (sd > todayISO()) return res.status(400).json({ error: 'Stock count date cannot be in the future' });
   const now = Date.now();
-  const created = [], updated = [], skipped = [];
+  const skipped = [], cautions = [];
+  let rowsImported = 0;
+  const touchedKeys = new Set();
+  // batches this SAME request has itself written — the only thing that
+  // distinguishes a genuine in-file duplicate (merge, summed) from a plain
+  // resubmission of a batch that was already on record from an earlier,
+  // separate call (an update/correction to that count, not a second lot;
+  // matches how a lone paste-box correction or a direct API resubmission has
+  // always behaved — it must stay idempotent, not additive)
+  const touchedThisReq = new Set();
   const tx = db.transaction(() => {
-    const find = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
-    const ins = db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,opening_qty,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)');
-    const upd = db.prepare('UPDATE items SET opening_qty=?, pack=?, nr=?, mrp=?, updated_at=? WHERE id=?');
+    const findItem = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
+    const findBatch = db.prepare('SELECT * FROM opening_batches WHERE hospital_id=? AND item_key=? AND batch=?');
+    const insBatch = db.prepare('INSERT INTO opening_batches(id,hospital_id,item_key,name,pack,batch,exp,qty,nr,mrp,stock_date,loaded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
+    const updBatch = db.prepare('UPDATE opening_batches SET qty=?, nr=?, mrp=?, pack=?, exp=?, stock_date=?, loaded_at=? WHERE id=?');
+
+    // captured up front — so a skipped row carries back what was actually
+    // typed, not just a name and a reason, for the retry table to edit
     rows.slice(0, 5000).forEach((raw, ix) => {
       const row = raw.row ?? (ix + 1);
       const name = S(raw.name, 150).trim();
-      // captured up front — so a skipped row carries back what was actually
-      // typed, not just a name and a reason, for the retry table to edit
-      const cells = { pack: S(raw.pack, 60), qty: N(raw.qty), nr: N(raw.nr), mrp: N(raw.mrp) };
+      const cells = { pack: S(raw.pack, 60).trim(), qty: N(raw.qty), nr: N(raw.nr), mrp: N(raw.mrp),
+        batch: S(raw.batch, 40).trim(), exp: parseExpiryCell(raw.exp) };
       const skip = (reason) => skipped.push({ row, name, reason, ...cells });
       if (!name) { skip('no product name'); return; }
       if (cells.qty < 0) { skip('negative opening count'); return; }
+
       const key = nameKey(name);
-      const ex = find.get(hid, key);
-      if (ex) {
-        // keep existing prices unless the file supplies better ones
-        const nr = cells.nr > 0 ? cells.nr : ex.nr;
-        const mrp = cells.mrp > 0 ? cells.mrp : ex.mrp;
-        if (nr > mrp && mrp > 0) { skip('net rate would exceed the MRP — kept as it was'); return; }
-        upd.run(cells.qty, cells.pack || ex.pack, nr, mrp, now, ex.id);
-        updated.push(rowItem({ ...ex, opening_qty: cells.qty, nr, mrp, pack: cells.pack || ex.pack, updated_at: now }));
+      const bkey = key + '|' + cells.batch;
+      const existingItem = findItem.get(hid, key);
+      const existingBatch = findBatch.get(hid, key, cells.batch);
+
+      // a row that omits its own price falls back to whatever this exact
+      // batch (if it's a repeat) or the item's own known price already says
+      // — never to a bare zero, and never diluting a real average with one
+      const nr = cells.nr > 0 ? cells.nr : (existingBatch ? existingBatch.nr : (existingItem ? existingItem.nr : 0));
+      const mrp = cells.mrp > 0 ? cells.mrp : (existingBatch ? existingBatch.mrp : (existingItem ? existingItem.mrp : 0));
+      if (nr > mrp && mrp > 0) { skip('net rate would exceed the MRP — kept as it was'); return; }
+      const pack = cells.pack || (existingBatch ? existingBatch.pack : (existingItem ? existingItem.pack : ''));
+
+      if (existingBatch && touchedThisReq.has(bkey)) {
+        /* same product, same batch (or both blank) as an earlier row/chunk of
+           THIS load — a genuine duplicate. Merge when the rate roughly
+           agrees (reported, not silent); reject outright when it disagrees
+           by more than a rounding difference, rather than guessing which
+           row is right and quietly averaging away a real disagreement. */
+        if (!RATE_TOL(nr, existingBatch.nr) || !RATE_TOL(mrp, existingBatch.mrp)) {
+          skip(`same batch already loaded for this product at a different rate (₹${existingBatch.nr} vs ₹${nr} net) — fix and re-upload`);
+          return;
+        }
+        const mergedQty = existingBatch.qty + cells.qty;
+        const mergedNr = mergedQty > 0 ? (existingBatch.qty * existingBatch.nr + cells.qty * nr) / mergedQty : nr;
+        const mergedMrp = mergedQty > 0 ? (existingBatch.qty * existingBatch.mrp + cells.qty * mrp) / mergedQty : mrp;
+        updBatch.run(mergedQty, mergedNr, mergedMrp, pack, cells.exp || existingBatch.exp, sd, now, existingBatch.id);
+        cautions.push({ row, name, reason: cells.batch
+          ? `duplicate of batch "${cells.batch}" already on this file — quantities added (${existingBatch.qty} + ${cells.qty} = ${mergedQty})`
+          : `another no-batch row for this product already on file — quantities added (${existingBatch.qty} + ${cells.qty} = ${mergedQty})` });
+      } else if (existingBatch) {
+        // on record from an earlier, separate call (not this request) —
+        // a correction to that count, so the new row's own qty REPLACES it
+        updBatch.run(cells.qty, nr, mrp, pack, cells.exp || existingBatch.exp, sd, now, existingBatch.id);
       } else {
-        if (cells.nr > cells.mrp && cells.mrp > 0) { skip('net rate above the MRP — that would sell at a loss'); return; }
-        const it = { id: uid('it'), hospital_id: hid, name, name_key: key, pack: cells.pack, nr: cells.nr, mrp: cells.mrp, opening_qty: cells.qty, source: 'opening', updated_at: now };
-        ins.run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.opening_qty, it.source, it.updated_at);
+        insBatch.run(uid('opb'), hid, key, name, pack, cells.batch, cells.exp || null, cells.qty, nr, mrp, sd, now);
+      }
+      touchedThisReq.add(bkey);
+      rowsImported++;
+      touchedKeys.add(key);
+    });
+
+    // one upsert per distinct product touched, AFTER every one of its rows
+    // has landed — the weighted average is across every batch the product
+    // now holds, never a single row's own value
+    const insItem = db.prepare('INSERT INTO items(id,hospital_id,name,name_key,pack,nr,mrp,opening_qty,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)');
+    const updItem = db.prepare('UPDATE items SET opening_qty=?, pack=?, nr=?, mrp=?, updated_at=? WHERE id=?');
+    const aggBatches = db.prepare('SELECT COALESCE(SUM(qty),0) q, COALESCE(SUM(qty*nr),0) sn, COALESCE(SUM(qty*mrp),0) sm FROM opening_batches WHERE hospital_id=? AND item_key=?');
+    const latestBatch = db.prepare('SELECT name, pack FROM opening_batches WHERE hospital_id=? AND item_key=? ORDER BY loaded_at DESC LIMIT 1');
+    const batchRows = db.prepare('SELECT * FROM opening_batches WHERE hospital_id=? AND item_key=?');
+    const created = [], updated = [], batches = [];
+    touchedKeys.forEach(key => {
+      const agg = aggBatches.get(hid, key);
+      const totalQty = agg.q, avgNr = totalQty > 0 ? agg.sn / totalQty : 0, avgMrp = totalQty > 0 ? agg.sm / totalQty : 0;
+      const lb = latestBatch.get(hid, key);
+      const ex = findItem.get(hid, key);
+      if (ex) {
+        const pack = ex.pack || (lb ? lb.pack : '');
+        updItem.run(totalQty, pack, avgNr, avgMrp, now, ex.id);
+        updated.push(rowItem({ ...ex, opening_qty: totalQty, pack, nr: avgNr, mrp: avgMrp, updated_at: now }));
+      } else {
+        const it = { id: uid('it'), hospital_id: hid, name: lb.name, name_key: key, pack: lb.pack,
+          nr: avgNr, mrp: avgMrp, opening_qty: totalQty, source: 'opening', updated_at: now };
+        insItem.run(it.id, it.hospital_id, it.name, it.name_key, it.pack, it.nr, it.mrp, it.opening_qty, it.source, it.updated_at);
         created.push(rowItem(it));
       }
+      // the client's own ledger needs these rows (not just the item-level
+      // average) to build per-batch lots — returned per touched product so
+      // a chunked, multi-request load can patch its local mirror incrementally
+      batchRows.all(hid, key).forEach(b => batches.push(rowOpeningBatch(b)));
     });
     db.prepare('UPDATE hospitals SET stock_date=? WHERE id=?').run(sd, hid);
+    return { created, updated, batches };
   });
-  tx();
-  res.json({ created, updated, skipped, stockDate: sd, hospital: rowHosp({ ...h, stock_date: sd }),
+  const { created, updated, batches } = tx();
+  res.json({ created, updated, batches, batchesLoaded: rowsImported, productsTouched: touchedKeys.size,
+    stockDate: sd, hospital: rowHosp({ ...h, stock_date: sd }),
     ...receiptFields({ fileName: S(fileName, 200), sheet: null, fileRows: rows.length,
-      parsed: rows.length, imported: created.length + updated.length, skipped, ignored: 0, source: S(source, 20) || 'template' }) });
+      parsed: rows.length, imported: rowsImported, skipped, ignored: 0, source: S(source, 20) || 'template', cautions }) });
 });
 
 const rowOpeningLoad = (r) => ({ id: r.id, hid: r.hospital_id, stockDate: r.stock_date, itemsCount: r.items_count,
@@ -2983,7 +3168,9 @@ const COL = {
   mrp:  { hdr: 'MRP — single strip',                    match: [/^mrp/i, /^m\.r\.p/i, /retail/i, /^sale *rate/i] },
   bal:  { hdr: 'Opening Balance (Rs.) — end with Cr or Dr', match: [/open.*bal/i, /^balance/i, /outstanding/i, /^amount/i, /\bdue\b/i] },
   credit: { hdr: 'Credit Days', match: [/credit/i] },
-  phone: { hdr: 'Phone', match: [/phone/i, /mobile/i, /contact/i] }
+  phone: { hdr: 'Phone', match: [/phone/i, /mobile/i, /contact/i] },
+  batch: { hdr: 'Batch No.', match: [/^batch/i, /^lot *no/i, /^lot$/i] },
+  exp:  { hdr: 'Expiry (MM-YYYY)', match: [/^exp/i, /expiry/i, /expires?/i, /best *before/i] }
 };
 /* Marg exports a vendor ledger balance with a trailing Cr/Dr rather than a
    sign: Cr is the ordinary case (a payable — we owe them), entered positive;
@@ -3016,7 +3203,7 @@ function packUnits(pack) {
 const TEMPLATES = {
   sales: {
     file: 'yajna-sales-margin-template.xlsx', sheet: 'Sales',
-    cols: ['name', 'pack', 'qty', 'qtyTab', 'nr', 'mrp'],
+    cols: ['name', 'pack', 'qty', 'qtyTab', 'nr', 'mrp', 'batch'],
     need: ['name', ['qty', 'qtyTab'], 'mrp'],
     /* full strips AND loose tablets are ADDITIVE — both columns filled is the
        normal way to count a part strip (2 strips + 5 loose of a 10s = 2.5),
@@ -3031,22 +3218,23 @@ const TEMPLATES = {
       { after: 'mrp', hdr: '» Margin % (auto)' }
     ],
     eg: [
-      ['Tab. Rifaximin 550', '10s', 12, '', 12, 298, 412, 29.8, 41.2, 4944, 3576, 1368, 27.67],
-      ['Tab. Sample Combo 10', '10s', 2, 5, 2.5, 759.25, 999, 75.925, 99.9, 2497.5, 1898.125, 599.375, 24.0],
-      ['Tab. Metformin 500', '15s', '', 75, 5, 12, 21, 0.8, 1.4, 105, 60, 45, 42.86],
-      ['Inj. Pantoprazole 40', 'vial', 8, '', 8, 38, 58, '', '', 464, 304, 160, 34.48]
+      ['Tab. Rifaximin 550', '10s', 12, '', 12, 298, 412, 29.8, 41.2, 4944, 3576, 1368, 27.67, 'B2201'],
+      ['Tab. Sample Combo 10', '10s', 2, 5, 2.5, 759.25, 999, 75.925, 99.9, 2497.5, 1898.125, 599.375, 24.0, ''],
+      ['Tab. Metformin 500', '15s', '', 75, 5, 12, 21, 0.8, 1.4, 105, 60, 45, 42.86, ''],
+      ['Inj. Pantoprazole 40', 'vial', 8, '', 8, 38, 58, '', '', 464, 304, 160, 34.48, 'B2210']
     ],
     notes: [
       ['Qty sold — full strips AND/OR loose tablets', 'Fill full strips, loose tablets, or BOTH per row — they ADD UP (2 strips + 5 loose of a 10s = 2.5 strips). Loose tablets alone are divided by the pack size (75 tablets of a 15s = 5 strips). Loose tablets need a numeric pack — a vial has no strip size to divide by.'],
       ['Net rate — single strip', 'What ONE strip cost you, INCLUSIVE of GST. The same basis the purchase entry uses.'],
       ['MRP — single strip', 'The printed MRP of ONE strip.'],
       ['Rate / MRP per piece', 'The single-strip rate divided by the pack size — DISPLAY ONLY, so you can sanity-check a part-strip row. Never a second costing basis.'],
-      ['What you get back', 'Sale value = Total strips × MRP. Cost of goods sold = Total strips × Net rate. Margin % = (MRP − Net rate) ÷ MRP — a ratio, unchanged by part strips.']
+      ['What you get back', 'Sale value = Total strips × MRP. Cost of goods sold = Total strips × Net rate. Margin % = (MRP − Net rate) ÷ MRP — a ratio, unchanged by part strips.'],
+      ['Batch (optional)', 'If the Marg report shows which batch was actually billed, put it here — the sale draws down THAT exact batch instead of guessing. Leave blank and the app falls back to first-expiry-first-out, same as always. A batch that does not exist, or does not have enough left, is reported rather than silently substituted.']
     ]
   },
   opening: {
     file: 'yajna-opening-stock-template.xlsx', sheet: 'Opening stock',
-    cols: ['name', 'pack', 'open', 'openTab', 'nr', 'mrp'],
+    cols: ['name', 'pack', 'open', 'openTab', 'nr', 'mrp', 'batch', 'exp'],
     need: ['name', 'open'],
     helpers: [
       { after: 'openTab', hdr: '» Total strips (auto — do not fill)' },
@@ -3056,10 +3244,10 @@ const TEMPLATES = {
       { after: 'mrp', hdr: '» Value at MRP (auto)' }
     ],
     eg: [
-      ['Tab. Rifaximin 550', '10s', 120, '', 120, 298, 412, 29.8, 41.2, 35760, 49440],
-      ['Tab. Sample Combo 10', '10s', 10, 3, 10.3, 759.25, 999, 75.925, 99.9, 7820.275, 10289.7],
-      ['Tab. Metformin 500', '15s', '', 4500, 300, 12, 21, 0.8, 1.4, 3600, 6300],
-      ['Inj. Pantoprazole 40', 'vial', 45, '', 45, 38, 58, '', '', 1710, 2610]
+      ['Tab. Rifaximin 550', '10s', 120, '', 120, 298, 412, 29.8, 41.2, 35760, 49440, 'B2318', '2027-06'],
+      ['Tab. Sample Combo 10', '10s', 10, 3, 10.3, 759.25, 999, 75.925, 99.9, 7820.275, 10289.7, '', ''],
+      ['Tab. Metformin 500', '15s', '', 4500, 300, 12, 21, 0.8, 1.4, 3600, 6300, 'B2402', '2028-01'],
+      ['Inj. Pantoprazole 40', 'vial', 45, '', 45, 38, 58, '', '', 1710, 2610, '', '']
     ],
     notes: [
       ['Opening stock — full strips AND/OR loose tablets', 'Count the shelf however it sits: full strips, loose tablets, or BOTH per row — they ADD UP (10 strips + 3 loose of a 10s = 10.3). Loose tablets alone are divided by the pack size (4500 tablets of a 15s = 300 strips). Loose tablets need a numeric pack — a vial has no strip size to divide by.'],
@@ -3069,8 +3257,10 @@ const TEMPLATES = {
       ['What you get back', 'Stock value at net rate = Total strips × net rate. Value at MRP = Total strips × MRP. Potential margin, the item table and every downstream figure follow from these.'],
       ['Items already on the master', 'Their opening count is updated; the prices are only overwritten if you supply them.'],
       ['The » columns are LIVE formulas', 'They recalculate as you type. Adding your own rows below row 5? Select the five » cells in row 5 and drag the fill handle (or copy/paste) down through your last row, so your own products total correctly too.'],
-      ['The TOTAL row (further down the sheet)', 'Already filled in — how many products, the value at cost, and the value at MRP, added up from every row above it. Leave it where it is; it recalculates on its own and the app never loads it as a product. This is the row to check against the Marg report before uploading.'],
-      ['Which total to trust', 'Check the VALUE AT MRP total against Marg first — MRP carries no tax, so nothing distorts it. If that agrees, the products and quantities are right. The value-at-cost total can still differ even when everything is correct: Marg commonly values stock EXCLUDING GST, so a real load can show MRP matching within a fraction of a percent while cost differs by several percent. That gap is not a data problem — it is the GST.']
+      ['The TOTAL row (further down the sheet)', 'Already filled in — how many BATCH LINES, the value at cost, and the value at MRP, added up from every row above it. Leave it where it is; it recalculates on its own and the app never loads it as a product. This is the row to check against the Marg report before uploading — note it counts rows (batches), not distinct products, since one product can legitimately span more than one row.'],
+      ['Which total to trust', 'Check the VALUE AT MRP total against Marg first — MRP carries no tax, so nothing distorts it. If that agrees, the products and quantities are right. The value-at-cost total can still differ even when everything is correct: Marg commonly values stock EXCLUDING GST, so a real load can show MRP matching within a fraction of a percent while cost differs by several percent. That gap is not a data problem — it is the GST.'],
+      ['Batch and Expiry (both optional)', 'Each row is ONE BATCH. A product with two batches — bought at different times, at different costs — appears on TWO rows, one per batch, each with its own batch number and expiry. Leave both blank if you cannot supply them: the row loads exactly as before, as one unidentified lot. The Item Master price becomes the quantity-weighted average across a product\'s batches — a batch of 5 does not count as heavily as a batch of 500.'],
+      ['Two rows, same product', 'DIFFERENT batch numbers means two real batches — both are kept. The SAME batch number (or no batch number) on two rows for the same product is treated as a duplicate: the quantities are added together and it is reported as a merge, not silently overwritten — unless the rate on the two rows disagrees by more than a rounding difference, in which case it is rejected instead of guessed at.']
     ]
   },
   purchase: {
@@ -3078,10 +3268,10 @@ const TEMPLATES = {
     /* LINE INPUTS ONLY — no vendor column (the vendor is chosen at upload and
        the whole file lands under them), no calculated columns, no totals. The
        app derives total qty, net rate, margin from these seven via calcLine. */
-    cols: ['name', 'pack', 'pqty', 'oqty', 'rate', 'disc', 'gst', 'mrp'],
+    cols: ['name', 'pack', 'pqty', 'oqty', 'rate', 'disc', 'gst', 'mrp', 'batch', 'exp'],
     hdrs: { name: 'Item', mrp: 'MRP ₹ (per strip)' },
     need: ['name', 'pqty'],
-    eg: [['Tab. Rifaximin 550', '10s', 10, 1, 85, 10, 12, 120]],
+    eg: [['Tab. Rifaximin 550', '10s', 10, 1, 85, 10, 12, 120, 'B2318', '2027-06']],
     notes: [
       ['Purchase Qty (strips)', 'STRIPS billed by the vendor. Part strips are fine: 2.5 is two and a half. Must be 0 or more.'],
       ['Offer Qty (free / scheme)', 'Free / scheme strips — they enter stock and dilute the net rate, but you are not billed for them. 0 if none.'],
@@ -3091,7 +3281,8 @@ const TEMPLATES = {
       ['MRP ₹', 'Printed MRP of one strip. Must be 0 or more.'],
       ['What the app computes', 'Total Qty = purchase + offer · Net Rate = billed amount ÷ total qty · Margin % = (MRP − net rate) ÷ MRP — the same calcLine math as manual entry, so nothing can disagree.'],
       ['One vendor per file', 'There is no vendor column on purpose. You name the vendor when uploading and every line lands under them.'],
-      ['Pack size', 'OPTIONAL for items already on the Item Master (their pack is known). REQUIRED when a line creates a NEW item — an item born without a pack can never convert tablets to strips.']
+      ['Pack size', 'OPTIONAL for items already on the Item Master (their pack is known). REQUIRED when a line creates a NEW item — an item born without a pack can never convert tablets to strips.'],
+      ['Batch and Expiry (both optional)', 'Printed on the vendor\'s invoice. Filling them in gives this exact lot a real identity — checkable at sale time, reportable for expiry risk. Left blank, the line still enters stock and is valued correctly; it just carries no batch identity of its own.']
     ]
   },
   items: {
@@ -3184,7 +3375,10 @@ function buildTemplate(kind) {
        illustrations, and the TOTAL row is what gets checked against Marg
        before anything is uploaded. Column layout (fixed by T.cols/helpers
        above): A name, B pack, C open, D openTab, E »Total strips, F nr,
-       G mrp, H »Rate/piece, I »MRP/piece, J »Value at cost, K »Value at MRP. */
+       G mrp, H »Rate/piece, I »MRP/piece, J »Value at cost, K »Value at MRP,
+       L batch, M exp — batch/exp are APPENDED at the end deliberately, so the
+       A-K formula system below (already shipped, already trusted) never has
+       to be re-derived for a shifted column letter. */
     ws = XLSX.utils.aoa_to_sheet([hdr, ...T.eg]);
     ws['!cols'] = widthKeys.map(c => ({ wch: c === 'name' ? 34 : c === 'nr' ? 32 : c === '_helper' ? 28 : 20 }));
     const col = { name: 'A', pack: 'B', open: 'C', openTab: 'D', totalStrips: 'E', nr: 'F', mrp: 'G', ratePiece: 'H', mrpPiece: 'I', valueCost: 'J', valueMrp: 'K' };
@@ -3209,13 +3403,18 @@ function buildTemplate(kind) {
       setF(`${col.valueCost}${r}`, `IF(OR(${col.name}${r}="",NOT(ISNUMBER(${col.totalStrips}${r}))),"",${col.totalStrips}${r}*${col.nr}${r})`);
       setF(`${col.valueMrp}${r}`, `IF(OR(${col.name}${r}="",NOT(ISNUMBER(${col.totalStrips}${r}))),"",${col.totalStrips}${r}*${col.mrp}${r})`);
     }
-    // capacity for ~1000 products (Viraj's real load was 407) before a TOTAL
-    // row placed comfortably clear of any realistic amount of real data
-    const lastDataRow = 1000, totalRow = 1002;
+    // capacity for ~3000 BATCH LINES (Viraj's real load was 419 lines across
+    // 407 products) before a TOTAL row placed comfortably clear of any
+    // realistic amount of real data — one product can now span several rows
+    const lastDataRow = 3000, totalRow = 3002;
     ws[`${col.name}${totalRow}`] = { t: 'str', v: 'TOTAL' };
     setF(`${col.valueCost}${totalRow}`, `SUM(${col.valueCost}2:${col.valueCost}${lastDataRow})`);
     setF(`${col.valueMrp}${totalRow}`, `SUM(${col.valueMrp}2:${col.valueMrp}${lastDataRow})`);
-    ws[`${col.pack}${totalRow}`] = { t: 'str', f: `COUNTA(${col.name}2:${col.name}${lastDataRow})&" products"` };
+    // this counts ROWS (batch lines), not distinct products — a product with
+    // two batches legitimately appears twice; the distinct-product count is
+    // shown in the upload preview instead, where it can be checked alongside
+    // this figure rather than faked as a second, fragile Excel formula
+    ws[`${col.pack}${totalRow}`] = { t: 'str', f: `COUNTA(${col.name}2:${col.name}${lastDataRow})&" batch lines"` };
     ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: totalRow - 1, c: hdr.length - 1 } });
   } else if (kind === 'purchase') {
     /* branding band + legend above the header. readTemplate scans the first 15
@@ -3306,13 +3505,15 @@ function readTemplate(buf, kind) {
            just named and blamed */
         const cells = kind === 'purchase'
           ? { pack: S(row[col.pack ?? -1], 30).trim(), pqty: N(row[col.pqty]), oqty: N(row[col.oqty ?? -1]),
-              rate: N(row[col.rate ?? -1]), disc: N(row[col.disc ?? -1]), gst: N(row[col.gst ?? -1]), mrp: N(row[col.mrp ?? -1]) }
+              rate: N(row[col.rate ?? -1]), disc: N(row[col.disc ?? -1]), gst: N(row[col.gst ?? -1]), mrp: N(row[col.mrp ?? -1]),
+              batch: S(row[col.batch ?? -1], 40).trim(), exp: parseExpiryCell(row[col.exp ?? -1]) }
           : kind === 'vendors'
           ? { bal: S(row[col.bal ?? -1]), credit: N(row[col.credit ?? -1]), phone: S(row[col.phone ?? -1], 40).trim() }
           : { pack: S(row[col.pack ?? -1], 30).trim(), molecule: S(row[col.mol ?? -1], 150).trim(),
               qty: qtyCol === undefined ? undefined : N(row[qtyCol]),
               loose: tabCol === undefined ? undefined : N(row[tabCol]),
-              nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) };
+              nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]),
+              batch: S(row[col.batch ?? -1], 40).trim(), exp: parseExpiryCell(row[col.exp ?? -1]) };
         const skip = (reason) => skipped.push({ row: sheetRow, name, reason, ...cells });
         if (!name) { skip(kind === 'vendors' ? 'no vendor name' : 'no product name'); continue; }
         if (/^(total|grand total|sub ?total)/i.test(name)) { skip('skipped: total row'); ignored++; continue; }
@@ -3361,7 +3562,7 @@ function readTemplate(buf, kind) {
         // sales needs something sold; opening allows a zero count; the master has no qty at all
         if (kind === 'sales' && qty <= 0) { skip('no quantity sold'); continue; }
         if (kind === 'opening' && qty < 0) { skip('negative opening count'); continue; }
-        out.push({ row: sheetRow, name, unit, srcStrips, srcLoose, molecule: S(row[col.mol ?? -1], 150).trim(), pack: S(row[col.pack ?? -1], 30).trim(), qty, nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) });
+        out.push({ row: sheetRow, name, unit, srcStrips, srcLoose, molecule: S(row[col.mol ?? -1], 150).trim(), pack: S(row[col.pack ?? -1], 30).trim(), qty, nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]), batch: cells.batch, exp: cells.exp });
       }
       const fileRows = out.length + skipped.length;
       // if the header matched but nothing at all sits below it, keep scanning —
@@ -3466,7 +3667,7 @@ app.post('/api/parse/gpreport', auth, upload.single('file'), async (req, res, ne
         const value = r.qty * r.mrp, cost = r.qty * r.nr;
         return { row: r.row, item: r.name, pack: r.pack, qty: r.qty, nr: r.nr, mrp: r.mrp,
           unit: r.unit || 'strips', srcStrips: r.srcStrips || 0, srcLoose: r.srcLoose || 0,
-          amount: +value.toFixed(2), cost: +cost.toFixed(2),
+          amount: +value.toFixed(2), cost: +cost.toFixed(2), batch: r.batch || '',
           // a ratio — the pack size never enters it, only the same unit on both sides
           marginPct: r.mrp > 0 ? (r.mrp - r.nr) / r.mrp * 100 : 0 };
       });
@@ -3547,6 +3748,18 @@ function normExpiry(v) {
     if (mo >= 1 && mo <= 12 && yr >= 2000 && yr <= 2099) return `${yr}-${String(mo).padStart(2, '0')}`;
   }
   return '';
+}
+/* A real Excel-typed date (typed by hand, or pasted from a date-formatted
+   source) arrives from XLSX.read as a raw numeric day-serial, not a string —
+   normExpiry's regexes would never match a bare number and would silently
+   treat a genuine date as blank. Detected and converted first; anything else
+   still goes through normExpiry's flexible MM/YY-style string parsing. */
+function parseExpiryCell(raw) {
+  if (typeof raw === 'number' && raw > 0) {
+    const d = XLSX.SSF.parse_date_code(raw);
+    return (d && d.y && d.m) ? `${d.y}-${String(d.m).padStart(2, '0')}` : '';
+  }
+  return normExpiry(raw);
 }
 /* Used at BOTH the preview (/parse/expiry) and the actual save (/snapshots) —
    the same blank-name drop happens in both places, so both get to report it
@@ -3639,7 +3852,7 @@ app.post('/api/parse/stock', auth, upload.single('file'), async (req, res, next)
     // our own opening-stock template reads by heading — no AI, nothing misread
     const tpl = readTemplate(req.file.buffer, 'opening');
     if (tpl.matched) {
-      const items = tpl.rows.map(r => ({ row: r.row, name: r.name, qty: r.qty, pack: r.pack, nr: r.nr, mrp: r.mrp, unit: r.unit || 'strips', srcStrips: r.srcStrips || 0, srcLoose: r.srcLoose || 0 }));
+      const items = tpl.rows.map(r => ({ row: r.row, name: r.name, qty: r.qty, pack: r.pack, nr: r.nr, mrp: r.mrp, unit: r.unit || 'strips', srcStrips: r.srcStrips || 0, srcLoose: r.srcLoose || 0, batch: r.batch || '', exp: r.exp || '' }));
       const noRate = items.filter(r => !(r.nr > 0)).length;
       return res.json({
         source: 'template', stockDate: '', rejected: tpl.rejected || [], tabletsCol: !!tpl.tabletsCol,
