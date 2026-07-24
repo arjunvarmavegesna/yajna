@@ -189,6 +189,18 @@ console.log('— the UI: the second-load warning, the confirm gate, and the pers
   w.eval(`renderInventory();`); await tick(300);
   body = doc.querySelector('#content').textContent;
   ok(/1 item/.test(body), 'back on the Inventory tab, the banner now reflects the correction — not the stale earlier figures', body.slice(0, 300));
+
+  console.log('— the real bug report: clearing opening stock must retire the "already loaded" warning, not just the underlying data —');
+  // clear via the real endpoint (same one the Clear-data tab calls) — the
+  // permanent opening_loads audit record survives this on purpose, but the
+  // warning that reads it must not go on citing figures that no longer exist
+  const clr = await fetch(`${B}/clear`, { method: 'POST', headers: { 'Content-Type': 'application/json', cookie: domCookie },
+    body: JSON.stringify({ hid: 'viraj', target: 'opening', confirm: 'Viraj Gastro' }) });
+  ok(clr.status === 200, 'opening stock clears for real', await clr.text());
+  doc.querySelector('#invOpening').click(); await tick(400);
+  const clearedModalBody = doc.querySelector('.modal').textContent;
+  ok(!/already loaded here/.test(clearedModalBody), 'the amber "already loaded" warning is GONE — there is nothing current left to replace', clearedModalBody.slice(0, 400));
+  ok(/has since been cleared/.test(clearedModalBody), 'a neutral note explains the history instead — a load happened before, but this upload starts fresh', clearedModalBody.slice(0, 400));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

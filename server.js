@@ -1014,7 +1014,7 @@ const CLEAR_TARGETS = {
   adjustments: { t: 'Stock adjustments', ranged: true, tables: ['stock_adjustments'] },
   snapshots:   { t: 'Imported stock reports', ranged: true, tables: ['expiry_snapshots'] },
   receivables: { t: 'Receivables', ranged: true, tables: ['receivables', 'receivable_actions'] },
-  items:       { t: 'Item Master', ranged: false, tables: ['items', 'price_log', 'pending_items', 'item_aliases'] },
+  items:       { t: 'Item Master', ranged: false, tables: ['items', 'price_log', 'pending_items', 'item_aliases', 'opening_batches'] },
   vendors:     { t: 'Vendors', ranged: false, tables: ['vendors'] },
   periods:     { t: 'Weekly / monthly entered sections', ranged: false, tables: ['period_data'] }
 };
@@ -2550,7 +2550,15 @@ app.get('/api/opening-loads', auth, (req, res) => {
   const hid = S(req.query.hid, 60);
   scopeCheck(req, hid);
   const rows = db.prepare('SELECT * FROM opening_loads WHERE hospital_id=? ORDER BY loaded_at DESC LIMIT 20').all(hid).map(rowOpeningLoad);
-  res.json({ loads: rows });
+  // the load record is a permanent AUDIT LOG (never cleared by "Clear opening
+  // stock" — that resets the count itself, not the history of what was
+  // counted), so its mere existence does not mean there is still anything to
+  // replace: a load that has since been cleared must not gate a fresh upload
+  // behind a warning naming figures that are no longer real. Checked fresh
+  // from the live tables, never inferred from the client's own cache.
+  const hasCurrentOpening = db.prepare('SELECT COUNT(*) c FROM items WHERE hospital_id=? AND opening_qty>0').get(hid).c > 0
+    || db.prepare('SELECT COUNT(*) c FROM opening_batches WHERE hospital_id=?').get(hid).c > 0;
+  res.json({ loads: rows, hasCurrentOpening });
 });
 
 app.post('/api/items/bulk', auth, requireRole('admin'), (req, res) => {

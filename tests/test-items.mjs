@@ -190,6 +190,12 @@ const editBtn = doc.querySelector('[data-iedit]'); editBtn.click(); await tick()
 setVal('#itNr', String(Number(doc.querySelector('#itNr').value) - 5));
 click('#itGo'); await tick();
 ok(lastToast().includes('updated'), 'price update flows', lastToast());
+// price history — one click from the Item Master toolbar to the tracker
+ok(!!doc.querySelector('#itmPriceHistory'), 'the Item Master toolbar has a Price history button — a price change is a click away, not a hunt through a different tab');
+click('#itmPriceHistory'); await tick(250);
+ok([...doc.querySelectorAll('[data-htab]')].find(b => b.dataset.htab === 'offers').classList.contains('active'), 'it navigates to the Margin offers tab (where the price ledger lives) and highlights it as active');
+ok(doc.body.textContent.includes('Price history'), 'landing directly on the Price history view, not the Offers list', doc.body.textContent.includes('Offers') + '/' + doc.body.textContent.includes('Price history'));
+htab('items'); await tick();
 // entry: manual invoice with margin mismatch chip
 htab('entry'); await tick();
 click('#invManualTop'); await tick(250);

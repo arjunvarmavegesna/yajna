@@ -112,29 +112,41 @@ await adm.req('POST', '/clear', { hid: 'mithra', target: 'receivables', from: '2
 
 console.log('— Opening stock clears WITHOUT taking the item master —');
 await seed();
-await adm.req('POST', '/items/opening', { hid: 'mithra', stockDate: addD(T, -5), rows: [{ name: 'OpenA', qty: 100, nr: 10, mrp: 20 }, { name: 'OpenB', qty: 50, nr: 5, mrp: 9 }] });
+await adm.req('POST', '/items/opening', { hid: 'mithra', stockDate: addD(T, -5), rows: [{ name: 'OpenA', qty: 100, nr: 10, mrp: 20, batch: 'OB1' }, { name: 'OpenB', qty: 50, nr: 5, mrp: 9 }] });
 ok((await counts()).opening === 2, 'the preview counts items carrying an opening count', (await counts()).opening);
 boot = (await adm.req('GET', '/bootstrap')).data;
 const itemsBefore = boot.items.mithra.length;
+// a real load record exists now — the actual bug report: this permanent
+// audit-log entry must NOT keep warning "already loaded" after the data it
+// describes is genuinely cleared
+await adm.req('POST', '/opening-loads', { hid: 'mithra', stockDate: addD(T, -5), itemsCount: 2, valueNr: 1250, valueMrp: 2450, fileName: 'seed.xlsx', source: 'template' });
+let loadCheck = await adm.req('GET', '/opening-loads?hid=mithra');
+ok(loadCheck.data.hasCurrentOpening === true, 'before clearing: real opening data exists, so hasCurrentOpening is true', loadCheck.data.hasCurrentOpening);
 r = await adm.req('POST', '/clear', { hid: 'mithra', target: 'opening', confirm: NAME });
 ok(r.status === 200 && r.data.deleted === 2, 'clearing opening stock reports what it zeroed', r.data.deleted);
 boot = (await adm.req('GET', '/bootstrap')).data;
 ok(boot.items.mithra.length === itemsBefore, 'the items are all still there — this is not the master', boot.items.mithra.length + ' vs ' + itemsBefore);
 ok(boot.items.mithra.every(i => i.openingQty === 0), 'but every opening count is zero');
+ok((boot.openingBatches.mithra || []).length === 0, 'and the batch rows behind it are gone too — nothing orphaned for the next load to collide with', (boot.openingBatches.mithra || []).length);
 const opA = boot.items.mithra.find(i => i.name === 'OpenA');
 ok(opA && opA.nr === 10 && opA.mrp === 20, 'and the negotiated prices survived — you can re-do a bad count without losing them', opA && opA.nr + '/' + opA.mrp);
 ok(boot.hospitals.mithra.stockDate === null, 'the counted-from anchor is dropped with the count', boot.hospitals.mithra.stockDate);
 ok((await counts()).opening === 0, 'and the preview drops to nothing');
+loadCheck = await adm.req('GET', '/opening-loads?hid=mithra');
+ok(loadCheck.data.loads.length >= 1, 'the load RECORD itself still exists — it is a permanent audit log, never cleared alongside the data', loadCheck.data.loads.length);
+ok(loadCheck.data.hasCurrentOpening === false, 'but hasCurrentOpening now correctly reads false — the "already loaded" warning must not fire on a record this stale', loadCheck.data.hasCurrentOpening);
 
 console.log('— the Item Master takes the opening count with it —');
 await seed();
-await adm.req('POST', '/items/opening', { hid: 'mithra', stockDate: addD(T, -5), rows: [{ name: 'ClearItem', qty: 50, nr: 1, mrp: 2 }] });
+await adm.req('POST', '/items/opening', { hid: 'mithra', stockDate: addD(T, -5), rows: [{ name: 'ClearItem', qty: 50, nr: 1, mrp: 2, batch: 'CI1' }] });
 boot = (await adm.req('GET', '/bootstrap')).data;
 ok(boot.hospitals.mithra.stockDate === addD(T, -5), 'the counted-from date is set');
+ok((boot.openingBatches.mithra || []).some(b => b.key === 'clearitem'), 'a real batch row exists for it', JSON.stringify(boot.openingBatches.mithra));
 r = await adm.req('POST', '/clear', { hid: 'mithra', target: 'items', confirm: NAME });
 boot = (await adm.req('GET', '/bootstrap')).data;
 ok(boot.items.mithra.length === 0, 'the master is empty');
 ok(boot.hospitals.mithra.stockDate === null, 'and the counted-from date is reset — the anchor went with the count', boot.hospitals.mithra.stockDate);
+ok((boot.openingBatches.mithra || []).length === 0, 'and its batch rows are gone too — clearing the master promises "AND the opening stock count", so nothing orphaned survives underneath it', JSON.stringify(boot.openingBatches.mithra));
 
 console.log('— clearing never reaches another hospital —');
 await adm.req('PUT', `/entries/viraj/${T}`, { entry: entry() });

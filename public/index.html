@@ -4727,12 +4727,13 @@ function renderItems(){
       <span style="flex:1"></span>
       <button class="btn btn-sm ${state.itemMultiBatchOnly?'btn-primary':''}" id="itmMultiBatch" title="Products currently holding stock across 2 or more distinct batches — worth checking the master price against each batch's own rate">${multiBatchCount} with 2+ batches</button>
       ${canEdit && pendCount? `<button class="btn btn-sm" id="itmPending" style="border-color:var(--amber);color:var(--amber);font-weight:700">${pendCount} new from purchases</button>`:''}
-      ${canEdit? `<button class="btn btn-sm" id="itmExport">${IC.dl} Export XLSX</button>
+      ${canEdit? `<button class="btn btn-sm" id="itmPriceHistory" title="Every price change on record — a purchase beating the margin, or a negotiated revision, either way">${IC.hist} Price history</button>
+      <button class="btn btn-sm" id="itmExport">${IC.dl} Export XLSX</button>
       <button class="btn btn-sm" id="itmTplTop" title="The item-master sheet — product, pack size, net rate and MRP per single strip">${IC.dl} Template</button>
       <button class="btn btn-sm" id="itmImport">${IC.up} Import</button>
       <button class="btn btn-sm btn-primary" id="itmAdd">${IC.plus} Add item</button>`:''}
     </div>
-    <p class="mini-note" style="margin:-6px 0 12px">Purchase price = NR per unit inclusive of GST. Margin = (MRP − NR) ÷ MRP. This is a REFERENCE price, not a live average — it is set once (an opening count, or a manually negotiated change) and after that only ever improves automatically, when a purchase beats it on margin. A worse-margin purchase never touches it — it is only flagged (±${MARGIN_TOL}% tolerance) so the master can never quietly erode to match a bad rate. Adjust it yourself any time via Update price; every change, automatic or negotiated, is on the Price history tab.</p>
+    <p class="mini-note" style="margin:-6px 0 12px">Purchase price = NR per unit inclusive of GST. Margin = (MRP − NR) ÷ MRP. This is a REFERENCE price, not a live average — it is set once (an opening count, or a manually negotiated change) and after that only ever improves automatically, when a purchase beats it on margin. A worse-margin purchase never touches it — it is only flagged (±${MARGIN_TOL}% tolerance) so the master can never quietly erode to match a bad rate. Adjust it yourself any time via Update price; every change, automatic or negotiated, is one click away in <b>Price history</b> above.</p>
     ${state.itemMultiBatchOnly? '<p class="mini-note">Showing only products currently on 2 or more batches.</p>':''}
     <div class="card"><div class="tbl-scroll"><table class="tbl">
       <thead><tr><th>Product name</th><th>Molecule / salt</th><th>Pack size</th><th class="r" title="Distinct batches currently holding stock for this product">Batches</th><th class="r" title="Cost of ONE strip, inclusive of GST — the master's reference rate, not necessarily every batch's own rate">Net rate / strip ₹</th><th class="r" title="Printed MRP of ONE strip">MRP / strip ₹</th><th class="r" title="(MRP − net rate) ÷ MRP — a ratio, so the pack size does not change it">Expected margin</th><th>Updated</th>${canEdit?'<th></th>':''}</tr></thead>
@@ -4763,6 +4764,7 @@ function renderItems(){
   const ie=$('#itmExport'); if(ie) ie.onclick=()=> exportItems(hid, list.map(it=>it.id));
   const ipd=$('#itmPending'); if(ipd) ipd.onclick=()=> pendingDrawer(hid);
   const imb=$('#itmMultiBatch'); if(imb) imb.onclick=()=>{ state.itemMultiBatchOnly = !state.itemMultiBatchOnly; renderItems(); };
+  const iph=$('#itmPriceHistory'); if(iph) iph.onclick=()=>{ state.hospTab='offers'; state.offView='history'; renderApp(); window.scrollTo({top:0}); };
   $$('[data-iedit]').forEach(b=> b.onclick=()=> itemModal((db.items[hid]||[]).find(x=>x.id===b.dataset.iedit)));
 }
 
@@ -6844,7 +6846,8 @@ function openingStockModal(hid){
   let valNr = 0, valMrp = 0;   // this file's own totals — set by preview(), read again on save
   let productCount = 0;   // distinct products, not batch-line rows — set by preview(), read again on save
   let saveCautions = [];  // merges reported by /items/opening at SAVE time (e.g. same batch twice, rates agreeing) — distinct from lastMeta.cautions, which are read-time only
-  let priorLoad = null;        // the most recent recorded load, if any — for the second-load warning
+  let priorLoad = null;        // the most recent recorded load — ONLY set when it still reflects real, current data
+  let priorLoadCleared = null; // a load record exists, but the data it describes has since been cleared — informational, not a gate
   openModal(`
     <div class="modal-head"><h3>Opening stock — ${esc(h.name||'')}</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
@@ -6871,11 +6874,25 @@ function openingStockModal(hid){
   // overwritten before a single row is ever read
   const renderPriorLoadNote = ()=>{
     const el = $('#osPriorLoad'); if(!el) return;
-    if(!priorLoad){ el.innerHTML = ''; return; }
-    el.innerHTML = `<p class="mini-note" style="color:var(--amber);margin:0 0 12px">⚠ Opening stock was already loaded here — counted as on <b>${fmtDateShort(priorLoad.stockDate)}</b>, ${priorLoad.itemsCount} item${priorLoad.itemsCount===1?'':'s'}, ${fmtRs(priorLoad.valueNr)} at cost / ${fmtRs(priorLoad.valueMrp)} at MRP, loaded by ${esc(priorLoad.loadedBy||'—')} on ${fmtDateShort(iso(new Date(priorLoad.loadedAt)))}. Uploading again will <b>replace</b> those figures, not add to them — make sure this is a real correction.</p>`;
+    if(priorLoad){
+      el.innerHTML = `<p class="mini-note" style="color:var(--amber);margin:0 0 12px">⚠ Opening stock was already loaded here — counted as on <b>${fmtDateShort(priorLoad.stockDate)}</b>, ${priorLoad.itemsCount} item${priorLoad.itemsCount===1?'':'s'}, ${fmtRs(priorLoad.valueNr)} at cost / ${fmtRs(priorLoad.valueMrp)} at MRP, loaded by ${esc(priorLoad.loadedBy||'—')} on ${fmtDateShort(iso(new Date(priorLoad.loadedAt)))}. Uploading again will <b>replace</b> those figures, not add to them — make sure this is a real correction.</p>`;
+    } else if(priorLoadCleared){
+      el.innerHTML = `<p class="mini-note" style="margin:0 0 12px">Opening stock was loaded here before — counted as on ${fmtDateShort(priorLoadCleared.stockDate)}, ${priorLoadCleared.itemsCount} item${priorLoadCleared.itemsCount===1?'':'s'}, loaded by ${esc(priorLoadCleared.loadedBy||'—')} — but that count has since been cleared. This upload starts fresh; there is nothing to replace.</p>`;
+    } else {
+      el.innerHTML = '';
+    }
   };
   if(!state.demo){
-    api(`/opening-loads?hid=${encodeURIComponent(hid)}`).then(r=>{ priorLoad = (r.loads||[])[0]||null; renderPriorLoadNote(); }).catch(()=>{});
+    // the load record is a permanent audit log — never cleared alongside the
+    // opening stock data itself — so its mere existence does not mean there
+    // is still anything to replace; hasCurrentOpening (checked fresh, server-
+    // side) is what actually decides whether the warning/confirm-gate fires
+    api(`/opening-loads?hid=${encodeURIComponent(hid)}`).then(r=>{
+      const rec = (r.loads||[])[0]||null;
+      priorLoad = r.hasCurrentOpening? rec : null;
+      priorLoadCleared = (rec && !r.hasCurrentOpening)? rec : null;
+      renderPriorLoadNote();
+    }).catch(()=>{});
   }
 
   // rows dropped at READ time — shown before the user commits; the full
