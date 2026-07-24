@@ -116,6 +116,21 @@ click('[data-invf="neg"]'); await tick(150);
 ok(content().includes('No items match') || doc.querySelectorAll('tbody tr').length >= 1, 'negative filter runs');
 click('[data-invf="all"]'); await tick(150);
 
+// column sorting — click a header to sort by it, click again to reverse
+const rowNames = () => [...doc.querySelectorAll('#invBody tbody tr')].map(tr => tr.querySelector('td b')).filter(Boolean).map(b => b.textContent);
+const unsorted = rowNames();
+click('[data-sortkey="name"]'); await tick(150);
+const ascNames = rowNames();
+ok(JSON.stringify(ascNames) === JSON.stringify(unsorted.slice().sort((a, b) => a.localeCompare(b))), 'clicking Product name sorts the rows alphabetically', JSON.stringify({ ascNames, unsorted }));
+ok(doc.querySelector('[data-sortkey="name"]').textContent.includes('▲'), 'the header shows an ascending arrow');
+click('[data-sortkey="name"]'); await tick(150);
+const descNames = rowNames();
+ok(JSON.stringify(descNames) === JSON.stringify(ascNames.slice().reverse()), 'clicking the SAME header again reverses to descending', JSON.stringify({ descNames, ascNames }));
+ok(doc.querySelector('[data-sortkey="name"]').textContent.includes('▼'), 'and the arrow flips');
+click('[data-sortkey="stock"]'); await tick(150);
+ok(doc.querySelector('[data-sortkey="stock"]').textContent.includes('▲'), 'sorting by a DIFFERENT column (In stock) starts fresh at ascending');
+ok(!doc.querySelector('[data-sortkey="name"]').textContent.match(/[▲▼]/), 'and the previous column\'s arrow is gone — only one column sorts at a time');
+
 // negative stock detection: sell more than we have
 r = await adm.req('PUT', `/entries/mithra/${T}`, { entry: {
   purchases: [], rtv: [], sales: {}, audit: { opening: 0, actual: '', unbilled: false, bounces: [] }, hv: [], invoices: [],

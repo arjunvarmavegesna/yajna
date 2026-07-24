@@ -717,12 +717,16 @@ function salesStockImpact(hid, rows){
     clean.push(b.name);
   });
 
-  /* Named batches get a SEPARATE, ADDITIONAL check — never instead of the
-     item-level one above. The item-level check alone can miss a row that
-     names a real but wrong or depleted batch on an otherwise well-stocked
-     product; this check alone would miss a cumulative oversell spread across
-     several unnamed rows. Both run, independently. */
-  const batchNotFound=[], batchInsufficient=[];
+  /* A named batch is checked against this product's OWN batches — never
+     instead of the item-level check above. A named batch that never
+     existed for this product at all is worth flagging as a possible typo:
+     the sale still draws from whatever real stock exists (see draw() — a
+     named batch running short, or already empty, spills over into the
+     product's other batches automatically, oldest-expiring first, exactly
+     like an unnamed sale), so this is informational, not a block. What the
+     item-level check above already catches is what still matters here: the
+     PRODUCT going negative overall, regardless of which batch was named. */
+  const batchNotFound=[];
   const byItemBatch = new Map();
   rows.forEach(r=>{
     const bn = String(r.batch||'').trim();
@@ -734,16 +738,9 @@ function salesStockImpact(hid, rows){
     byItemBatch.get(k).qty += num(r.qty);
   });
   if(byItemBatch.size){
-    const lotByKeyBatch = {};
-    snap.batches.forEach(b=>{
-      const bk = b.key+'|'+String(b.batchNo||'').trim().toLowerCase();
-      lotByKeyBatch[bk] = (lotByKeyBatch[bk]||0) + b.qty;
-    });
+    const knownBatchKeys = new Set(snap.batches.map(b=> b.key+'|'+String(b.batchNo||'').trim().toLowerCase()));
     byItemBatch.forEach(b=>{
-      const bk = b.key+'|'+b.batch.toLowerCase();
-      const have = lotByKeyBatch[bk];
-      if(have===undefined){ batchNotFound.push({name:b.name, batch:b.batch}); return; }
-      if(have - b.qty < -0.0000001) batchInsufficient.push({name:b.name, batch:b.batch, have, selling:b.qty});
+      if(!knownBatchKeys.has(b.key+'|'+b.batch.toLowerCase())) batchNotFound.push({name:b.name, batch:b.batch});
     });
   }
 
@@ -752,7 +749,7 @@ function salesStockImpact(hid, rows){
     stockNowItems: snap.items.length, stockNowValue: snap.valueNr,
     reportItems: byItem.size, reportStrips, reportCogs: cogs,
     stockAfterValue: snap.valueNr - cogs,
-    notFound, negative, clean, batchNotFound, batchInsufficient
+    notFound, negative, clean, batchNotFound
   };
 }
 function renderStockImpact(impact){
@@ -769,11 +766,10 @@ function renderStockImpact(impact){
       <div class="kpi"><div class="l">This report sells</div><div class="v num" style="font-size:16px">${impact.reportItems} items · ${fmtQ(impact.reportStrips)} strips</div><div class="d">${fmtRs(impact.reportCogs)} at cost</div></div>
     </div>
     <p class="mini-note" style="margin:0 0 8px"><b>Stock after: ${impact.stockNowItems} items · ${fmtRs(impact.stockAfterValue)} at cost</b> <span style="color:var(--faint)">(${fmtN(impact.stockNowValue)} − ${fmtN(impact.reportCogs)} = ${fmtN(impact.stockAfterValue)})</span></p>
-    <p class="mini-note"><b>${adjusted} item${adjusted===1?'':'s'} adjusted</b>${impact.notFound.length? ` · <span style="color:var(--red)">${impact.notFound.length} not found in inventory — nothing deducted</span>`:''}${impact.negative.length? ` · <span style="color:var(--red)">${impact.negative.length} would go negative</span>`:''}${impact.batchNotFound&&impact.batchNotFound.length? ` · <span style="color:var(--red)">${impact.batchNotFound.length} named batch${impact.batchNotFound.length===1?'':'es'} not found</span>`:''}${impact.batchInsufficient&&impact.batchInsufficient.length? ` · <span style="color:var(--red)">${impact.batchInsufficient.length} named batch${impact.batchInsufficient.length===1?'':'es'} short of stock</span>`:''}</p>
+    <p class="mini-note"><b>${adjusted} item${adjusted===1?'':'s'} adjusted</b>${impact.notFound.length? ` · <span style="color:var(--red)">${impact.notFound.length} not found in inventory — nothing deducted</span>`:''}${impact.negative.length? ` · <span style="color:var(--red)">${impact.negative.length} would go negative</span>`:''}${impact.batchNotFound&&impact.batchNotFound.length? ` · <span style="color:var(--amber)">${impact.batchNotFound.length} named batch${impact.batchNotFound.length===1?'':'es'} not on record</span>`:''}</p>
     ${impact.notFound.length? `<p class="mini-note" style="color:var(--red)">Not on the Item Master, so the sale records but nothing comes off any real shelf: ${impact.notFound.slice(0,8).map(esc).join(', ')}${impact.notFound.length>8?`, +${impact.notFound.length-8} more`:''}. Fix the name (a typo, or add it to the Item Master) and re-read.</p>`:''}
     ${impact.negative.length? `<p class="mini-note" style="color:var(--red)">Would go negative — a symptom of a missed purchase or a short opening count, not just a low stock level: ${impact.negative.slice(0,8).map(n=>`${esc(n.name)} (has ${fmtQ(n.have)}, selling ${fmtQ(n.selling)})`).join(', ')}${impact.negative.length>8?`, +${impact.negative.length-8} more`:''}.</p>`:''}
-    ${impact.batchNotFound&&impact.batchNotFound.length? `<p class="mini-note" style="color:var(--red)">Named a batch that doesn't exist on record — the sale records, but not against that lot: ${impact.batchNotFound.slice(0,8).map(n=>`${esc(n.name)} (batch "${esc(n.batch)}")`).join(', ')}${impact.batchNotFound.length>8?`, +${impact.batchNotFound.length-8} more`:''}. Check the batch number, or leave it blank to fall back to first-expiry-first-out.</p>`:''}
-    ${impact.batchInsufficient&&impact.batchInsufficient.length? `<p class="mini-note" style="color:var(--red)">The named batch exists but doesn't have enough left — a real signal about the count or the billing, not just guessed away: ${impact.batchInsufficient.slice(0,8).map(n=>`${esc(n.name)} batch "${esc(n.batch)}" (has ${fmtQ(n.have)}, selling ${fmtQ(n.selling)})`).join(', ')}${impact.batchInsufficient.length>8?`, +${impact.batchInsufficient.length-8} more`:''}.</p>`:''}`;
+    ${impact.batchNotFound&&impact.batchNotFound.length? `<p class="mini-note" style="color:var(--amber)">Named a batch that doesn't match anything on record for that product — the sale still draws from whatever real stock exists (oldest-expiring first), but worth checking it isn't a typo: ${impact.batchNotFound.slice(0,8).map(n=>`${esc(n.name)} (batch "${esc(n.batch)}")`).join(', ')}${impact.batchNotFound.length>8?`, +${impact.batchNotFound.length-8} more`:''}.</p>`:''}`;
 }
 const MARGIN_TOL = 2; // percentage points, mirrors the server
 
@@ -1233,7 +1229,7 @@ function healthScore(hid, ym){
 function scoreBand(s){ return s>=85? {c:'green',t:'Healthy'} : s>=70? {c:'amber',t:'Needs attention'} : {c:'red',t:'Serious review needed'}; }
 
 /* ---------------- state / auth / routing ---------------- */
-const state = { user:null, demo:false, aiEnabled:false, view:'hospitals', hospital:null, hospTab:'entry', date:todayISO(), entryTab:0, entryMode:'daily', entryMonth:monthKey(todayISO()), reportType:'daily', reportDate:todayISO(), reportMonth:monthKey(todayISO()), unlocked:{}, lastReportHTML:'', lastSummary:'', itemQuery:'', invQuery:'', invFilter:'all', invOpen:null, inv:null, clr:null, rcvFilter:{party:'all',bucket:'all',status:'all',assigned:'all',overdueOnly:false,dueToday:false}, rcvSort:'due', rcvSel:[], rcvOpen:null };
+const state = { user:null, demo:false, aiEnabled:false, view:'hospitals', hospital:null, hospTab:'entry', date:todayISO(), entryTab:0, entryMode:'daily', entryMonth:monthKey(todayISO()), reportType:'daily', reportDate:todayISO(), reportMonth:monthKey(todayISO()), unlocked:{}, lastReportHTML:'', lastSummary:'', itemQuery:'', invQuery:'', invFilter:'all', invSort:null, invOpen:null, inv:null, clr:null, rcvFilter:{party:'all',bucket:'all',status:'all',assigned:'all',overdueOnly:false,dueToday:false}, rcvSort:'due', rcvSel:[], rcvOpen:null };
 
 function toast(msg, kind){
   const t = document.createElement('div');
@@ -1710,34 +1706,52 @@ function stockLedger(hid){
 
   const issues = {unbatched:0, noExpiry:0, unsourced:[]};
 
-  // pull `need` units out of `key` on `date`, oldest-expiring first. When
-  // wantBatch names a real batch, draw ONLY from lot(s) matching it — a sale
-  // that names its batch should consume THAT stock, never guess via FEFO.
+  // pull `need` units out of `key` on `date`. When wantBatch names a real
+  // batch, draw from THAT lot FIRST — a sale that names its batch should
+  // consume THAT stock, never guess via FEFO while it still has some. If
+  // the named batch runs short (or is already empty), the REMAINDER spills
+  // over into the product's other batches, oldest-expiring first, exactly
+  // like an unnamed sale would — naming a batch says "start here", not
+  // "only here". Only once every batch of this product is exhausted does
+  // the shortfall register as a genuine oversell.
   const draw = (key, date, need, type, ref, by, name, wantBatch)=>{
     const want = String(wantBatch||'').trim();
     const usableWant = want && !RESERVED_BATCH.has(want.toLowerCase()) ? want : '';
-    const forWant = (all)=> usableWant
-      ? all.filter(l=> String(l.batchNo||'').trim().toLowerCase()===usableWant.toLowerCase())
-      : all;
-    for(const lot of forWant(issueOrder(key, date))){
-      if(need<=0) break;
-      if(lot.remaining<=0) continue;
-      const take = Math.min(need, lot.remaining);
-      lot.remaining -= take; need -= take;
-      move(date, lot, type, -take, ref, by);
+    const isNamed = l=> String(l.batchNo||'').trim().toLowerCase()===usableWant.toLowerCase();
+
+    if(usableWant){
+      for(const lot of issueOrder(key, date).filter(isNamed)){
+        if(need<=0) break;
+        if(lot.remaining<=0) continue;
+        const take = Math.min(need, lot.remaining);
+        lot.remaining -= take; need -= take;
+        move(date, lot, type, -take, ref, by);
+      }
     }
     if(need>0.0000001){
-      // more went out than ever came in. NEVER clamp to zero — that hides the
-      // defect. The shortfall lands on a real lot so it carries a real cost —
-      // the SAME named lot if one was named (letting it go negative, same as
-      // any other oversell), or the app's usual UNSOURCED fallback otherwise.
-      const cands = forWant(issueOrder(key, date));
-      let lot = cands[cands.length-1];
+      for(const lot of issueOrder(key, date).filter(l=> !usableWant || !isNamed(l))){
+        if(need<=0) break;
+        if(lot.remaining<=0) continue;
+        const take = Math.min(need, lot.remaining);
+        lot.remaining -= take; need -= take;
+        move(date, lot, type, -take, ref, by);
+      }
+    }
+    if(need>0.0000001){
+      // more went out than every batch of this product ever received,
+      // combined. NEVER clamp to zero — that hides the defect. The
+      // shortfall lands on a real lot so it carries a real cost: the named
+      // lot if one existed (already empty by now, but the most honest place
+      // to show where the deficit started), the last lot in issue order
+      // otherwise, or the app's usual UNSOURCED fallback when this product
+      // has no lots on record AT ALL.
+      const all = issueOrder(key, date);
+      let lot = (usableWant && all.find(isNamed)) || all[all.length-1];
       if(!lot){
         const m = master[key];
         lot = addLot({key, name: name||(m?m.name:key), batchNo: usableWant? `BATCH NOT FOUND: ${usableWant}` : 'UNSOURCED', exp:null,
           nr: m? num(m.nr):0, mrp: m? num(m.mrp):0, received:from, synthetic:'unsourced',
-          src: usableWant? `Named batch "${usableWant}" not found` : 'No receipt on record'});
+          src: usableWant? `Named batch "${usableWant}" not found — no receipt at all for this product` : 'No receipt on record'});
         lot.qtyReceived = 0;
         issues.unsourced.push(name||key);
       }
@@ -6413,7 +6427,26 @@ function invAsOfView(hid, canEdit){
   else if(f==='adj') list = list.filter(i=> i.adj);
   else if(f==='expiring') list = list.filter(i=> i.batches.some(b=> b.qty>0 && ['expired','b30','b90'].includes(expiryBucketOf(b, v.asOf))));
 
-
+  // click a column header to sort by it, click again to reverse — the
+  // default (no key set) is the same name-ascending order rollupItems
+  // already returns, so an unsorted table looks exactly as it always has
+  const INV_SORT_KEYS = {
+    name: i=> i.name.toLowerCase(), pack: i=> (i.pack||'').toLowerCase(),
+    nr: i=> num(i.nrStrip), mrp: i=> num(i.mrpStrip),
+    opening: i=> num(i.opening), purchased: i=> num(i.purchased), sold: i=> num(i.sold),
+    rtv: i=> num(i.rtv), adj: i=> num(i.adj), stock: i=> num(i.stock),
+    valueNr: i=> num(i.valueNr), valueMrp: i=> num(i.valueMrp),
+    potentialRs: i=> num(i.potentialRs), potentialPct: i=> num(i.potentialPct),
+    nearestExp: i=> i.nearestExp || '9999-99',   // no expiry sorts last, ascending or descending
+    lots: i=> i.batches.filter(b=>b.qty!==0).length, lastMove: i=> i.lastMove || ''
+  };
+  if(!state.invSort) state.invSort = {key:null, dir:'asc'};
+  if(state.invSort.key && INV_SORT_KEYS[state.invSort.key]){
+    const kf = INV_SORT_KEYS[state.invSort.key], dir = state.invSort.dir==='asc'? 1 : -1;
+    list = list.slice().sort((a,b)=>{ const av=kf(a), bv=kf(b); return av<bv? -dir : av>bv? dir : 0; });
+  }
+  const sortArrow = key => state.invSort.key===key? (state.invSort.dir==='asc'? ' <span style="font-size:9px">▲</span>' : ' <span style="font-size:9px">▼</span>') : '';
+  const sortTh = key => `data-sortkey="${key}" style="cursor:pointer;user-select:none"`;
 
   $('#invBody').innerHTML = `
     ${invWarnings(s)}
@@ -6455,12 +6488,12 @@ function invAsOfView(hid, canEdit){
       <span class="eyebrow">${list.length} of ${s.items.length}</span>
     </div>
     <div class="card"><div class="tbl-scroll"><table class="tbl">
-      <thead><tr><th>Product name</th><th>Pack size</th>
-        <th class="r" title="Cost of ONE ${UW}, inclusive of GST${QV==='tablets'? ' — the strip rate ÷ pack':''}. Where lots differ this is the weighted average of the lots holding stock — open the row for the true per-lot rates.">Net rate / ${UW} ₹</th>
-        <th class="r" title="Printed MRP of ONE ${UW}${QV==='tablets'? ' — the strip MRP ÷ pack':''}, weighted the same way">MRP / ${UW} ₹</th>
-        <th class="r" title="${qtyTitle}">Opening / ${UW}</th><th class="r" title="${qtyTitle}">Purchased / ${UW}</th><th class="r" title="${qtyTitle}">Sold / ${UW}</th><th class="r" title="${qtyTitle}">RTV / ${UW}</th><th class="r" title="${qtyTitle}">Adjusted / ${UW}</th>
-        <th class="r" title="${qtyTitle} on hand">In stock / ${UW}</th><th class="r" title="Strips × net rate of one strip — IDENTICAL in every view mode">Value (NR)</th><th class="r" title="Strips × MRP of one strip — identical in every view mode">MRP value</th><th class="r">Pot. margin ₹</th><th class="r">Pot. margin %</th>
-        ${tb? '<th>Nearest expiry</th>':''}<th class="r" title="One lot per purchase line — each carries its own frozen net rate">Lots</th><th>Last move</th><th></th></tr></thead>
+      <thead><tr><th ${sortTh('name')}>Product name${sortArrow('name')}</th><th ${sortTh('pack')}>Pack size${sortArrow('pack')}</th>
+        <th class="r" ${sortTh('nr')} title="Cost of ONE ${UW}, inclusive of GST${QV==='tablets'? ' — the strip rate ÷ pack':''}. Where lots differ this is the weighted average of the lots holding stock — open the row for the true per-lot rates.">Net rate / ${UW} ₹${sortArrow('nr')}</th>
+        <th class="r" ${sortTh('mrp')} title="Printed MRP of ONE ${UW}${QV==='tablets'? ' — the strip MRP ÷ pack':''}, weighted the same way">MRP / ${UW} ₹${sortArrow('mrp')}</th>
+        <th class="r" ${sortTh('opening')} title="${qtyTitle}">Opening / ${UW}${sortArrow('opening')}</th><th class="r" ${sortTh('purchased')} title="${qtyTitle}">Purchased / ${UW}${sortArrow('purchased')}</th><th class="r" ${sortTh('sold')} title="${qtyTitle}">Sold / ${UW}${sortArrow('sold')}</th><th class="r" ${sortTh('rtv')} title="${qtyTitle}">RTV / ${UW}${sortArrow('rtv')}</th><th class="r" ${sortTh('adj')} title="${qtyTitle}">Adjusted / ${UW}${sortArrow('adj')}</th>
+        <th class="r" ${sortTh('stock')} title="${qtyTitle} on hand">In stock / ${UW}${sortArrow('stock')}</th><th class="r" ${sortTh('valueNr')} title="Strips × net rate of one strip — IDENTICAL in every view mode">Value (NR)${sortArrow('valueNr')}</th><th class="r" ${sortTh('valueMrp')} title="Strips × MRP of one strip — identical in every view mode">MRP value${sortArrow('valueMrp')}</th><th class="r" ${sortTh('potentialRs')}>Pot. margin ₹${sortArrow('potentialRs')}</th><th class="r" ${sortTh('potentialPct')}>Pot. margin %${sortArrow('potentialPct')}</th>
+        ${tb? `<th ${sortTh('nearestExp')}>Nearest expiry${sortArrow('nearestExp')}</th>`:''}<th class="r" ${sortTh('lots')} title="One lot per purchase line — each carries its own frozen net rate">Lots${sortArrow('lots')}</th><th ${sortTh('lastMove')}>Last move${sortArrow('lastMove')}</th><th></th></tr></thead>
       <tbody>${list.slice(0,400).map(i=>{
         const col = i.stock<0? 'var(--red)' : i.stock===0? 'var(--amber)' : 'var(--ink)';
         const open = state.invOpen===i.key;
@@ -6568,6 +6601,13 @@ function wireInvTable(hid){
   $$('[data-invexp]').forEach(b=> b.onclick=()=>{ state.invOpen = state.invOpen===b.dataset.invexp? null : b.dataset.invexp; renderInventory(); });
   $$('[data-invled]').forEach(b=> b.onclick=()=> ledgerModal(hid, b.dataset.invled));
   $$('[data-invadj]').forEach(b=> b.onclick=()=> adjustModal(hid, b.dataset.invadj));
+  $$('[data-sortkey]').forEach(th=> th.onclick=()=>{
+    const k = th.dataset.sortkey;
+    if(!state.invSort) state.invSort = {key:null, dir:'asc'};
+    if(state.invSort.key===k) state.invSort.dir = state.invSort.dir==='asc'? 'desc' : 'asc';
+    else state.invSort = {key:k, dir:'asc'};
+    renderInventory();
+  });
 }
 
 function invBetweenView(hid){

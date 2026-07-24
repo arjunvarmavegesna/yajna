@@ -276,7 +276,7 @@ console.log('— purchase-margin RATCHET: the master only ever improves automati
   ok(stub.nr === 7, 'the ratcheted price replaces the stub item in the local mirror, matched by id', JSON.stringify(stub));
 }
 
-console.log('— named-batch sales: consumes the NAMED batch, FEFO still works with none, a bad name is reported —');
+console.log('— named-batch sales: consumes the NAMED batch first, SPILLS OVER into the product\'s other batches when it runs short, FEFO still works with none —');
 {
   const html = fs.readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   const dom = new JSDOM(html, { url: 'http://127.0.0.1:3061/', runScripts: 'dangerously', pretendToBeVisual: true,
@@ -303,7 +303,7 @@ console.log('— named-batch sales: consumes the NAMED batch, FEFO still works w
   `);
   let s = J(`stockAsOf('nb','2026-02-01')`);
   const qOf = n => s.batches.find(b => b.batchNo === n).qty;
-  ok(qOf('NY') === 25, 'naming batch NY takes it straight from NY (40-15=25), leaving NX untouched', JSON.stringify({ NX: qOf('NX'), NY: qOf('NY') }));
+  ok(qOf('NY') === 25, 'naming batch NY takes it straight from NY (40-15=25), leaving NX untouched — plenty of stock, nothing to spill over', JSON.stringify({ NX: qOf('NX'), NY: qOf('NY') }));
   ok(qOf('NX') === 50, 'NX (not named) is completely untouched by the named sale', qOf('NX'));
 
   // now a sale with NO batch named — falls back to FEFO as always
@@ -314,24 +314,74 @@ console.log('— named-batch sales: consumes the NAMED batch, FEFO still works w
   const qOf2 = n => s.batches.find(b => b.batchNo === n).qty;
   ok(qOf2('NY') === 15, 'FEFO (earlier expiry first) drains the rest of NY, not NX', JSON.stringify({ NX: qOf2('NX'), NY: qOf2('NY') }));
 
-  // a sale naming a batch that doesn't exist / doesn't have enough stock
+  console.log('  — Arjun\'s worked example: batch A(=NY) only has 15, sale names it for 20 — 15 from NY, the other 5 spills into NX —');
   ev(`db.dailyData.nb['2026-02-03'] = {purchases:[],rtv:[],invoices:[],hv:[],
     sales:{mrp:0,cogs:0,cash:0,credit:0,cancels:0}, cash:{}, audit:{opening:0,actual:'',unbilled:false,bounces:[]}, savedAt:1,
-    itemSales:[{item:'Nombre', qty:5, amount:0, batch:'GHOST'}]};`);
+    itemSales:[{item:'Nombre', qty:20, amount:0, batch:'NY'}]};`);
   s = J(`stockAsOf('nb','2026-02-03')`);
-  const ghostLot = s.batches.find(b => b.batchNo && b.batchNo.includes('GHOST'));
-  ok(ghostLot, 'a batch name with no matching lot gets its own distinctly-labeled synthetic lot, not a silent FEFO fallback', JSON.stringify(s.batches.map(b => b.batchNo)));
+  const qOf3 = n => s.batches.find(b => b.batchNo === n).qty;
+  ok(qOf3('NY') === 0, 'NY is fully drained (15 of the 20), not pushed negative', qOf3('NY'));
+  ok(qOf3('NX') === 45, 'the remaining 5 came from NX automatically — naming a batch means "start here", not "only here" (50-5=45)', qOf3('NX'));
+  ok(!s.negBatches.some(b => b.key === 'nombre'), 'no negative batch is recorded — the whole 20 was satisfied from real stock', JSON.stringify(s.negBatches));
 
-  const impact = J(`salesStockImpact('nb', [{item:'Nombre', qty:1000, batch:'GHOST'}])`);
-  ok(impact.batchNotFound && impact.batchNotFound.length === 1, 'the preview-time check flags the nonexistent batch by name before anything saves', JSON.stringify(impact.batchNotFound));
-  const impact2 = J(`salesStockImpact('nb', [{item:'Nombre', qty:1000, batch:'NX'}])`);
-  ok(impact2.batchInsufficient && impact2.batchInsufficient.length === 1, 'naming a real batch without enough stock in it is flagged too, distinct from "batch not found"', JSON.stringify(impact2.batchInsufficient));
-
-  console.log('— a sentinel-like batch value is never mistaken for a real one —');
+  console.log('  — next sale names the SAME now-empty batch: nothing in it, so the full amount comes from the other batch —');
   ev(`db.dailyData.nb['2026-02-04'] = {purchases:[],rtv:[],invoices:[],hv:[],
     sales:{mrp:0,cogs:0,cash:0,credit:0,cancels:0}, cash:{}, audit:{opening:0,actual:'',unbilled:false,bounces:[]}, savedAt:1,
-    itemSales:[{item:'Nombre', qty:3, amount:0, batch:'—'}]};`);
+    itemSales:[{item:'Nombre', qty:5, amount:0, batch:'NY'}]};`);
   s = J(`stockAsOf('nb','2026-02-04')`);
+  const qOf4 = n => s.batches.find(b => b.batchNo === n).qty;
+  ok(qOf4('NY') === 0, 'NY stays at 0 — nothing to draw from it', qOf4('NY'));
+  ok(qOf4('NX') === 40, 'the whole 5 came from NX (45-5=40)', qOf4('NX'));
+
+  console.log('  — only once EVERY batch is genuinely exhausted does it go negative, landing on the named batch —');
+  ev(`db.dailyData.nb['2026-02-05'] = {purchases:[],rtv:[],invoices:[],hv:[],
+    sales:{mrp:0,cogs:0,cash:0,credit:0,cancels:0}, cash:{}, audit:{opening:0,actual:'',unbilled:false,bounces:[]}, savedAt:1,
+    itemSales:[{item:'Nombre', qty:40, amount:0, batch:'NY'}]};`);   // drains the rest of NX too (both now 0)
+  ev(`db.dailyData.nb['2026-02-06'] = {purchases:[],rtv:[],invoices:[],hv:[],
+    sales:{mrp:0,cogs:0,cash:0,credit:0,cancels:0}, cash:{}, audit:{opening:0,actual:'',unbilled:false,bounces:[]}, savedAt:1,
+    itemSales:[{item:'Nombre', qty:5, amount:0, batch:'NY'}]};`);
+  s = J(`stockAsOf('nb','2026-02-06')`);
+  const qOf6 = n => s.batches.find(b => b.batchNo === n).qty;
+  ok(qOf6('NX') === 0 && qOf6('NY') === -5, 'NX sits at exactly 0 (nothing left) and the deficit lands on NY — the named batch — going negative, never silently clamped', JSON.stringify({ NX: qOf6('NX'), NY: qOf6('NY') }));
+  ok(s.negBatches.some(b => b.batchNo === 'NY' && near(b.qty, -5)), 'and it is surfaced as a real negative batch, the way any other oversell is', JSON.stringify(s.negBatches.map(b => ({ b: b.batchNo, q: b.qty }))));
+
+  console.log('  — a named batch that never existed AT ALL for this product still draws from real stock (cascades), just flagged as a possible typo —');
+  ev(`
+    db.hospitals.nb2 = {id:'nb2', name:'NB2', doctor:'D', location:'', phone:'', startDate:'2026-01-01', stockDate:'2026-01-10', issueMethod:'fefo', active:true, base:1000};
+    db.items.nb2 = [
+      {id:'w1', name:'Widget', key:'widget', pack:'10s', nr:5, mrp:10, openingQty:0, source:'t', updatedAt:1},
+      {id:'w2', name:'Ghostly', key:'ghostly', pack:'10s', nr:5, mrp:10, openingQty:0, source:'t', updatedAt:1}
+    ];
+    db.adjustments.nb2 = []; db.dailyData.nb2 = {}; db.vendors.nb2 = []; db.payments.nb2 = []; db.receivables.nb2 = []; db.recvActions.nb2 = [];
+    db.openingBatches.nb2 = [
+      {id:'ob3', key:'widget', name:'Widget', pack:'10s', batch:'REAL1', exp:'2027-01', qty:20, nr:5, mrp:10, stockDate:'2026-01-10', loadedAt:1}
+    ];
+    db.dailyData.nb2['2026-02-01'] = {purchases:[],rtv:[],invoices:[],hv:[],
+      sales:{mrp:0,cogs:0,cash:0,credit:0,cancels:0}, cash:{}, audit:{opening:0,actual:'',unbilled:false,bounces:[]}, savedAt:1,
+      itemSales:[{item:'Widget', qty:8, amount:0, batch:'TYPO'}]};
+  `);
+  let s2 = J(`stockAsOf('nb2','2026-02-01')`);
+  const real1 = s2.batches.find(b => b.batchNo === 'REAL1');
+  ok(real1 && real1.qty === 12, 'a batch name that matches nothing still cascades to REAL1 (20-8=12) — never a phantom lot when real stock exists', real1 && real1.qty);
+  ok(!s2.batches.some(b => b.batchNo && b.batchNo.includes('TYPO')), 'and no synthetic "TYPO" lot is created — the sale drew from the real shelf, it just did not match a name', JSON.stringify(s2.batches.map(b => b.batchNo)));
+
+  const impact = J(`salesStockImpact('nb2', [{item:'Widget', qty:1, batch:'TYPO'}])`);
+  ok(impact.batchNotFound && impact.batchNotFound.length === 1, 'the preview still flags the unmatched batch name — informational (possible typo), never blocking', JSON.stringify(impact.batchNotFound));
+  ok(impact.batchInsufficient === undefined, 'the old batchInsufficient bucket is gone — a batch running short is normal, handled behavior now, not a problem to flag', impact.batchInsufficient);
+
+  console.log('  — a product with NO batches at all still gets the genuine "nothing on record" fallback —');
+  ev(`db.dailyData.nb2['2026-02-02'] = {purchases:[],rtv:[],invoices:[],hv:[],
+    sales:{mrp:0,cogs:0,cash:0,credit:0,cancels:0}, cash:{}, audit:{opening:0,actual:'',unbilled:false,bounces:[]}, savedAt:1,
+    itemSales:[{item:'Ghostly', qty:3, amount:0, batch:'ANY'}]};`);
+  s2 = J(`stockAsOf('nb2','2026-02-02')`);
+  const ghostLot = s2.batches.find(b => b.key === 'ghostly' && b.batchNo && b.batchNo.includes('ANY'));
+  ok(ghostLot, 'with truly nothing to cascade to, the named-batch fallback still creates its distinctly-labeled synthetic lot', JSON.stringify(s2.batches.filter(b => b.key === 'ghostly').map(b => b.batchNo)));
+
+  console.log('— a sentinel-like batch value is never mistaken for a real one —');
+  ev(`db.dailyData.nb['2026-02-07'] = {purchases:[],rtv:[],invoices:[],hv:[],
+    sales:{mrp:0,cogs:0,cash:0,credit:0,cancels:0}, cash:{}, audit:{opening:0,actual:'',unbilled:false,bounces:[]}, savedAt:1,
+    itemSales:[{item:'Nombre', qty:3, amount:0, batch:'—'}]};`);
+  s = J(`stockAsOf('nb','2026-02-07')`);
   ok(!s.batches.some(b => b.batchNo === 'BATCH NOT FOUND: —'), 'a bare dash is treated as "no batch named" (falls back to FEFO), never chased as a real batch name', JSON.stringify(s.batches.map(b => b.batchNo)));
 
   console.log('— ledgerSig invalidates on batch CONTENT change, not just aggregate qty —');
