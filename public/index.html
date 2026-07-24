@@ -1875,36 +1875,20 @@ function rollupItems(hid, live, date){
   return Object.values(map).sort((a,b)=> a.name.localeCompare(b.name));
 }
 
-/* Keeps the Item Master's reference price current with whatever batches are
-   actually on the shelf right now, reusing rollupItems' OWN weighted-average
-   math (nrStrip/mrpStrip) — never a second, separate calculation that could
-   drift from what the Inventory tab already shows. Only pushes a change for
-   a product rollupItems computed a REAL average for (qPos>0) — a zero-stock
-   product's nrStrip/mrpStrip already equals its current nr/mrp (rollupItems'
-   own fallback), so it never shows up as a diff here: "last known price,
-   unchanged once stock hits zero" happens simply because nothing gets sent,
-   not because of a separate check. Called after anything that can change
-   stock; a missed sync is not fatal — the next such action retries it. */
-async function syncItemPrices(hid){
-  if(state.demo) return;
-  try{
-    const items = stockAsOf(hid, todayISO()).items;
-    const updates = [];
-    items.forEach(m=>{
-      if(!m.onMaster) return;
-      const it = (db.items[hid]||[]).find(x=>x.key===m.key);
-      if(!it) return;
-      const nrDiff = Math.abs(num(m.nrStrip) - num(it.nr)) > 0.005;
-      const mrpDiff = Math.abs(num(m.mrpStrip) - num(it.mrp)) > 0.005;
-      if(nrDiff || mrpDiff) updates.push({key:m.key, nr:+num(m.nrStrip).toFixed(2), mrp:+num(m.mrpStrip).toFixed(2)});
-    });
-    if(!updates.length) return;
-    const r = await api('/items/sync-prices', {method:'POST', body:{hid, updates}});
-    (r.updated||[]).forEach(u=>{
-      const it = (db.items[hid]||[]).find(x=>x.key===u.key);
-      if(it){ it.nr=u.nr; it.mrp=u.mrp; it.priceAsOf=u.priceAsOf; it.updatedAt=u.updatedAt; }
-    });
-  }catch(e){ /* not fatal — see comment above */ }
+/* Folds a day-save's auto-ratcheted prices (a purchase line that beat the
+   master's current margin — computed server-side, in PUT /entries, right
+   where the margin-deviation alert already compares a line to the master)
+   into the local mirror, so the very next entry in this session shows the
+   improved price without waiting on a full bootstrap reload. Nothing is
+   EVER pushed the other way from here — the master no longer tracks a
+   continuously-recomputed average of held batches (that let one
+   worse-margin purchase quietly redefine "the expected margin" for every
+   purchase after it); it only improves, and only from a real purchase. */
+function applyPriceImprovements(hid, items){
+  (items||[]).forEach(it=>{
+    const ix = (db.items[hid]||[]).findIndex(x=>x.id===it.id);
+    if(ix>=0) db.items[hid][ix] = it;
+  });
 }
 
 /* MODE B — movement between two dates. Everything is valued at the lot's own
@@ -2997,7 +2981,6 @@ function removeSalesConfirmModal(e){
       (r.notifications||[]).forEach(n=> db.notifications.unshift(n));
       closeModal();
       toast(`Sales removed — ${r.removal.itemsCount} row${r.removal.itemsCount===1?'':'s'}, ${fmtRs(r.removal.costValue)} at cost`, 'green');
-      syncItemPrices(hid);   // the stock those sales drew down just came back
       renderEntry();
     }catch(err){ toast(err.message,'red'); btn.disabled=false; btn.textContent='Remove sales'; }
   };
@@ -3665,10 +3648,10 @@ async function saveEntry(e){
     db.hvTracked[hid] = r.hvTracked || db.hvTracked[hid];
     db.notifications = db.notifications.filter(n=> !(n.hid===hid && n.date===date && ['variance','unbilled','hv','margin','cashdrawer'].includes(n.type)));
     (r.notifications||[]).forEach(n=> db.notifications.unshift(n));
-    const nv = (r.vendorsAdded||[]).length, ni = (r.itemsAdded||[]).length;
-    toast('Saved & synced — ' + db.hospitals[hid].name + (nv? ` · ${nv} new vendor${nv>1?'s':''}`:'') + (ni? ` · ${ni} item${ni>1?'s':''} added to master`:''), 'green');
+    applyPriceImprovements(hid, r.itemsPriceImproved);
+    const nv = (r.vendorsAdded||[]).length, ni = (r.itemsAdded||[]).length, np = (r.itemsPriceImproved||[]).length;
+    toast('Saved & synced — ' + db.hospitals[hid].name + (nv? ` · ${nv} new vendor${nv>1?'s':''}`:'') + (ni? ` · ${ni} item${ni>1?'s':''} added to master`:'') + (np? ` · ${np} price${np>1?'s':''} improved on master`:''), 'green');
     if((r.notifications||[]).length) toast('Alert sent to Yajna admin', 'red');
-    syncItemPrices(hid);   // purchases/sales/RTV just changed what's on the shelf
     renderEntry();
   }catch(err){
     toast(err.message, 'red');
@@ -4712,11 +4695,11 @@ function renderItems(){
   const all = db.items[hid]||[];
   const pendCount = (db.pendingItems[hid]||[]).filter(p=>p.status==='pending').length;
   const q = nameKey(state.itemQuery);
-  // a product with nothing on the shelf keeps its LAST computed price rather
-  // than losing its reference rate the moment stock runs out — flagged here
-  // so that number is never mistaken for a live, currently-weighted average
-  const stockByKey = {}, batchesByKey = {};
-  stockAsOf(hid, todayISO()).items.forEach(m=>{ stockByKey[m.key] = m.stock; batchesByKey[m.key] = m.batches.filter(b=>b.qty>0).length; });
+  // a product on 2+ batches is worth a second look: the master's nr/mrp is a
+  // RATCHET (see below), so it may reflect the best of several rates, not an
+  // average across all of them — this count/filter is how to go check
+  const batchesByKey = {};
+  stockAsOf(hid, todayISO()).items.forEach(m=>{ batchesByKey[m.key] = m.batches.filter(b=>b.qty>0).length; });
   const multiBatchCount = all.filter(it=> (batchesByKey[it.key]||0) >= 2).length;
   const searched = q? all.filter(it=> it.key.includes(q)) : all;
   const filtered = state.itemMultiBatchOnly? searched.filter(it=> (batchesByKey[it.key]||0) >= 2) : searched;
@@ -4728,28 +4711,27 @@ function renderItems(){
       <input class="in" id="itmSearch" placeholder="Search items…" value="${esc(state.itemQuery)}" style="width:220px">
       <span class="eyebrow">${all.length} items · avg margin ${pct(avgM)}</span>
       <span style="flex:1"></span>
-      <button class="btn btn-sm ${state.itemMultiBatchOnly?'btn-primary':''}" id="itmMultiBatch" title="Products currently holding stock across 2 or more distinct batches — check here that the Item Master price shown really is the weighted average across them, not a single batch's own rate">${multiBatchCount} with 2+ batches</button>
+      <button class="btn btn-sm ${state.itemMultiBatchOnly?'btn-primary':''}" id="itmMultiBatch" title="Products currently holding stock across 2 or more distinct batches — worth checking the master price against each batch's own rate">${multiBatchCount} with 2+ batches</button>
       ${canEdit && pendCount? `<button class="btn btn-sm" id="itmPending" style="border-color:var(--amber);color:var(--amber);font-weight:700">${pendCount} new from purchases</button>`:''}
       ${canEdit? `<button class="btn btn-sm" id="itmExport">${IC.dl} Export XLSX</button>
       <button class="btn btn-sm" id="itmTplTop" title="The item-master sheet — product, pack size, net rate and MRP per single strip">${IC.dl} Template</button>
       <button class="btn btn-sm" id="itmImport">${IC.up} Import</button>
       <button class="btn btn-sm btn-primary" id="itmAdd">${IC.plus} Add item</button>`:''}
     </div>
-    <p class="mini-note" style="margin:-6px 0 12px">Purchase price = NR per unit inclusive of GST. Margin = (MRP − NR) ÷ MRP. Update prices here after negotiating with vendors — purchase entries are tallied against these margins (±${MARGIN_TOL}% tolerance). Where a product holds 2 or more batches, NR and MRP are the quantity-weighted average across them — a batch of 500 counts for more than a batch of 5 — recalculated automatically whenever a purchase, sale or adjustment changes what is on the shelf.</p>
+    <p class="mini-note" style="margin:-6px 0 12px">Purchase price = NR per unit inclusive of GST. Margin = (MRP − NR) ÷ MRP. This is a REFERENCE price, not a live average — it is set once (an opening count, or a manually negotiated change) and after that only ever improves automatically, when a purchase beats it on margin. A worse-margin purchase never touches it — it is only flagged (±${MARGIN_TOL}% tolerance) so the master can never quietly erode to match a bad rate. Adjust it yourself any time via Update price; every change, automatic or negotiated, is on the Price history tab.</p>
     ${state.itemMultiBatchOnly? '<p class="mini-note">Showing only products currently on 2 or more batches.</p>':''}
     <div class="card"><div class="tbl-scroll"><table class="tbl">
-      <thead><tr><th>Product name</th><th>Molecule / salt</th><th>Pack size</th><th class="r" title="Distinct batches currently holding stock for this product">Batches</th><th class="r" title="Cost of ONE strip, inclusive of GST — the quantity-weighted average across every batch currently on the shelf, when there is more than one">Net rate / strip ₹</th><th class="r" title="Printed MRP of ONE strip — weighted the same way">MRP / strip ₹</th><th class="r" title="(MRP − net rate) ÷ MRP — a ratio, so the pack size does not change it">Expected margin</th><th>Updated</th>${canEdit?'<th></th>':''}</tr></thead>
+      <thead><tr><th>Product name</th><th>Molecule / salt</th><th>Pack size</th><th class="r" title="Distinct batches currently holding stock for this product">Batches</th><th class="r" title="Cost of ONE strip, inclusive of GST — the master's reference rate, not necessarily every batch's own rate">Net rate / strip ₹</th><th class="r" title="Printed MRP of ONE strip">MRP / strip ₹</th><th class="r" title="(MRP − net rate) ÷ MRP — a ratio, so the pack size does not change it">Expected margin</th><th>Updated</th>${canEdit?'<th></th>':''}</tr></thead>
       <tbody>${list.map(it=>{
         const m = marginPct(it.nr, it.mrp);
         const mc = m>=30? 'var(--green)' : m>=18? 'var(--amber)' : 'var(--red)';
-        const lastKnown = (stockByKey[it.key]||0)<=0 && it.priceAsOf;
         const bc = batchesByKey[it.key]||0;
         return `<tr>
           <td><b>${esc(it.name)}</b>${it.source==='invoice'?' <span class="chip chip-gray" style="font-size:10px">from invoice</span>':''}</td>
           <td style="color:${it.molecule?'var(--muted)':'var(--faint)'};font-size:12.5px">${esc(it.molecule||'—')}</td>
           <td style="color:var(--muted)">${esc(it.pack||'—')}</td>
-          <td class="r num">${bc>=2? `<span class="chip chip-blue" title="Weighted average across ${bc} batches">${bc} batches</span>` : bc===1? '1' : '—'}</td>
-          <td class="r num">${it.nr}${lastKnown? ` <span class="chip chip-gray" style="font-size:9px" title="No stock on hand — this is the last calculated rate, from ${esc(it.priceAsOf)}">last known</span>`:''}</td>
+          <td class="r num">${bc>=2? `<span class="chip chip-blue" title="${bc} batches currently holding stock — the master price may not match every one of them">${bc} batches</span>` : bc===1? '1' : '—'}</td>
+          <td class="r num">${it.nr}</td>
           <td class="r num">${it.mrp}</td>
           <td class="r num" style="color:${mc};font-weight:600">${pct(m)}</td>
           <td class="num" style="font-size:12px;color:var(--faint)">${fmtDateShort(iso(new Date(it.updatedAt||Date.now())))}</td>
@@ -5184,7 +5166,7 @@ function renderPriceHistory(){
             <td class="r num">${num(r.oldNr)||'—'} → <b>${num(r.newNr)}</b></td>
             <td class="r num">${num(r.oldMrp)===num(r.newMrp)? num(r.newMrp) : `${num(r.oldMrp)||'—'} → ${num(r.newMrp)}`}</td>
             <td class="r num" style="color:${g>0.05?'var(--green)':g<-0.05?'var(--red)':'var(--muted)'};font-weight:600">${pct(r.oldMargin)} → ${pct(r.newMargin)}</td>
-            <td style="font-size:12.5px">${r.source==='offer'? `Offer${r.vendor? ' — '+esc(r.vendor):''}` : 'Price revision'}<div style="color:var(--faint)">${esc(r.by)}</div></td>
+            <td style="font-size:12.5px">${r.source==='offer'? `Offer${r.vendor? ' — '+esc(r.vendor):''}` : r.source==='purchase-improved'? 'Better rate on a purchase' : 'Price revision'}<div style="color:var(--faint)">${esc(r.by)}</div></td>
             <td style="font-size:12.5px">${r.approvedBy? `<span class="chip chip-green">Dr ✓</span> ${esc(r.approvedBy)}` : '<span style="color:var(--faint)">—</span>'}</td>
           </tr>`;
         }).join('') || `<tr><td colspan="7" style="color:var(--faint);padding:16px">No price has moved yet. When an offer is applied — or a revision approved — it lands here with who negotiated it and which doctor signed off.</td></tr>`}
@@ -6768,7 +6750,7 @@ function adjustModal(hid, key){
       db.adjustments[hid] = db.adjustments[hid]||[];
       db.adjustments[hid].unshift(r.adjustment);
       closeModal(); toast(`${inv.name} adjusted by ${qty>0?'+':''}${fmtN(qty)} — ${body.reason}`,'green');
-      syncItemPrices(hid); renderInventory();
+      renderInventory();
     }catch(err){ btn.disabled=false; toast(err.message,'red'); }
   };
 }
@@ -6809,7 +6791,7 @@ function ledgerModal(hid, key){
       await api('/stock/adjust/'+id, {method:'DELETE'});
       db.adjustments[hid] = (db.adjustments[hid]||[]).filter(a=>a.id!==id);
       closeModal(); toast('Adjustment undone — stock reverted','green');
-      syncItemPrices(hid); renderInventory();
+      renderInventory();
     }catch(err){ b.disabled=false; toast(err.message,'red'); }
   });
 }
@@ -7034,10 +7016,6 @@ function openingStockModal(hid){
     // must be visible here, not only in the History tab's import receipt
     if(saveCautions.length) $('#osChunked').insertAdjacentHTML('beforeend',
       `<p class="mini-note" style="color:var(--amber)">⚠ ${saveCautions.length} duplicate row${saveCautions.length===1?'':'s'} merged into an existing batch rather than added separately: ${saveCautions.slice(0,6).map(c=>`row ${c.row} — ${esc(c.name)}: ${esc(c.reason)}`).join('; ')}${saveCautions.length>6?'…':''}</p>`);
-    // the client's own weighted-average math (rollupItems, via stockAsOf) now
-    // has real batch lots to compute from — sync once for the whole load,
-    // never per chunk, since one product's batches can split across chunks
-    await syncItemPrices(hid);
     // ONE record for the whole upload, not one per batch — the figures are
     // exactly what the preview already showed, so the record can never
     // disagree with what the person actually checked before saving

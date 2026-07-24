@@ -17,6 +17,7 @@ try { require('dotenv').config({ path: path.join(__dirname, '.env') }); } catch 
 
 const PORT = process.env.PORT || 3060;
 const MARGIN_TOL = parseFloat(process.env.MARGIN_TOLERANCE_PP || '2'); // percentage points
+const MARGIN_RATCHET_EPS = 0.01; // percentage points — real improvement, not floating-point noise (see the ratchet in PUT /entries)
 const SESSION_DAYS = 30;
 const COOKIE = 'yps_session';
 
@@ -769,8 +770,12 @@ app.put('/api/entries/:hid/:date', auth, (req, res) => {
     const itemsAdded = [];      // kept in the response shape; nothing lands here from invoices now
     const pendingTouched = [];
     const marginAlerts = [];
+    const itemsPriceImproved = [];
     const findItem = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
     const findAlias = db.prepare('SELECT i.* FROM item_aliases a JOIN items i ON i.id=a.item_id WHERE a.hospital_id=? AND a.alias_key=?');
+    const ratchetPrice = db.prepare('UPDATE items SET nr=?, mrp=?, price_as_of=?, updated_at=? WHERE id=?');
+    const logRatchet = db.prepare(`INSERT INTO price_log(id,item_id,hospital_id,old_nr,old_mrp,new_nr,new_mrp,note,user_name,ts,source)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`);
     for (const inv of entry.invoices) {
       for (const l of inv.lines) {
         const name = (l.item || '').trim();
@@ -815,6 +820,25 @@ app.put('/api/entries/:hid/:date', auth, (req, res) => {
             if (Math.abs(lineM - masterM) > MARGIN_TOL) {
               marginAlerts.push(`"${existing.name}" margin ${lineM.toFixed(1)}% vs master ${masterM.toFixed(1)}% on ${inv.vendor || 'invoice'}${inv.invoiceNo ? ' #' + inv.invoiceNo : ''}`);
             }
+            /* The ratchet: a genuinely BETTER margin updates the master
+               automatically (mechanical fact, not a negotiation — bypasses
+               the doctor-approval gate same as every other derived write); a
+               worse or equal one never touches it. Uses THIS LINE's own
+               rate, never a weighted average across batches — an average
+               would just let a bad batch dilute a good one and reintroduce
+               the exact erosion this replaces. */
+            if (lineM > masterM + MARGIN_RATCHET_EPS) {
+              logRatchet.run(uid('pl'), existing.id, hid, existing.nr, existing.mrp, l.nr, l.mrp,
+                `Better margin found on a purchase${inv.vendor ? ' from ' + inv.vendor : ''}${inv.invoiceNo ? ' (invoice #' + inv.invoiceNo + ')' : ''} — master updated automatically`,
+                'system', savedAt, 'purchase-improved');
+              ratchetPrice.run(l.nr, l.mrp, date, savedAt, existing.id);
+              itemsPriceImproved.push(rowItem({ ...existing, nr: l.nr, mrp: l.mrp, updated_at: savedAt, price_as_of: date }));
+              // a later line for the SAME product (another invoice, or
+              // another line, same save) re-reads `existing` fresh from the
+              // DB every iteration — inside the same transaction, so it sees
+              // THIS write immediately and compares against the just-
+              // improved price, never the stale one this line started from
+            }
           }
         }
       }
@@ -833,7 +857,7 @@ app.put('/api/entries/:hid/:date', auth, (req, res) => {
     const pendingItems = pendingTouched.length
       ? db.prepare(`SELECT * FROM pending_items WHERE id IN (${pendingTouched.map(() => '?').join(',')})`).all(...pendingTouched).map(rowPending)
       : [];
-    return { vendorsAdded, itemsAdded, pendingItems, notifications, hvTracked: drugs };
+    return { vendorsAdded, itemsAdded, pendingItems, notifications, hvTracked: drugs, itemsPriceImproved };
   });
 
   const r = tx();
@@ -2313,48 +2337,24 @@ app.get('/api/items/opening/movements-after', auth, requireRole('admin'), (req, 
    small absolute floor so two near-zero rates don't trip it on noise */
 const RATE_TOL = (a, b) => Math.abs(a - b) <= Math.max(Math.abs(a), Math.abs(b)) * 0.02 + 0.01;
 
-/* Keeps items.nr/mrp current with the client's own weighted-average
-   computation across whatever batches a product currently holds — the
-   client already does this math for the Inventory tab's rollup (rollupItems'
-   nrStrip/mrpStrip); this just persists it. Mechanical/derived, never a
-   negotiated decision, so — same reasoning as /api/items/opening and
-   /api/items/bulk — it bypasses the margin_offers doctor-approval gate
-   entirely. Tagged source='sync' in price_log so the 30-row history view
-   isn't drowned in continuous small recomputations alongside real
-   negotiated changes. Only ever called with products that currently have
-   positive stock to weight (the client computes nothing to send otherwise),
-   which is what makes "last known price, unchanged once stock hits zero"
-   true — the write simply never happens for a depleted product. */
-app.post('/api/items/sync-prices', auth, (req, res) => {
-  const b = req.body || {};
-  const hid = S(b.hid, 60);
-  scopeCheck(req, hid);
-  const updates = Array.isArray(b.updates) ? b.updates : [];
-  const now = Date.now(), today = todayISO();
-  const updated = [];
-  const tx = db.transaction(() => {
-    const find = db.prepare('SELECT * FROM items WHERE hospital_id=? AND name_key=?');
-    const upd = db.prepare('UPDATE items SET nr=?, mrp=?, price_as_of=?, updated_at=? WHERE id=?');
-    const logPrice = db.prepare(`INSERT INTO price_log(id,item_id,hospital_id,old_nr,old_mrp,new_nr,new_mrp,note,user_name,ts,source)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?)`);
-    for (const u of updates.slice(0, 2000)) {
-      const key = S(u.key, 150);
-      const ex = find.get(hid, key);
-      if (!ex) continue;
-      const nr = N(u.nr), mrp = N(u.mrp);
-      // same sanity floor every other nr/mrp writer already applies — the
-      // server can't verify the client's math, but it can still refuse an
-      // obviously broken payload
-      if (!(nr >= 0) || !(mrp >= 0) || (nr > mrp && mrp > 0)) continue;
-      if (Math.abs(nr - ex.nr) < 0.005 && Math.abs(mrp - ex.mrp) < 0.005) continue;   // nothing actually changed
-      logPrice.run(uid('pl'), ex.id, hid, ex.nr, ex.mrp, nr, mrp, 'Weighted average recomputed from current batches', 'system', now, 'sync');
-      upd.run(nr, mrp, today, now, ex.id);
-      updated.push({ key, nr, mrp, priceAsOf: today, updatedAt: now });
-    }
-  });
-  tx();
-  res.json({ updated });
-});
+/* The Item Master's nr/mrp for an EXISTING product is a RATCHET, never a
+   continuously-recomputed average. An earlier version of this kept it
+   current with the weighted average across whatever batches a product
+   currently held, recomputed after every purchase, sale and adjustment —
+   which meant a single worse-margin purchase would drag the master down to
+   match it, and every purchase AFTER that one would then be compared
+   against the already-eroded figure and pass silently. A margin check that
+   moves to match whatever just happened can never catch drift.
+   So: the master only ever improves automatically, and only from a
+   genuinely better-margin PURCHASE LINE (see the ratchet in
+   PUT /entries/:hid/:date, right where marginAlerts already compares a
+   line's margin to the master's) — never from an average across several
+   batches, which would just reintroduce the same erosion by another path.
+   A worse price never touches the master automatically; correcting one
+   deliberately still goes through the existing doctor-approval price-change
+   flow (margin_offers), and every automatic improvement is visible on the
+   Price History tab same as a negotiated one, tagged source='purchase-
+   improved' so the two are never confused for each other. */
 
 /* Wipes this hospital's opening batches before a CONFIRMED second load
    rewrites them from scratch — called once, before the chunked upload

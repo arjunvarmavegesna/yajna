@@ -148,11 +148,79 @@ console.log('— Excel date-serial expiry: a real date-typed cell, not a string,
   ok(item && item.exp === '2027-08', 'the numeric day-serial resolves to the right calendar month (August 2027), not a blank', item && item.exp);
 }
 
-console.log('— DOM: weighted-average sync writes back to the server, and freezes once stock hits zero —');
+console.log('— purchase-margin RATCHET: the master only ever improves automatically, never erodes —');
+// replaces the earlier "weighted-average sync" design entirely: that design
+// recomputed the master's nr/mrp to the average across ALL currently-held
+// batches after every purchase — which meant one worse-margin purchase
+// quietly redefined "the expected margin" for every purchase after it, and
+// margin-deviation checks stopped catching real drift the moment the
+// master had already drifted to match. The replacement is a one-way
+// ratchet: a purchase line beats the master on margin -> master moves to
+// THAT LINE's own rate (never a weighted average, which would just
+// reintroduce erosion by another path); a worse or equal line never
+// touches it, and is only flagged.
 {
+  let boot = (await adm.req('GET', '/bootstrap')).data;
+  let A = boot.items[HID].find(i => i.key === 'tab. batchazole 500');
+  ok(A && near(A.nr, 11) && near(A.mrp, 22), 'starting point from the earlier reload: master at nr 11 / mrp 22 (50% margin)', JSON.stringify({ nr: A.nr, mrp: A.mrp }));
+
+  console.log('  — a WORSE-margin purchase saves, is flagged, but never touches the master —');
+  const worse = await adm.req('PUT', `/entries/${HID}/${T}`, { entry: {
+    purchases: [], rtv: [], sales: {}, audit: { opening: 0, actual: '', unbilled: false, bounces: [] }, hv: [], itemSales: [],
+    invoices: [{ vendor: 'WorseVendor', invoiceNo: 'RATCHET-1', date: T, fileName: '', lines: [
+      { item: 'Tab. Batchazole 500', batch: 'BW', exp: '2028-01', pqty: 50, oqty: 0, rate: 18, disc: 0, gst: 0, mrp: 22 }   // margin ≈18.2%, worse than 50%
+    ] }]
+  } });
+  ok(worse.status === 200, 'the worse-margin purchase still saves — it is flagged, never blocked', JSON.stringify(worse.data.error || ''));
+  ok((worse.data.itemsPriceImproved || []).length === 0, 'and nothing comes back in itemsPriceImproved — there is nothing to apply', JSON.stringify(worse.data.itemsPriceImproved));
+  boot = (await adm.req('GET', '/bootstrap')).data;
+  A = boot.items[HID].find(i => i.key === 'tab. batchazole 500');
+  ok(A && near(A.nr, 11) && near(A.mrp, 22), 'the master is UNCHANGED — a worse purchase never erodes the reference price', JSON.stringify({ nr: A.nr, mrp: A.mrp }));
+
+  console.log('  — a BETTER-margin purchase ratchets the master to THAT LINE\'s own rate —');
+  const better = await adm.req('PUT', `/entries/${HID}/${T}`, { entry: {
+    purchases: [], rtv: [], sales: {}, audit: { opening: 0, actual: '', unbilled: false, bounces: [] }, hv: [], itemSales: [],
+    invoices: [{ vendor: 'BetterVendor', invoiceNo: 'RATCHET-2', date: T, fileName: '', lines: [
+      { item: 'Tab. Batchazole 500', batch: 'BB', exp: '2028-02', pqty: 50, oqty: 0, rate: 6, disc: 0, gst: 0, mrp: 22 }   // margin ≈72.7%, better than 50%
+    ] }]
+  } });
+  ok(better.status === 200, 'the better-margin purchase saves');
+  ok((better.data.itemsPriceImproved || []).length === 1 && near(better.data.itemsPriceImproved[0].nr, 6) && near(better.data.itemsPriceImproved[0].mrp, 22),
+    'and IS returned in itemsPriceImproved, at the line\'s OWN rate (6/22) — not blended with the old 11', JSON.stringify(better.data.itemsPriceImproved));
+  boot = (await adm.req('GET', '/bootstrap')).data;
+  A = boot.items[HID].find(i => i.key === 'tab. batchazole 500');
+  ok(A && near(A.nr, 6) && near(A.mrp, 22), 'the master moved to exactly the purchase line\'s own rate, never a weighted average with the old price', JSON.stringify({ nr: A.nr, mrp: A.mrp }));
+  ok(A && A.priceAsOf === T, 'price_as_of is stamped with the date of the improving purchase', A.priceAsOf);
+
+  console.log('  — the SAME rate again (equal margin, not better) does not re-trigger —');
+  const same = await adm.req('PUT', `/entries/${HID}/${T}`, { entry: {
+    purchases: [], rtv: [], sales: {}, audit: { opening: 0, actual: '', unbilled: false, bounces: [] }, hv: [], itemSales: [],
+    invoices: [{ vendor: 'BetterVendor', invoiceNo: 'RATCHET-3', date: T, fileName: '', lines: [
+      { item: 'Tab. Batchazole 500', batch: 'BC', exp: '2028-03', pqty: 50, oqty: 0, rate: 6, disc: 0, gst: 0, mrp: 22 }
+    ] }]
+  } });
+  ok((same.data.itemsPriceImproved || []).length === 0, 'an equal-margin purchase does not fire the ratchet again — improvement only, never a re-confirmation', JSON.stringify(same.data.itemsPriceImproved));
+
+  console.log('  — two lines in ONE save: the second compares against the price the FIRST just set —');
+  const twoLines = await adm.req('PUT', `/entries/${HID}/${T}`, { entry: {
+    purchases: [], rtv: [], sales: {}, audit: { opening: 0, actual: '', unbilled: false, bounces: [] }, hv: [], itemSales: [],
+    invoices: [{ vendor: 'V', invoiceNo: 'RATCHET-4', date: T, fileName: '', lines: [
+      { item: 'Tab. Batchazole 500', batch: 'BD', exp: '2028-04', pqty: 10, oqty: 0, rate: 5, disc: 0, gst: 0, mrp: 22 },   // better than 6 -> ratchets to 5
+      { item: 'Tab. Batchazole 500', batch: 'BE', exp: '2028-05', pqty: 10, oqty: 0, rate: 5, disc: 0, gst: 0, mrp: 22 }    // equal to the JUST-ratcheted 5, not the stale 6 -> must NOT ratchet again
+    ] }]
+  } });
+  ok(twoLines.status === 200, 'a two-line save (same product, same day) saves cleanly');
+  ok((twoLines.data.itemsPriceImproved || []).length === 1, 'only ONE ratchet fires for the two lines — the second line compared against the price the first line just set, never the stale one the save started with', JSON.stringify(twoLines.data.itemsPriceImproved));
+  boot = (await adm.req('GET', '/bootstrap')).data;
+  A = boot.items[HID].find(i => i.key === 'tab. batchazole 500');
+  ok(A && near(A.nr, 5), 'the master now reflects the best rate actually observed (5)', A.nr);
+
+  console.log('— Item Master: a filter + a visible chip for products currently on 2+ batches —');
+  // must run BEFORE the stock is sold out below — the filter counts only
+  // batches with POSITIVE qty, so a fully-depleted product would show zero
   const html = fs.readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   let domCookie = adm.cookie();
-  const dom = new JSDOM(html, { url: 'http://127.0.0.1:3061/', runScripts: 'dangerously', pretendToBeVisual: true,
+  const dom2 = new JSDOM(html, { url: 'http://127.0.0.1:3061/', runScripts: 'dangerously', pretendToBeVisual: true,
     beforeParse(w) {
       w.HTMLElement.prototype.scrollIntoView = () => {}; w.scrollTo = () => {}; w.print = () => {}; w.open = () => null; w.confirm = () => true;
       w.fetch = async (url, opts = {}) => {
@@ -161,71 +229,51 @@ console.log('— DOM: weighted-average sync writes back to the server, and freez
         return r;
       };
     } });
-  const w = dom.window, doc = w.document;
+  const w2 = dom2.window, doc2 = w2.document;
   await tick(400);
-  doc.querySelector('#loginEmail').value = 'bhagavan@yajnapharma.in';
-  doc.querySelector('#loginPw').value = ADMIN_PW;
-  doc.querySelector('#loginBtn').click(); await tick(900);
-  const J = s => JSON.parse(w.eval(`JSON.stringify(${s})`));
-
-  const rollA = J(`stockAsOf(${JSON.stringify(HID)}, ${JSON.stringify(T)}).items`).find(i => i.key === 'tab. batchazole 500');
-  ok(rollA && near(rollA.nrStrip, 11), 'rollupItems already computes the right weighted average for the reloaded batch (100 @ 11) before any sync', rollA && rollA.nrStrip);
-
-  await w.eval(`syncItemPrices(${JSON.stringify(HID)})`);
-  await tick(300);
-  let boot = (await adm.req('GET', '/bootstrap')).data;
-  let A = boot.items[HID].find(i => i.key === 'tab. batchazole 500');
-  // the item was already at nr=11/mrp=22 from the reload, so sync should be a no-op here —
-  // prove that by adding a SECOND batch through a real purchase and re-syncing
-  const invRes = await adm.req('PUT', `/entries/${HID}/${T}`, { entry: {
-    purchases: [], rtv: [], sales: {}, audit: { opening: 0, actual: '', unbilled: false, bounces: [] }, hv: [], itemSales: [],
-    invoices: [{ vendor: 'V', invoiceNo: 'SYNC-1', date: T, fileName: '', lines: [{ item: 'Tab. Batchazole 500', batch: 'B4', exp: '2028-06', pqty: 100, oqty: 0, rate: 20, disc: 0, gst: 0, mrp: 30 }] }]
-  } });
-  ok(invRes.status === 200, 'a purchase of a second batch (100 @ NR 20) saves', JSON.stringify(invRes.data.error || ''));
-  w.eval(`db.dailyData[${JSON.stringify(HID)}] = ${JSON.stringify((await adm.req('GET', '/bootstrap')).data.dailyData[HID])};`);
-  const rollA2 = J(`stockAsOf(${JSON.stringify(HID)}, ${JSON.stringify(T)}).items`).find(i => i.key === 'tab. batchazole 500');
-  // (100@11 + 100@20) / 200 = 15.5
-  ok(rollA2 && near(rollA2.nrStrip, 15.5), 'adding a purchase moves the weighted average to include it — (100×11 + 100×20)/200 = 15.5', rollA2 && rollA2.nrStrip);
-
-  await w.eval(`syncItemPrices(${JSON.stringify(HID)})`);
-  await tick(300);
-  boot = (await adm.req('GET', '/bootstrap')).data;
-  A = boot.items[HID].find(i => i.key === 'tab. batchazole 500');
-  ok(A && near(A.nr, 15.5), 'the sync persisted the NEW average server-side — the Item Master now matches the ledger', A && A.nr);
-  ok(A && A.priceAsOf === T, 'price_as_of is stamped with the date of the sync', A && A.priceAsOf);
-
-  console.log('— Item Master: a filter + a visible chip for products currently on 2+ batches —');
-  w.eval(`state.hospital=${JSON.stringify(HID)}; state.itemMultiBatchOnly=false; renderItems();`);
+  doc2.querySelector('#loginEmail').value = 'bhagavan@yajnapharma.in';
+  doc2.querySelector('#loginPw').value = ADMIN_PW;
+  doc2.querySelector('#loginBtn').click(); await tick(900);
+  w2.eval(`state.hospital=${JSON.stringify(HID)}; state.itemMultiBatchOnly=false; renderItems();`);
   await tick(200);
-  let body = doc.querySelector('#content').textContent;
-  ok(/1 with 2\+ batches/.test(body), 'the toolbar names exactly one product currently on 2+ batches (Batchazole: opening B3 + purchase B4)', body.slice(0, 250));
-  ok(body.includes('2 batches'), 'and the row itself shows a "2 batches" chip next to its averaged NR/MRP, not just a bare number', body.includes('2 batches'));
-  doc.querySelector('#itmMultiBatch').click(); await tick(200);
-  body = doc.querySelector('#content').textContent;
+  let body = doc2.querySelector('#content').textContent;
+  ok(/1 with 2\+ batches/.test(body), 'the toolbar names exactly one product currently on 2+ batches (Batchazole: batches BW/BB/BC/BD/BE all still on record)', body.slice(0, 250));
+  ok(body.includes('2 batches') || /\d+ batches/.test(body), 'and the row itself shows a batch-count chip', body.includes('batches'));
+  doc2.querySelector('#itmMultiBatch').click(); await tick(200);
+  body = doc2.querySelector('#content').textContent;
   ok(body.includes('Tab. Batchazole 500'), 'clicking the filter keeps the multi-batch product in view', body.includes('Tab. Batchazole 500'));
   ok(!body.includes('Syp. Plainocol'), 'and hides a single-batch product (Plainocol, one no-batch lot) — proving the filter actually filters, not just decorates', body.includes('Syp. Plainocol'));
-  w.eval(`state.itemMultiBatchOnly=false;`);
 
-  // now sell every last strip, so the product's stock hits exactly zero —
-  // PUT /entries replaces the WHOLE day, so the same day's invoice has to be
-  // resent alongside the sale, not just the new itemSales row
+  console.log('  — selling out completely does not touch the master price at all —');
   const sellRes = await adm.req('PUT', `/entries/${HID}/${T}`, { entry: {
-    purchases: [], rtv: [], audit: { opening: 0, actual: '', unbilled: false, bounces: [] }, hv: [],
-    invoices: [{ vendor: 'V', invoiceNo: 'SYNC-1', date: T, fileName: '', lines: [{ item: 'Tab. Batchazole 500', batch: 'B4', exp: '2028-06', pqty: 100, oqty: 0, rate: 20, disc: 0, gst: 0, mrp: 30 }] }],
+    purchases: [], rtv: [], audit: { opening: 0, actual: '', unbilled: false, bounces: [] }, hv: [], invoices: [],
     sales: { mrp: 0, cogs: 0, cash: 0, credit: 0, cancels: 0 },
-    itemSales: [{ item: 'Tab. Batchazole 500', qty: 200, amount: 1 }]
+    itemSales: [{ item: 'Tab. Batchazole 500', qty: 220, amount: 1 }]
   } });
-  ok(sellRes.status === 200, 'selling out the full 200 strips saves');
-  w.eval(`db.dailyData[${JSON.stringify(HID)}] = ${JSON.stringify((await adm.req('GET', '/bootstrap')).data.dailyData[HID])};`);
-  const rollZero = J(`stockAsOf(${JSON.stringify(HID)}, ${JSON.stringify(T)}).items`).find(i => i.key === 'tab. batchazole 500');
-  ok(rollZero && rollZero.stock === 0, 'stock is genuinely zero now', rollZero && rollZero.stock);
-  ok(rollZero && near(rollZero.nrStrip, 15.5), 'with nothing left to weight, rollupItems falls back to the LAST known rate rather than zero', rollZero && rollZero.nrStrip);
+  ok(sellRes.status === 200, 'selling out the stock saves');
+  boot = (await adm.req('GET', '/bootstrap')).data;
+  A = boot.items[HID].find(i => i.key === 'tab. batchazole 500');
+  ok(A && near(A.nr, 5) && near(A.mrp, 22), 'the master is untouched by a sale — it is a reference price, not a live average that depletion could reset', JSON.stringify({ nr: A.nr, mrp: A.mrp }));
 
-  await w.eval(`syncItemPrices(${JSON.stringify(HID)})`);
+  console.log('  — every automatic improvement is logged distinctly from a negotiated change —');
+  const hist = await adm.req('GET', `/price-history?hid=${HID}`);
+  const ratchetEntries = (hist.data.history || []).filter(h => h.source === 'purchase-improved' && h.item === 'Tab. Batchazole 500');
+  ok(ratchetEntries.length === 2, 'exactly the two real improvements are logged (11->6, then 6->5) — the worse and equal purchases logged nothing', ratchetEntries.length);
+  ok(ratchetEntries.every(h => !h.approvedBy), 'and carry no doctor approval — this is a mechanical fact, never a negotiated decision', JSON.stringify(ratchetEntries.map(h => h.approvedBy)));
+
+  console.log('— DOM: applyPriceImprovements folds a save\'s ratcheted prices into the local item mirror —');
+  const dom = new JSDOM(html, { url: 'http://127.0.0.1:3061/', runScripts: 'dangerously', pretendToBeVisual: true,
+    beforeParse(w) { w.HTMLElement.prototype.scrollIntoView = () => {}; w.scrollTo = () => {}; w.open = () => null; w.print = () => {};
+      w.fetch = async () => ({ ok: false, status: 401, json: async () => ({}) }); } });
+  const w = dom.window, doc = w.document;
   await tick(300);
-  const bootAfterZero = (await adm.req('GET', '/bootstrap')).data;
-  const AZero = bootAfterZero.items[HID].find(i => i.key === 'tab. batchazole 500');
-  ok(AZero && near(AZero.nr, 15.5) && AZero.priceAsOf === T, 'the Item Master price is unchanged at zero stock — "last known", not wiped or reset', JSON.stringify({ nr: AZero.nr, priceAsOf: AZero.priceAsOf }));
+  doc.querySelector('[data-quick="admin"]').click(); await tick(700);
+  w.eval(`
+    db.items.demo1 = [{id:'stubitem', name:'Stub', key:'stub', pack:'10s', nr:10, mrp:20, molecule:'', preferredVendor:'', openingQty:5, source:'t', updatedAt:1}];
+    applyPriceImprovements('demo1', [{id:'stubitem', name:'Stub', key:'stub', pack:'10s', nr:7, mrp:20, molecule:'', preferredVendor:'', openingQty:5, source:'t', updatedAt:2, priceAsOf:${JSON.stringify(T)}}]);
+  `);
+  const stub = JSON.parse(w.eval(`JSON.stringify(db.items.demo1[0])`));
+  ok(stub.nr === 7, 'the ratcheted price replaces the stub item in the local mirror, matched by id', JSON.stringify(stub));
 }
 
 console.log('— named-batch sales: consumes the NAMED batch, FEFO still works with none, a bad name is reported —');
