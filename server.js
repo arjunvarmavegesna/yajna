@@ -2965,7 +2965,7 @@ app.post('/api/parse/invoice', auth, upload.single('file'), async (req, res, nex
    enters it. Pack is captured so inventory and the master know what one unit IS
    (a 10s strip is not a 15s strip), and because value totals are qty × rate. */
 const COL = {
-  name: { hdr: 'Product name',                          match: [/^product/i, /^item/i, /^name/i, /^description/i, /^particular/i] },
+  name: { hdr: 'Product name',                          match: [/^product/i, /^item/i, /^name/i, /^description/i, /^particular/i, /vendor/i, /supplier/i] },
   pack: { hdr: 'Pack size (10s / 15s)',                 match: [/^pack/i, /^strip *size/i, /^unit/i, /^conv/i] },
   /* the STRIP matchers must never swallow a "(tablets)" heading — the tablet
      keys sit after them in cols order, so a claimed heading never reaches them */
@@ -2980,8 +2980,31 @@ const COL = {
   rate: { hdr: 'Rate ₹ (per strip, pre-disc/tax)', match: [/^rate/i, /^p\.? *rate/i, /^price/i] },
   disc: { hdr: 'Vendor Disc %', match: [/disc/i] },
   gst:  { hdr: 'GST %', match: [/^gst/i, /^tax/i] },
-  mrp:  { hdr: 'MRP — single strip',                    match: [/^mrp/i, /^m\.r\.p/i, /retail/i, /^sale *rate/i] }
+  mrp:  { hdr: 'MRP — single strip',                    match: [/^mrp/i, /^m\.r\.p/i, /retail/i, /^sale *rate/i] },
+  bal:  { hdr: 'Opening Balance (Rs.) — end with Cr or Dr', match: [/open.*bal/i, /^balance/i, /outstanding/i, /^amount/i, /\bdue\b/i] },
+  credit: { hdr: 'Credit Days', match: [/credit/i] },
+  phone: { hdr: 'Phone', match: [/phone/i, /mobile/i, /contact/i] }
 };
+/* Marg exports a vendor ledger balance with a trailing Cr/Dr rather than a
+   sign: Cr is the ordinary case (a payable — we owe them), entered positive;
+   Dr is the reverse (an advance or credit note in our favour), entered
+   negative. Indian exports also comma-group in lakhs ("1,25,000"), which
+   parseFloat alone would silently truncate at the first comma — so commas are
+   always stripped before parsing, never left for the number parser to trip
+   over. A value that isn't a plain number once the suffix and separators are
+   gone is refused outright rather than guessed at. Mirrored client-side. */
+function parseVendorBalance(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return { ok: true, value: 0 };
+  const m = s.match(/^[₹Rs.\s]*(-?[\d,]+(?:\.\d+)?)\s*(cr|dr)?\.?\s*$/i);
+  if (!m) return { ok: false, value: 0 };
+  const n = Number(m[1].replace(/,/g, ''));
+  if (!Number.isFinite(n)) return { ok: false, value: 0 };
+  const suffix = (m[2] || '').toLowerCase();
+  if (suffix === 'cr') return { ok: true, value: Math.abs(n) };
+  if (suffix === 'dr') return { ok: true, value: -Math.abs(n) };
+  return { ok: true, value: n };
+}
 /* mirror of the client helper: the strip size out of the pack string; null for
    vial / btl / amp — nothing to divide by */
 function packUnits(pack) {
@@ -3082,6 +3105,29 @@ const TEMPLATES = {
       ['MRP — single strip', 'The printed MRP of ONE strip.'],
       ['What you get back', 'Expected margin % = (MRP − Net rate) ÷ MRP. Every purchase line is tallied against it, and a line priced away from it alerts the admin.'],
       ['No quantity here', 'The master is prices, not stock. Opening counts go in the opening-stock template.']
+    ]
+  },
+  vendors: {
+    file: 'yajna-vendor-balances-template.xlsx', sheet: 'Vendors',
+    cols: ['name', 'bal', 'credit', 'phone'],
+    hdrs: { name: 'Vendor Name' },
+    /* both a name AND a balance column must be recognized — 'name' alone
+       would happily match an items/sales/opening sheet's own name column too
+       (nothing else on this template is required), letting the wrong file
+       "match" and hand back nonsense rows read as vendor names. Requiring the
+       BALANCE COLUMN to exist (not that every cell under it is filled — a
+       brand-new vendor's row can still be blank) is what actually tells a
+       vendor file apart from anything else in the console. */
+    need: ['name', 'bal'],
+    eg: [
+      ['Sun Pharma Distributors', '1,25,000 Cr', 30, '+91 98480 12345'],
+      ['Cipla Agencies', 42500, 21, '+91 98661 44556'],
+      ['Zydus Lifecare Agencies', '8,500 Dr', 30, '']
+    ],
+    notes: [
+      ['Opening Balance', 'What you owed this vendor the day you started with us. A Marg export often ends the figure with Cr or Dr: Cr is the ordinary case — you owe them — entered as a positive number, or just left with the suffix on (it is read either way). Dr is the reverse — an advance, or a credit note in your favour — entered as negative. Leave it blank for a brand-new vendor with nothing owed yet. A balance that cannot be read this way is rejected with a reason, never guessed at.'],
+      ['Credit Days', 'How many days of credit this vendor gives you. Optional — 30 if left blank.'],
+      ['Phone', 'Optional. Used for WhatsApp order lists.']
     ]
   }
 };
@@ -3261,12 +3307,14 @@ function readTemplate(buf, kind) {
         const cells = kind === 'purchase'
           ? { pack: S(row[col.pack ?? -1], 30).trim(), pqty: N(row[col.pqty]), oqty: N(row[col.oqty ?? -1]),
               rate: N(row[col.rate ?? -1]), disc: N(row[col.disc ?? -1]), gst: N(row[col.gst ?? -1]), mrp: N(row[col.mrp ?? -1]) }
+          : kind === 'vendors'
+          ? { bal: S(row[col.bal ?? -1]), credit: N(row[col.credit ?? -1]), phone: S(row[col.phone ?? -1], 40).trim() }
           : { pack: S(row[col.pack ?? -1], 30).trim(), molecule: S(row[col.mol ?? -1], 150).trim(),
               qty: qtyCol === undefined ? undefined : N(row[qtyCol]),
               loose: tabCol === undefined ? undefined : N(row[tabCol]),
               nr: N(row[col.nr ?? -1]), mrp: N(row[col.mrp ?? -1]) };
         const skip = (reason) => skipped.push({ row: sheetRow, name, reason, ...cells });
-        if (!name) { skip('no product name'); continue; }
+        if (!name) { skip(kind === 'vendors' ? 'no vendor name' : 'no product name'); continue; }
         if (/^(total|grand total|sub ?total)/i.test(name)) { skip('skipped: total row'); ignored++; continue; }
         if (kind === 'purchase') {
           /* raw INPUTS only — cleanEntry + calcLine derive everything on save,
@@ -3276,6 +3324,12 @@ function readTemplate(buf, kind) {
           l.disc = Math.min(100, Math.max(0, l.disc));                       // legend rule: 0–100
           if (l.pqty + l.oqty <= 0) { skip('no quantity — nothing purchased'); continue; }
           out.push(l);
+          continue;
+        }
+        if (kind === 'vendors') {
+          const b = parseVendorBalance(cells.bal);
+          if (!b.ok) { skip('could not read the opening balance — expected a plain number, optionally ending in Cr or Dr'); continue; }
+          out.push({ row: sheetRow, name, bal: b.value, credit: cells.credit > 0 ? Math.round(cells.credit) : 30, phone: cells.phone });
           continue;
         }
         /* FULL STRIPS + LOOSE TABLETS, together — 10 strips + 3 loose of a 10s
@@ -3370,6 +3424,26 @@ app.post('/api/parse/items', auth, requireRole('admin'), upload.single('file'), 
   const tpl = readTemplate(req.file.buffer, 'items');
   if (!tpl.matched) return res.status(400).json(noSheetMatchedReceipt('items', req.file.originalname));
   const rows = tpl.rows.map(r => ({ row: r.row, name: r.name, molecule: r.molecule || '', pack: r.pack, nr: r.nr, mrp: r.mrp }));
+  res.json({
+    source: 'template', sheet: tpl.sheet, rows,
+    ...receiptFields({ fileName: req.file.originalname, sheet: tpl.sheet, fileRows: tpl.fileRows,
+      parsed: rows.length, imported: rows.length, skipped: tpl.skipped, ignored: tpl.ignored, source: 'template' }),
+    note: `Read ${rows.length} row${rows.length === 1 ? '' : 's'} from the template (sheet "${tpl.sheet}")`
+  });
+});
+
+/* Vendor opening balances. No AI fallback, same reasoning as the item master:
+   these are ledger figures, not something worth guessing from a free-form
+   layout. Excel/CSV go through the same readTemplate() every other upload
+   uses — the balance's Cr/Dr suffix is resolved server-side (parseVendorBalance)
+   so a bad value is rejected with a reason rather than silently truncated. */
+app.post('/api/parse/vendors', auth, requireRole('admin'), upload.single('file'), (req, res) => {
+  const hid = S(req.query.hid, 60);
+  scopeCheck(req, hid);
+  if (!req.file) return res.status(400).json({ error: 'Attach the filled vendor balances template' });
+  const tpl = readTemplate(req.file.buffer, 'vendors');
+  if (!tpl.matched) return res.status(400).json(noSheetMatchedReceipt('vendors', req.file.originalname));
+  const rows = tpl.rows.map(r => ({ row: r.row, name: r.name, bal: r.bal, credit: r.credit, phone: r.phone }));
   res.json({
     source: 'template', sheet: tpl.sheet, rows,
     ...receiptFields({ fileName: req.file.originalname, sheet: tpl.sheet, fileRows: tpl.fileRows,

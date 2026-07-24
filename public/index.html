@@ -3709,37 +3709,96 @@ function payModal(s){
   };
 }
 
+/* mirror of the server helper (parseVendorBalance in server.js) — Cr is the
+   ordinary case (a payable, entered positive), Dr is the reverse (an advance
+   or credit note, entered negative); commas are always stripped before
+   parsing so an Indian lakh-grouped figure never gets truncated at the first
+   comma the way a bare parseFloat would. Anything else is refused, not
+   guessed at. */
+function parseVendorBalance(raw){
+  const s = String(raw ?? '').trim();
+  if(!s) return {ok:true, value:0};
+  const m = s.match(/^[₹Rs.\s]*(-?[\d,]+(?:\.\d+)?)\s*(cr|dr)?\.?\s*$/i);
+  if(!m) return {ok:false, value:0};
+  const n = Number(m[1].replace(/,/g,''));
+  if(!Number.isFinite(n)) return {ok:false, value:0};
+  const suffix = (m[2]||'').toLowerCase();
+  if(suffix==='cr') return {ok:true, value:Math.abs(n)};
+  if(suffix==='dr') return {ok:true, value:-Math.abs(n)};
+  return {ok:true, value:n};
+}
 function uploadModal(hid){
   openModal(`
     <div class="modal-head"><h3>Upload opening balances</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
-      <p style="font-size:13px;color:var(--muted);margin-bottom:12px">CSV format: <span class="num" style="font-size:12px">Vendor Name, Opening Balance, Credit Days, Phone</span>. Vendors already on the master list are skipped.</p>
-      <div class="field"><label>Choose CSV file</label><input class="in" type="file" id="csvFile" accept=".csv,text/csv"></div>
+      <div class="lock-note" style="margin-bottom:12px">
+        <div><b>Vendor Name, Opening Balance, Credit Days, Phone.</b> A Marg export's balance can end in Cr or Dr — both are read correctly. Vendors already on the master list are skipped.</div>
+        <button class="btn btn-sm" id="vbTpl" style="margin-left:auto;flex:none">${IC.dl} Download template</button></div>
+      <div class="field"><label>Filled template (Excel) or a CSV</label><input class="in" type="file" id="csvFile" accept=".xls,.xlsx,.csv,text/csv"></div>
       <div class="field"><label>Or paste rows</label><textarea class="in" id="csvPaste" rows="5" placeholder="Sun Pharma Distributors,125000,30,+91 9848012345"></textarea></div>
       <div id="csvPreview"></div>
     </div>
     <div class="modal-foot"><button class="btn modal-x">Cancel</button><button class="btn" id="csvPrev">Preview</button><button class="btn btn-primary" id="csvGo" disabled>Import</button></div>`);
   let parsed = [];
-  const doParse = text=>{
-    parsed = [];
-    text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).forEach(line=>{
-      if(/vendor\s*name/i.test(line)) return;
-      const parts = line.split(',').map(x=>x.trim());
-      if(parts.length>=2 && parts[0]){
-        const dup = db.vendors[hid].some(v=>v.name.toLowerCase()===parts[0].toLowerCase());
-        parsed.push({name:parts[0], bal:num(parts[1]), credit:num(parts[2])||30, phone:parts[3]||'', dup});
-      }
-    });
+  const vt=$('#vbTpl'); if(vt) vt.onclick = ()=> downloadTemplate('vendors', 'Vendor balances');
+
+  const readSkipNote = skipped=>{
+    if(!skipped || !skipped.length) return '';
+    return `<p class="mini-note" style="color:var(--red)">✕ ${skipped.length} row${skipped.length===1?'':'s'} could not be read: ${skipped.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name||'(blank)')}: ${esc(x.reason)}`).join('; ')}${skipped.length>6?'…':''}</p>`;
+  };
+  const showPreview = (skipped, note)=>{
     const fresh = parsed.filter(p=>!p.dup);
     $('#csvPreview').innerHTML = parsed.length? `
       <div class="tbl-scroll" style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:7px"><table class="tbl">
       <thead><tr><th>Vendor</th><th class="r">Opening</th><th class="r">Credit</th><th></th></tr></thead>
       <tbody>${parsed.map(p=>`<tr><td>${esc(p.name)}</td><td class="r num">${fmtRs(p.bal)}</td><td class="r num">${p.credit}d</td><td>${p.dup?'<span class="chip chip-gray">Duplicate — skip</span>':'<span class="chip chip-green">New</span>'}</td></tr>`).join('')}</tbody></table></div>
-      <p class="mini-note">${fresh.length} new vendor${fresh.length===1?'':'s'} will be imported · ${parsed.length-fresh.length} duplicate${parsed.length-fresh.length===1?'':'s'} skipped</p>` : '<p class="mini-note">No valid rows found.</p>';
+      <p class="mini-note">${note? esc(note)+' · ':''}${fresh.length} new vendor${fresh.length===1?'':'s'} will be imported · ${parsed.length-fresh.length} duplicate${parsed.length-fresh.length===1?'':'s'} skipped</p>
+      ${readSkipNote(skipped)}` : `<p class="mini-note">No valid rows found.</p>${readSkipNote(skipped)}`;
     $('#csvGo').disabled = fresh.length===0;
   };
-  $('#csvPrev').onclick = ()=>{
+  const doParse = text=>{
+    parsed = [];
+    const skipped = [];
+    let fileRows = 0;
+    text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).forEach(line=>{
+      if(/vendor\s*name/i.test(line)) return;   // header line — not a data row
+      fileRows++;
+      const row = fileRows;
+      const parts = line.split(',').map(x=>x.trim());
+      if(!parts[0]){ skipped.push({row, name:'', reason:'no vendor name'}); return; }
+      const b = parseVendorBalance(parts[1]);
+      if(!b.ok){ skipped.push({row, name:parts[0], reason:'could not read the opening balance — expected a plain number, optionally ending in Cr or Dr'}); return; }
+      const dup = db.vendors[hid].some(v=>v.name.toLowerCase()===parts[0].toLowerCase());
+      parsed.push({row, name:parts[0], bal:b.value, credit:num(parts[2])||30, phone:parts[3]||'', dup});
+    });
+    // a binary file misread as text, or simply the wrong file — caught before
+    // ANY count is shown, rather than offering to import nonsense rows
+    const looksLikeVendors = parsed.length===0 || (
+      !parsed.some(p=> /[\x00-\x08\x0E-\x1F�]/.test(p.name)) &&
+      parsed.filter(p=> /[A-Za-z]/.test(p.name)).length >= parsed.length*0.5
+    );
+    if(!looksLikeVendors){
+      parsed = [];
+      $('#csvPreview').innerHTML = `<p class="mini-note" style="color:var(--red)">This doesn't look like vendor data — it may be an Excel file read as plain text, or the wrong file entirely. Use the Excel template, or export a plain CSV, and try again.</p>`;
+      $('#csvGo').disabled = true;
+      return;
+    }
+    showPreview(skipped);
+  };
+  $('#csvPrev').onclick = async ()=>{
     const f = $('#csvFile').files[0];
+    if(f && /\.xlsx?$/i.test(f.name)){
+      // an Excel file is read on the server by matching the template's headings
+      const btn=$('#csvPrev'); btn.disabled=true; btn.textContent='Reading…';
+      try{
+        const r = await apiUpload(`/parse/vendors?hid=${encodeURIComponent(hid)}`, f);
+        parsed = r.rows.map(x=>({row:x.row, name:x.name, bal:num(x.bal), credit:num(x.credit)||30, phone:x.phone||'',
+          dup: db.vendors[hid].some(v=>v.name.toLowerCase()===x.name.toLowerCase())}));
+        showPreview(r.skipped||[], r.note);
+      }catch(err){ $('#csvPreview').innerHTML = `<p style="color:var(--red);font-size:13px">${esc(err.message)}</p>`; }
+      btn.disabled=false; btn.textContent='Preview';
+      return;
+    }
     if(f){ const rd=new FileReader(); rd.onload=()=>doParse(rd.result); rd.readAsText(f); }
     else doParse($('#csvPaste').value);
   };
