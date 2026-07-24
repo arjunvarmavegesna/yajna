@@ -5935,15 +5935,28 @@ function invState(){
   return state.inv;
 }
 
+/* the opening-stock load is a one-time event, but the figures it left behind
+   stay worth seeing every time this tab opens — not just inside the modal
+   that closed after loading them */
+async function loadOpeningLoads(hid){
+  state.openingLoads = state.openingLoads||{};
+  if(state.demo){ state.openingLoads[hid] = null; return; }
+  try{ state.openingLoads[hid] = (await api(`/opening-loads?hid=${encodeURIComponent(hid)}`)).loads[0] || null; }
+  catch(e){ state.openingLoads[hid] = null; }
+}
 function renderInventory(){
   const hid = state.hospital;
   const canEdit = state.user.role==='admin';
   const h = db.hospitals[hid]||{};
   const v = invState();
   const counted = !!h.stockDate;
+  const latestLoad = (state.openingLoads||{})[hid];
+  if(counted && latestLoad===undefined) loadOpeningLoads(hid).then(()=>{ if(state.hospital===hid) renderInventory(); });
 
   $('#content').innerHTML = `
-    ${counted? '' : `<div class="lock-note" style="background:var(--amber-light);border-color:#E8D5AE;color:var(--amber)">
+    ${counted? (latestLoad? `<div class="lock-note" style="background:var(--green-light);border-color:#BFE0C8;color:var(--green-dark)">
+      ${IC.box} Opening stock counted as on <b>${fmtDateShort(latestLoad.stockDate)}</b> — ${latestLoad.itemsCount} item${latestLoad.itemsCount===1?'':'s'}, ${fmtRs(latestLoad.valueNr)} at cost / ${fmtRs(latestLoad.valueMrp)} at MRP — loaded by ${esc(latestLoad.loadedBy||'—')}.</div>` : '')
+    : `<div class="lock-note" style="background:var(--amber-light);border-color:#E8D5AE;color:var(--amber)">
       ${IC.box} No opening stock recorded yet — inventory starts from zero. Enter the stock you had when the pharmacy started, and every purchase and sale after that adjusts it automatically.
       ${canEdit? '<button class="btn btn-sm" id="invSetup" style="margin-left:auto">Set opening stock</button>':''}</div>`}
     <div class="entry-bar">
@@ -6578,12 +6591,15 @@ function openingStockModal(hid){
   let parsed = null;
   let rawRows = null, lastNote = '', lastSrc = 'template', lastMeta = {};
   let units = fileUnits(hid, 'template');
+  let valNr = 0, valMrp = 0;   // this file's own totals — set by preview(), read again on save
+  let priorLoad = null;        // the most recent recorded load, if any — for the second-load warning
   openModal(`
     <div class="modal-head"><h3>Opening stock — ${esc(h.name||'')}</h3><button class="modal-x">✕</button></div>
     <div class="modal-body">
       <div class="lock-note" style="margin-bottom:12px">
         <div><b>Counts are in STRIPS, rates are per single strip.</b> A 10s and a 15s are both just "1 strip" — the pack size is recorded so inventory knows what a unit is, and the stock is valued at the net rate of one strip. Everything after this date — invoices in, sales out, RTV — adjusts it automatically.</div>
         <button class="btn btn-sm" id="osTpl" style="margin-left:auto;flex:none">${IC.dl} Download template</button></div>
+      <div id="osPriorLoad"></div>
       <div class="field"><label>Stock counted as on</label><input class="in" type="date" id="osDate" value="${todayISO()}" max="${todayISO()}">
         <p class="ivnote">Everything entered on or after this date is applied on top of this count. Set it to the day the shelf was physically counted — not today's upload.</p></div>
       ${state.demo? '' : `<div class="field"><label>Filled template, or any stock report (Excel / CSV / PDF / photo)</label><input class="in" type="file" id="osFile" accept=".xls,.xlsx,.csv,.pdf,image/*">
@@ -6596,6 +6612,19 @@ function openingStockModal(hid){
     <div class="modal-foot" id="osFoot"><button class="btn modal-x">Cancel</button><button class="btn" id="osRead">Read / preview</button><button class="btn btn-primary" id="osGo" disabled>Save opening stock</button></div>`, {lg:true});
 
   const ot=$('#osTpl'); if(ot) ot.onclick = ()=> downloadTemplate('opening', 'Opening stock');
+
+  // opening stock is meant to be loaded ONCE — a second attempt on a pharmacy
+  // that already has one needs to be a visibly different action, not a
+  // look-alike of the first, so it warns with exactly what is about to be
+  // overwritten before a single row is ever read
+  const renderPriorLoadNote = ()=>{
+    const el = $('#osPriorLoad'); if(!el) return;
+    if(!priorLoad){ el.innerHTML = ''; return; }
+    el.innerHTML = `<p class="mini-note" style="color:var(--amber);margin:0 0 12px">⚠ Opening stock was already loaded here — counted as on <b>${fmtDateShort(priorLoad.stockDate)}</b>, ${priorLoad.itemsCount} item${priorLoad.itemsCount===1?'':'s'}, ${fmtRs(priorLoad.valueNr)} at cost / ${fmtRs(priorLoad.valueMrp)} at MRP, loaded by ${esc(priorLoad.loadedBy||'—')} on ${fmtDateShort(iso(new Date(priorLoad.loadedAt)))}. Uploading again will <b>replace</b> those figures, not add to them — make sure this is a real correction.</p>`;
+  };
+  if(!state.demo){
+    api(`/opening-loads?hid=${encodeURIComponent(hid)}`).then(r=>{ priorLoad = (r.loads||[])[0]||null; renderPriorLoadNote(); }).catch(()=>{});
+  }
 
   // rows dropped at READ time — shown before the user commits; the full
   // standard receipt (with a real imported count) only makes sense AFTER the
@@ -6618,14 +6647,15 @@ function openingStockModal(hid){
     const rows = cv.rows;
     parsed = rows;
     const known = rows.filter(r=> findItem(hid, r.name)).length;
-    const valNr = rows.reduce((a,r)=> a + num(r.qty)*(num(r.nr) || num((findItem(hid,r.name)||{}).nr)), 0);
-    const valMrp = rows.reduce((a,r)=> a + num(r.qty)*(num(r.mrp) || num((findItem(hid,r.name)||{}).mrp)), 0);
+    valNr = rows.reduce((a,r)=> a + num(r.qty)*(num(r.nr) || num((findItem(hid,r.name)||{}).nr)), 0);
+    valMrp = rows.reduce((a,r)=> a + num(r.qty)*(num(r.mrp) || num((findItem(hid,r.name)||{}).mrp)), 0);
     $('#osPrev').innerHTML = rows.length? `
       <p class="mini-note" style="margin-top:0">Counting as on <b>${fmtDateShort($('#osDate').value||todayISO())}</b> — check this before saving; it decides what movements land on top of this count.</p>
       <div class="grid2" style="margin:8px 0">
-        <div class="kpi"><div class="l">Stock value (at net rate)</div><div class="v num" style="font-size:17px">${fmtRs(valNr)}</div><div class="d">Σ strips × net rate</div></div>
+        <div class="kpi"><div class="l">${rows.length} product${rows.length===1?'':'s'} · Stock value (at net rate)</div><div class="v num" style="font-size:17px">${fmtRs(valNr)}</div><div class="d">Σ strips × net rate</div></div>
         <div class="kpi"><div class="l">Value at MRP</div><div class="v num" style="font-size:17px">${fmtRs(valMrp)}</div><div class="d">potential margin ${pct(valMrp>0? (valMrp-valNr)/valMrp*100 : 0)}</div></div>
       </div>
+      <p class="mini-note">Check the <b>value at MRP</b> against the Marg report first — MRP carries no tax, so nothing distorts it. The value at cost can differ even when everything else is right: Marg commonly values stock excluding GST, so cost can be several percent off while MRP matches almost exactly. That gap is the GST, not a data problem.</p>
       <div class="tbl-scroll" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:7px"><table class="tbl">
         <thead><tr><th>Product</th><th>Pack</th><th class="r">Strips</th><th class="r">Net rate/strip</th><th class="r">MRP/strip</th><th></th></tr></thead>
         <tbody>${rows.slice(0,200).map(r=>`<tr ${unmatchedRowStyle(hid, r.name)}><td>${esc(r.name)}</td><td class="num" style="color:var(--muted)">${esc(r.pack||'—')}</td><td class="r num">${srcQtyCell(r, units)}</td><td class="r num">${r.nr? r2(r.nr):'—'}</td><td class="r num">${r.mrp? r2(r.mrp):'—'}</td>
@@ -6676,9 +6706,12 @@ function openingStockModal(hid){
   // user reads a file, then goes back and corrects the date before saving
   $('#osDate').onchange = ()=>{ if(parsed) preview(rawRows, lastNote); };
 
-  const finish = ()=>{
+  const finish = (recorded)=>{
     $('#osFoot').innerHTML = `<span style="flex:1"></span><button class="btn btn-primary" id="osDone">Done</button>`;
     $('#osDone').onclick = closeModal;
+    // the same three figures, kept visible one more time — this is the
+    // reference point for any later question about the opening position
+    if(recorded) $('#osPrev').insertAdjacentHTML('afterbegin', `<p class="mini-note" style="color:var(--green-dark);margin-top:0">✓ Recorded — counted as on ${fmtDateShort(recorded.stockDate)}, ${recorded.itemsCount} item${recorded.itemsCount===1?'':'s'}, ${fmtRs(recorded.valueNr)} at cost / ${fmtRs(recorded.valueMrp)} at MRP, loaded by ${esc(recorded.loadedBy||'—')}.</p>`);
   };
   $('#osGo').onclick = async ()=>{
     if(!parsed || !parsed.length) return;
@@ -6695,6 +6728,13 @@ function openingStockModal(hid){
           if(!go){ btn.disabled=false; return; }
         }
       }catch(err){ btn.disabled=false; toast(err.message,'red'); return; }
+    }
+    if(!state.demo && priorLoad){
+      // opening stock is meant to be a ONE-TIME count — a second save here is
+      // rare enough that it earns its own explicit confirmation, naming
+      // exactly what it is about to replace
+      const go = confirm(`Opening stock here was already loaded — counted as on ${fmtDateShort(priorLoad.stockDate)}, ${priorLoad.itemsCount} item${priorLoad.itemsCount===1?'':'s'}, ${fmtRs(priorLoad.valueNr)} at cost / ${fmtRs(priorLoad.valueMrp)} at MRP.\n\nSaving now will REPLACE that count with this one. Confirm this is really a correction, not an accidental repeat.`);
+      if(!go){ btn.disabled=false; return; }
     }
     if(state.demo){
       db.hospitals[hid].stockDate = stockDate;
@@ -6726,7 +6766,17 @@ function openingStockModal(hid){
         imported: tally.imported+tally.fixed, skipped: [], ignored:lastMeta.ignored||0})
     });
     await uploader.run({fileRows: lastMeta.fileRows ?? parsed.length, rows: parsed, preSkipped: lastMeta.skipped||[]});
-    finish();
+    // ONE record for the whole upload, not one per batch — the figures are
+    // exactly what the preview already showed, so the record can never
+    // disagree with what the person actually checked before saving
+    let recorded = null;
+    try{
+      const r = await api('/opening-loads', {method:'POST', body:{hid, stockDate,
+        itemsCount: parsed.length, valueNr: valNr, valueMrp: valMrp, fileName: lastMeta.fileName||'', source: lastMeta.source||''}});
+      recorded = r.load;
+      state.openingLoads = state.openingLoads||{}; state.openingLoads[hid] = recorded;
+    }catch(err){ toast('Opening stock saved, but the load record could not be written: '+err.message, 'amber'); }
+    finish(recorded);
   };
 }
 

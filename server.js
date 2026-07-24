@@ -189,6 +189,11 @@ CREATE TABLE IF NOT EXISTS sales_removals(
   mrp_value REAL NOT NULL DEFAULT 0, cost_value REAL NOT NULL DEFAULT 0,
   file_name TEXT DEFAULT '', removed_by TEXT DEFAULT '', removed_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_salesrm_hd ON sales_removals(hospital_id, date);
+CREATE TABLE IF NOT EXISTS opening_loads(
+  id TEXT PRIMARY KEY, hospital_id TEXT NOT NULL, stock_date TEXT NOT NULL,
+  items_count INTEGER NOT NULL DEFAULT 0, value_nr REAL NOT NULL DEFAULT 0, value_mrp REAL NOT NULL DEFAULT 0,
+  file_name TEXT DEFAULT '', source TEXT DEFAULT '', loaded_by TEXT DEFAULT '', loaded_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_openingloads_h ON opening_loads(hospital_id, loaded_at);
 `);
 
 /* migrate: single hospital_id -> hospital_ids list + portal on/off flag */
@@ -1051,7 +1056,7 @@ app.post('/api/clear', auth, requireRole('admin'), (req, res) => {
    than inferred, and the impact is countable before anything happens. */
 const HOSPITAL_TABLES = ['entries', 'notifications', 'vendors', 'payments', 'items', 'price_log', 'pending_items', 'item_aliases', 'wa_outbox', 'approval_batches',
   'stock_adjustments', 'receivables', 'receivable_actions', 'expiry_snapshots', 'period_data',
-  'hv_tracked', 'report_prefs', 'import_receipts', 'sales_removals'];
+  'hv_tracked', 'report_prefs', 'import_receipts', 'sales_removals', 'opening_loads'];
 
 /* What would go, and who would be left without a hospital — answered BEFORE the
    delete, so the confirmation can show it rather than surprise anyone. */
@@ -2328,6 +2333,41 @@ app.post('/api/items/opening', auth, requireRole('admin'), (req, res) => {
       parsed: rows.length, imported: created.length + updated.length, skipped, ignored: 0, source: S(source, 20) || 'template' }) });
 });
 
+const rowOpeningLoad = (r) => ({ id: r.id, hid: r.hospital_id, stockDate: r.stock_date, itemsCount: r.items_count,
+  valueNr: r.value_nr, valueMrp: r.value_mrp, fileName: r.file_name, source: r.source,
+  loadedBy: r.loaded_by, loadedAt: r.loaded_at });
+
+/* One record per logical "Save opening stock" click — a big load may take
+   several /items/opening batches (chunkedSaveUI), so the client calls this
+   ONCE at the end with the totals it already computed for the preview, rather
+   than the server trying to stitch batches back together into one figure.
+   This is the record a later question about the opening position gets
+   answered from, and the check a second load warns against before overwriting
+   it — never cleared by "Clear opening stock" (that resets the count itself,
+   not the history of what was counted). */
+app.post('/api/opening-loads', auth, requireRole('admin'), (req, res) => {
+  const b = req.body || {};
+  const hid = S(b.hid, 60);
+  scopeCheck(req, hid);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(S(b.stockDate))) return res.status(400).json({ error: 'A valid stock count date is required' });
+  const rec = {
+    id: uid('opl'), hospital_id: hid, stock_date: b.stockDate, items_count: N(b.itemsCount),
+    value_nr: N(b.valueNr), value_mrp: N(b.valueMrp), file_name: S(b.fileName, 200), source: S(b.source, 20),
+    loaded_by: req.user.name, loaded_at: Date.now()
+  };
+  db.prepare(`INSERT INTO opening_loads(id,hospital_id,stock_date,items_count,value_nr,value_mrp,file_name,source,loaded_by,loaded_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?)`).run(rec.id, rec.hospital_id, rec.stock_date, rec.items_count, rec.value_nr, rec.value_mrp,
+    rec.file_name, rec.source, rec.loaded_by, rec.loaded_at);
+  res.json({ load: rowOpeningLoad(rec) });
+});
+
+app.get('/api/opening-loads', auth, (req, res) => {
+  const hid = S(req.query.hid, 60);
+  scopeCheck(req, hid);
+  const rows = db.prepare('SELECT * FROM opening_loads WHERE hospital_id=? ORDER BY loaded_at DESC LIMIT 20').all(hid).map(rowOpeningLoad);
+  res.json({ loads: rows });
+});
+
 app.post('/api/items/bulk', auth, requireRole('admin'), (req, res) => {
   const { hid, items, fileName, sheet, fileRows, source } = req.body || {};
   scopeCheck(req, S(hid, 60));
@@ -3004,7 +3044,10 @@ const TEMPLATES = {
       ['MRP — single strip', 'The printed MRP of ONE strip.'],
       ['Rate / MRP per piece', 'The single-strip rate divided by the pack size — DISPLAY ONLY, so a part strip like 10.3 still checks out at a glance. Never a second costing basis.'],
       ['What you get back', 'Stock value at net rate = Total strips × net rate. Value at MRP = Total strips × MRP. Potential margin, the item table and every downstream figure follow from these.'],
-      ['Items already on the master', 'Their opening count is updated; the prices are only overwritten if you supply them.']
+      ['Items already on the master', 'Their opening count is updated; the prices are only overwritten if you supply them.'],
+      ['The » columns are LIVE formulas', 'They recalculate as you type. Adding your own rows below row 5? Select the five » cells in row 5 and drag the fill handle (or copy/paste) down through your last row, so your own products total correctly too.'],
+      ['The TOTAL row (further down the sheet)', 'Already filled in — how many products, the value at cost, and the value at MRP, added up from every row above it. Leave it where it is; it recalculates on its own and the app never loads it as a product. This is the row to check against the Marg report before uploading.'],
+      ['Which total to trust', 'Check the VALUE AT MRP total against Marg first — MRP carries no tax, so nothing distorts it. If that agrees, the products and quantities are right. The value-at-cost total can still differ even when everything is correct: Marg commonly values stock EXCLUDING GST, so a real load can show MRP matching within a fraction of a percent while cost differs by several percent. That gap is not a data problem — it is the GST.']
     ]
   },
   purchase: {
@@ -3088,7 +3131,47 @@ function buildTemplate(kind) {
     (T.helpers || []).filter(h => h.after === c).forEach(h => { hdr.push(h.hdr); widthKeys.push('_helper'); });
   });
   let ws;
-  if (kind === 'purchase') {
+  if (kind === 'opening') {
+    /* opening stock is loaded ONCE per pharmacy and everything downstream is
+       built on it — the sheet is the only cheap moment to catch a mistake, so
+       its calculated columns and TOTAL row are LIVE formulas, not static
+       illustrations, and the TOTAL row is what gets checked against Marg
+       before anything is uploaded. Column layout (fixed by T.cols/helpers
+       above): A name, B pack, C open, D openTab, E »Total strips, F nr,
+       G mrp, H »Rate/piece, I »MRP/piece, J »Value at cost, K »Value at MRP. */
+    ws = XLSX.utils.aoa_to_sheet([hdr, ...T.eg]);
+    ws['!cols'] = widthKeys.map(c => ({ wch: c === 'name' ? 34 : c === 'nr' ? 32 : c === '_helper' ? 28 : 20 }));
+    const col = { name: 'A', pack: 'B', open: 'C', openTab: 'D', totalStrips: 'E', nr: 'F', mrp: 'G', ratePiece: 'H', mrpPiece: 'I', valueCost: 'J', valueMrp: 'K' };
+    /* pack units come from a leading number ("10s" -> 10); anything that
+       doesn't parse that way (vial / btl / amp) correctly falls through to
+       blank, matching packUnits() server-side — verified by hand against
+       all 4 example rows before shipping this. */
+    const packOf = r => `VALUE(LEFT(${col.pack}${r},LEN(${col.pack}${r})-1))`;
+    const setF = (addr, formula) => { ws[addr] = { t: 'n', f: formula }; };
+    /* ONLY the fixed example rows (2-5) get formulas — never pre-fill further
+       rows "just in case": a formula cell that evaluates to "" still reads
+       back as a non-blank row once a real spreadsheet recalculates and caches
+       that empty string, which would make readTemplate see it as a nameless
+       row and reject it. Verified empirically with the xlsx package before
+       choosing this design — an untouched cell stays genuinely blank, a
+       formula cell that resolves to "" does not. */
+    for (let r = 2; r <= 5; r++) {
+      setF(`${col.totalStrips}${r}`,
+        `IF(${col.name}${r}="","",IF(AND(${col.openTab}${r}<>"",${col.openTab}${r}<>0,ISERROR(${packOf(r)})),"check pack size",${col.open}${r}+IF(OR(${col.openTab}${r}="",${col.openTab}${r}=0),0,${col.openTab}${r}/${packOf(r)})))`);
+      setF(`${col.ratePiece}${r}`, `IF(OR(${col.name}${r}="",${col.nr}${r}="",${col.nr}${r}=0),"",IFERROR(${col.nr}${r}/${packOf(r)},""))`);
+      setF(`${col.mrpPiece}${r}`, `IF(OR(${col.name}${r}="",${col.mrp}${r}="",${col.mrp}${r}=0),"",IFERROR(${col.mrp}${r}/${packOf(r)},""))`);
+      setF(`${col.valueCost}${r}`, `IF(OR(${col.name}${r}="",NOT(ISNUMBER(${col.totalStrips}${r}))),"",${col.totalStrips}${r}*${col.nr}${r})`);
+      setF(`${col.valueMrp}${r}`, `IF(OR(${col.name}${r}="",NOT(ISNUMBER(${col.totalStrips}${r}))),"",${col.totalStrips}${r}*${col.mrp}${r})`);
+    }
+    // capacity for ~1000 products (Viraj's real load was 407) before a TOTAL
+    // row placed comfortably clear of any realistic amount of real data
+    const lastDataRow = 1000, totalRow = 1002;
+    ws[`${col.name}${totalRow}`] = { t: 'str', v: 'TOTAL' };
+    setF(`${col.valueCost}${totalRow}`, `SUM(${col.valueCost}2:${col.valueCost}${lastDataRow})`);
+    setF(`${col.valueMrp}${totalRow}`, `SUM(${col.valueMrp}2:${col.valueMrp}${lastDataRow})`);
+    ws[`${col.pack}${totalRow}`] = { t: 'str', f: `COUNTA(${col.name}2:${col.name}${lastDataRow})&" products"` };
+    ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: totalRow - 1, c: hdr.length - 1 } });
+  } else if (kind === 'purchase') {
     /* branding band + legend above the header. readTemplate scans the first 15
        rows for the header, so the band costs nothing at read time. (This xlsx
        build cannot write cell colours — the band and legend carry the branding
