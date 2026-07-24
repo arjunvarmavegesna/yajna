@@ -194,6 +194,18 @@ console.log('— DOM: weighted-average sync writes back to the server, and freez
   ok(A && near(A.nr, 15.5), 'the sync persisted the NEW average server-side — the Item Master now matches the ledger', A && A.nr);
   ok(A && A.priceAsOf === T, 'price_as_of is stamped with the date of the sync', A && A.priceAsOf);
 
+  console.log('— Item Master: a filter + a visible chip for products currently on 2+ batches —');
+  w.eval(`state.hospital=${JSON.stringify(HID)}; state.itemMultiBatchOnly=false; renderItems();`);
+  await tick(200);
+  let body = doc.querySelector('#content').textContent;
+  ok(/1 with 2\+ batches/.test(body), 'the toolbar names exactly one product currently on 2+ batches (Batchazole: opening B3 + purchase B4)', body.slice(0, 250));
+  ok(body.includes('2 batches'), 'and the row itself shows a "2 batches" chip next to its averaged NR/MRP, not just a bare number', body.includes('2 batches'));
+  doc.querySelector('#itmMultiBatch').click(); await tick(200);
+  body = doc.querySelector('#content').textContent;
+  ok(body.includes('Tab. Batchazole 500'), 'clicking the filter keeps the multi-batch product in view', body.includes('Tab. Batchazole 500'));
+  ok(!body.includes('Syp. Plainocol'), 'and hides a single-batch product (Plainocol, one no-batch lot) — proving the filter actually filters, not just decorates', body.includes('Syp. Plainocol'));
+  w.eval(`state.itemMultiBatchOnly=false;`);
+
   // now sell every last strip, so the product's stock hits exactly zero —
   // PUT /entries replaces the WHOLE day, so the same day's invoice has to be
   // resent alongside the sale, not just the new itemSales row

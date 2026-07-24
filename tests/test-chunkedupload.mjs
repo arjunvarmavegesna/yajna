@@ -134,6 +134,32 @@ console.log('— chunkedSaveUI: batching, tally, editable retry, the invariant (
   body = doc.querySelector('#testChunk').textContent;
   ok(/2 rows in file/.test(body) && /1 imported/.test(body) && /1 remaining/.test(body), 'the pre-skipped row sits in the SAME failing table as any save-stage failure', body);
   ok(doc.querySelector('#testChunk [data-fix-field="name"]').value === 'Vial Row', 'pre-filled from what readTemplate captured, ready to fix and resend');
+
+  console.log('  — a TOTAL row in preSkipped is tallied but NEVER shown in the failing/retry table —');
+  // real bug reported by a user: a 473-row file's TOTAL row (readTemplate's
+  // own 'skipped: total row' reason) landed in the SAME retry table as a
+  // genuine bad row — "row 2997, TOTAL, ✕" sitting there forever, since a
+  // label can never be "fixed" into a product and was never a real problem
+  // to begin with (it was already tallied as `ignored`, not a rejection).
+  w.eval(`document.getElementById('testChunk').innerHTML = ''`);
+  w.eval(`
+    window.__u4 = chunkedSaveUI(document.getElementById('testChunk'), {
+      batchSize: 10,
+      fields: [{key:'name',label:'Product name'}, {key:'pack',label:'Pack'}, {key:'qty',label:'Opening qty'}, {key:'nr',label:'Net rate'}, {key:'mrp',label:'MRP'}, {key:'batch',label:'Batch'}, {key:'exp',label:'Expiry'}],
+      validate: r => r.name? null : 'no product name',
+      saveBatch: async (rows) => ({ created: rows.map(r=>({id:'w'+r.name})), filled: [], skipped: [] }),
+      countImported: r => r.created.length,
+      applyResult: () => {}
+    });
+    window.__done4 = window.__u4.run({fileRows:474, rows: Array.from({length:473}, (_,i)=>({row:i+2, name:'Item'+i})),
+      preSkipped:[{row:2997, name:'TOTAL', reason:'skipped: total row', pack:'', qty:0, nr:0, mrp:0, batch:'', exp:''}]});
+  `);
+  await tick(300);
+  body = doc.querySelector('#testChunk').textContent;
+  ok(/474 rows in file/.test(body) && /473 imported/.test(body), 'all 473 real rows import cleanly', body.slice(0, 200));
+  ok(/0 remaining/.test(body), 'the TOTAL row is NOT counted as remaining/failing — it can never be "fixed"', body.slice(0, 250));
+  ok(/1 total\/subtotal row ignored/.test(body), 'it is named plainly as ignored, not as a failure', body.slice(0, 250));
+  ok(!doc.querySelector('#testChunk table'), 'and critically: NO retry table is rendered at all — "row 2997, TOTAL, ✕" never appears on screen');
 }
 
 console.log('— end to end: itemImportModal really saves through chunkedSaveUI against the live server —');

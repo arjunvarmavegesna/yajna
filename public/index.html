@@ -3209,15 +3209,15 @@ async function saveImportReceipt(hid, kind, receipt){
    Usage: const u = chunkedSaveUI(containerEl, kindConfig);
           await u.run({fileRows, rows, preSkipped}); */
 function chunkedSaveUI(container, kind){
-  const state = { fileRows:0, imported:0, fixed:0, removed:0, failing:[] };
-  const notify = ()=>{ if(kind.onChange) kind.onChange({fileRows:state.fileRows, imported:state.imported, fixed:state.fixed, removed:state.removed, remaining:state.failing.length}); };
+  const state = { fileRows:0, imported:0, fixed:0, removed:0, ignored:0, failing:[] };
+  const notify = ()=>{ if(kind.onChange) kind.onChange({fileRows:state.fileRows, imported:state.imported, fixed:state.fixed, removed:state.removed, ignored:state.ignored, remaining:state.failing.length}); };
   const render = ()=>{
     const remaining = state.failing.length;
-    const total = state.imported + state.fixed + state.removed + remaining;
+    const total = state.imported + state.fixed + state.removed + state.ignored + remaining;
     const mismatch = state.fileRows>0 && total!==state.fileRows;
     notify();
     container.innerHTML = `
-      <p class="mini-note" style="margin:0 0 6px"><b>${state.fileRows} row${state.fileRows===1?'':'s'} in file · ${state.imported} imported${state.fixed? ` · ${state.fixed} fixed and imported`:''}${state.removed? ` · ${state.removed} removed`:''} · ${remaining} remaining</b></p>
+      <p class="mini-note" style="margin:0 0 6px"><b>${state.fileRows} row${state.fileRows===1?'':'s'} in file · ${state.imported} imported${state.fixed? ` · ${state.fixed} fixed and imported`:''}${state.removed? ` · ${state.removed} removed`:''}${state.ignored? ` · ${state.ignored} total/subtotal row${state.ignored===1?'':'s'} ignored (not a data problem)`:''} · ${remaining} remaining</b></p>
       ${mismatch? `<p class="mini-note" style="color:var(--red)">⚠ ${state.fileRows} in file but the tally adds up to ${total} — that is a bug here, not a data problem.</p>`:''}
       ${remaining? `
         <div class="tbl-scroll" style="max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:7px">
@@ -3261,7 +3261,15 @@ function chunkedSaveUI(container, kind){
     async run({fileRows, rows, preSkipped}){
       state.fileRows = fileRows!=null? fileRows : rows.length;
       state.imported = 0; state.fixed = 0; state.removed = 0;
-      state.failing = (preSkipped||[]).slice();   // rows that never even made it past reading the file
+      const pre = (preSkipped||[]).slice();
+      // a TOTAL/subtotal row is expected on every real file and was already
+      // reported once, at read time (as "ignored", not a rejection) — it can
+      // never be "fixed" into a product, so it must never sit in the SAME
+      // failing/retry table as a genuine bad row waiting on a person to edit
+      // it. Counted here so the reconciliation tally still holds; never shown
+      // as something to work through.
+      state.ignored = pre.filter(r=> /total row/i.test(r.reason||'')).length;
+      state.failing = pre.filter(r=> !/total row/i.test(r.reason||''));   // rows that never even made it past reading the file
       const n = kind.batchSize||100;
       for(let i=0;i<rows.length;i+=n){
         const batch = rows.slice(i, i+n);
@@ -3874,7 +3882,13 @@ function uploadModal(hid){
 
   const readSkipNote = skipped=>{
     if(!skipped || !skipped.length) return '';
-    return `<p class="mini-note" style="color:var(--red)">✕ ${skipped.length} row${skipped.length===1?'':'s'} could not be read: ${skipped.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name||'(blank)')}: ${esc(x.reason)}`).join('; ')}${skipped.length>6?'…':''}</p>`;
+    // a TOTAL/subtotal row is expected on every real file, not a rejection —
+    // showing it in the same red "could not be read" bucket as a genuine
+    // problem reads as an error on every single correct upload
+    const real = skipped.filter(x=> !/total row/i.test(x.reason||''));
+    const ig = skipped.filter(x=> /total row/i.test(x.reason||''));
+    return (real.length? `<p class="mini-note" style="color:var(--red)">✕ ${real.length} row${real.length===1?'':'s'} could not be read: ${real.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name||'(blank)')}: ${esc(x.reason)}`).join('; ')}${real.length>6?'…':''}</p>`:'')
+      + (ig.length? `<p class="mini-note">${ig.length} total/subtotal row${ig.length===1?'':'s'} recognized and skipped — not a data problem.</p>`:'');
   };
   const showPreview = (skipped, note)=>{
     const fresh = parsed.filter(p=>!p.dup);
@@ -4698,44 +4712,52 @@ function renderItems(){
   const all = db.items[hid]||[];
   const pendCount = (db.pendingItems[hid]||[]).filter(p=>p.status==='pending').length;
   const q = nameKey(state.itemQuery);
-  const list = (q? all.filter(it=> it.key.includes(q)) : all).slice(0, 400);
-  const avgM = all.length? all.reduce((a,it)=>a+marginPct(it.nr,it.mrp),0)/all.length : 0;
   // a product with nothing on the shelf keeps its LAST computed price rather
   // than losing its reference rate the moment stock runs out — flagged here
   // so that number is never mistaken for a live, currently-weighted average
-  const stockByKey = {}; stockAsOf(hid, todayISO()).items.forEach(m=> stockByKey[m.key] = m.stock);
+  const stockByKey = {}, batchesByKey = {};
+  stockAsOf(hid, todayISO()).items.forEach(m=>{ stockByKey[m.key] = m.stock; batchesByKey[m.key] = m.batches.filter(b=>b.qty>0).length; });
+  const multiBatchCount = all.filter(it=> (batchesByKey[it.key]||0) >= 2).length;
+  const searched = q? all.filter(it=> it.key.includes(q)) : all;
+  const filtered = state.itemMultiBatchOnly? searched.filter(it=> (batchesByKey[it.key]||0) >= 2) : searched;
+  const list = filtered.slice(0, 400);
+  const avgM = all.length? all.reduce((a,it)=>a+marginPct(it.nr,it.mrp),0)/all.length : 0;
   $('#content').innerHTML = `
     <div class="entry-bar">
       ${hospSelect('itmHosp')}
       <input class="in" id="itmSearch" placeholder="Search items…" value="${esc(state.itemQuery)}" style="width:220px">
       <span class="eyebrow">${all.length} items · avg margin ${pct(avgM)}</span>
       <span style="flex:1"></span>
+      <button class="btn btn-sm ${state.itemMultiBatchOnly?'btn-primary':''}" id="itmMultiBatch" title="Products currently holding stock across 2 or more distinct batches — check here that the Item Master price shown really is the weighted average across them, not a single batch's own rate">${multiBatchCount} with 2+ batches</button>
       ${canEdit && pendCount? `<button class="btn btn-sm" id="itmPending" style="border-color:var(--amber);color:var(--amber);font-weight:700">${pendCount} new from purchases</button>`:''}
       ${canEdit? `<button class="btn btn-sm" id="itmExport">${IC.dl} Export XLSX</button>
       <button class="btn btn-sm" id="itmTplTop" title="The item-master sheet — product, pack size, net rate and MRP per single strip">${IC.dl} Template</button>
       <button class="btn btn-sm" id="itmImport">${IC.up} Import</button>
       <button class="btn btn-sm btn-primary" id="itmAdd">${IC.plus} Add item</button>`:''}
     </div>
-    <p class="mini-note" style="margin:-6px 0 12px">Purchase price = NR per unit inclusive of GST. Margin = (MRP − NR) ÷ MRP. Update prices here after negotiating with vendors — purchase entries are tallied against these margins (±${MARGIN_TOL}% tolerance).</p>
+    <p class="mini-note" style="margin:-6px 0 12px">Purchase price = NR per unit inclusive of GST. Margin = (MRP − NR) ÷ MRP. Update prices here after negotiating with vendors — purchase entries are tallied against these margins (±${MARGIN_TOL}% tolerance). Where a product holds 2 or more batches, NR and MRP are the quantity-weighted average across them — a batch of 500 counts for more than a batch of 5 — recalculated automatically whenever a purchase, sale or adjustment changes what is on the shelf.</p>
+    ${state.itemMultiBatchOnly? '<p class="mini-note">Showing only products currently on 2 or more batches.</p>':''}
     <div class="card"><div class="tbl-scroll"><table class="tbl">
-      <thead><tr><th>Product name</th><th>Molecule / salt</th><th>Pack size</th><th class="r" title="Cost of ONE strip, inclusive of GST">Net rate / strip ₹</th><th class="r" title="Printed MRP of ONE strip">MRP / strip ₹</th><th class="r" title="(MRP − net rate) ÷ MRP — a ratio, so the pack size does not change it">Expected margin</th><th>Updated</th>${canEdit?'<th></th>':''}</tr></thead>
+      <thead><tr><th>Product name</th><th>Molecule / salt</th><th>Pack size</th><th class="r" title="Distinct batches currently holding stock for this product">Batches</th><th class="r" title="Cost of ONE strip, inclusive of GST — the quantity-weighted average across every batch currently on the shelf, when there is more than one">Net rate / strip ₹</th><th class="r" title="Printed MRP of ONE strip — weighted the same way">MRP / strip ₹</th><th class="r" title="(MRP − net rate) ÷ MRP — a ratio, so the pack size does not change it">Expected margin</th><th>Updated</th>${canEdit?'<th></th>':''}</tr></thead>
       <tbody>${list.map(it=>{
         const m = marginPct(it.nr, it.mrp);
         const mc = m>=30? 'var(--green)' : m>=18? 'var(--amber)' : 'var(--red)';
         const lastKnown = (stockByKey[it.key]||0)<=0 && it.priceAsOf;
+        const bc = batchesByKey[it.key]||0;
         return `<tr>
           <td><b>${esc(it.name)}</b>${it.source==='invoice'?' <span class="chip chip-gray" style="font-size:10px">from invoice</span>':''}</td>
           <td style="color:${it.molecule?'var(--muted)':'var(--faint)'};font-size:12.5px">${esc(it.molecule||'—')}</td>
           <td style="color:var(--muted)">${esc(it.pack||'—')}</td>
+          <td class="r num">${bc>=2? `<span class="chip chip-blue" title="Weighted average across ${bc} batches">${bc} batches</span>` : bc===1? '1' : '—'}</td>
           <td class="r num">${it.nr}${lastKnown? ` <span class="chip chip-gray" style="font-size:9px" title="No stock on hand — this is the last calculated rate, from ${esc(it.priceAsOf)}">last known</span>`:''}</td>
           <td class="r num">${it.mrp}</td>
           <td class="r num" style="color:${mc};font-weight:600">${pct(m)}</td>
           <td class="num" style="font-size:12px;color:var(--faint)">${fmtDateShort(iso(new Date(it.updatedAt||Date.now())))}</td>
           ${canEdit? `<td><button class="btn btn-sm" data-iedit="${esc(it.id)}">Update price</button></td>`:''}
         </tr>`;
-      }).join('') || `<tr><td colspan="8" style="color:var(--faint);padding:16px">No items yet — add them manually, import a CSV, or upload a purchase invoice (items are added automatically).</td></tr>`}
+      }).join('') || `<tr><td colspan="9" style="color:var(--faint);padding:16px">${state.itemMultiBatchOnly? 'No products currently on 2 or more batches.' : 'No items yet — add them manually, import a CSV, or upload a purchase invoice (items are added automatically).'}</td></tr>`}
       </tbody></table></div></div>
-    ${all.length>400 && list.length>=400? '<p class="mini-note">Showing first 400 matches — refine the search.</p>':''}`;
+    ${filtered.length>400 && list.length>=400? '<p class="mini-note">Showing first 400 matches — refine the search.</p>':''}`;
   const ih=$('#itmHosp'); if(ih) ih.onchange = ev=>{ state.hospital=ev.target.value; renderItems(); };
   const si=$('#itmSearch');
   si.oninput = ()=>{ state.itemQuery = si.value; renderItems(); const s2=$('#itmSearch'); s2.focus(); s2.setSelectionRange(s2.value.length, s2.value.length); };
@@ -4744,6 +4766,7 @@ function renderItems(){
   const itt=$('#itmTplTop'); if(itt) itt.onclick=()=> downloadTemplate('items', 'Item Master');
   const ie=$('#itmExport'); if(ie) ie.onclick=()=> exportItems(hid, list.map(it=>it.id));
   const ipd=$('#itmPending'); if(ipd) ipd.onclick=()=> pendingDrawer(hid);
+  const imb=$('#itmMultiBatch'); if(imb) imb.onclick=()=>{ state.itemMultiBatchOnly = !state.itemMultiBatchOnly; renderItems(); };
   $$('[data-iedit]').forEach(b=> b.onclick=()=> itemModal((db.items[hid]||[]).find(x=>x.id===b.dataset.iedit)));
 }
 
@@ -5590,7 +5613,13 @@ function itemImportModal(hid){
   const readSkipNote = ()=>{
     const s = (lastReceipt||{}).skipped||[];
     if(!s.length) return '';
-    return `<p class="mini-note" style="color:var(--red)">✕ ${s.length} row${s.length===1?'':'s'} could not be read: ${s.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name||'(blank)')}: ${esc(x.reason)}`).join('; ')}${s.length>6?'…':''}</p>`;
+    // a TOTAL/subtotal row is expected on every real file, not a rejection —
+    // showing it in the same red "could not be read" bucket as a genuine
+    // problem reads as an error on every single correct upload
+    const real = s.filter(x=> !/total row/i.test(x.reason||''));
+    const ig = s.filter(x=> /total row/i.test(x.reason||''));
+    return (real.length? `<p class="mini-note" style="color:var(--red)">✕ ${real.length} row${real.length===1?'':'s'} could not be read: ${real.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name||'(blank)')}: ${esc(x.reason)}`).join('; ')}${real.length>6?'…':''}</p>`:'')
+      + (ig.length? `<p class="mini-note">${ig.length} total/subtotal row${ig.length===1?'':'s'} recognized and skipped — not a data problem.</p>`:'');
   };
   /* the same preview whether the rows came from a pasted CSV or a read template */
   const showPreview = (note)=>{
@@ -6831,10 +6860,16 @@ function openingStockModal(hid){
   // standard receipt (with a real imported count) only makes sense AFTER the
   // save, since /items/opening can still reject a row (e.g. nr above the MRP)
   const readSkipNote = ()=>{
-    const s = (lastMeta.skipped)||[];
+    const all = (lastMeta.skipped)||[];
     const c = (lastMeta.cautions)||[];
-    if(!s.length && !c.length) return '';
+    // a TOTAL/subtotal row is expected on every real file, not a rejection —
+    // showing it in the same red "could not be read" bucket as a genuine
+    // problem reads as an error on every single correct upload
+    const s = all.filter(x=> !/total row/i.test(x.reason||''));
+    const ig = all.filter(x=> /total row/i.test(x.reason||''));
+    if(!s.length && !c.length && !ig.length) return '';
     return (s.length? `<p class="mini-note" style="color:var(--red)">✕ ${s.length} row${s.length===1?'':'s'} could not be read: ${s.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name||'(blank)')}: ${esc(x.reason)}`).join('; ')}${s.length>6?'…':''}</p>`:'')
+      + (ig.length? `<p class="mini-note">${ig.length} total/subtotal row${ig.length===1?'':'s'} recognized and skipped — not a data problem.</p>`:'')
       + (c.length? `<p class="mini-note" style="color:var(--amber)">⚠ ${c.length} row${c.length===1?'':'s'} worth a second look: ${c.slice(0,6).map(x=>`row ${x.row} — ${esc(x.name)}: ${esc(x.reason)}`).join('; ')}${c.length>6?'…':''}</p>`:'');
   };
   const preview = (rows0, note, src, meta)=>{
